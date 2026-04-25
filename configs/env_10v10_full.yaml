@@ -1,6 +1,6 @@
 map:
-  width: 2000
-  height: 1200
+  width: 3000
+  height: 4000
 
 teams:
   red_fighters: 10
@@ -8,13 +8,13 @@ teams:
   red_detectors: 0
   blue_detectors: 0
 
-max_steps: 1500
+max_steps: 2000
 dt: 1.0
 
 dynamics:
   turn_mode: instant
   boundary_mode: clamp
-  default_fighter_speed: 2.0
+  default_fighter_speed: 5.0
   default_detector_speed: 1.5
 
 spawn:
@@ -28,16 +28,16 @@ spawn:
 radar:
   enabled: true
   freq_count: 10
-  fighter_range: 260.0
+  fighter_range: 300.0
   fighter_fov_deg: 120.0
-  detector_range: 360.0
+  detector_range: 540.0
   detector_fov_deg: 360.0
 
 jamming:
   enabled: true
-  mode: deterministic
-  range: 300.0
-  spot_block_prob: 1.0
+  mode: probabilistic
+  range: 320.0
+  spot_block_prob: 0.75
   barrage_block_prob: 0.4
 
 passive_detection:
@@ -49,12 +49,12 @@ passive_detection:
 weapon:
   long_range: 220.0
   short_range: 120.0
-  long_hit_prob: 0.35
-  short_hit_prob: 0.60
+  long_hit_prob: 0.4
+  short_hit_prob: 0.75
   long_ammo: 2
   short_ammo: 4
   hit_prob_enable: true
-  attack_effect_delay: 0
+  attack_effect_delay: 2
   simultaneous_resolution: true
   allow_passive_fire: false
 
@@ -71,8 +71,8 @@ reward:
   keep_alive_step: 0.0
 
 render:
-  width: 1200
-  height: 720
+  width: 900
+  height: 1200
   pixel_style: true
   debug_overlay: true
   show_radar: true
@@ -80,3 +80,25 @@ render:
   show_visible_edges: false
   show_fireable_edges: true
   show_target_allocations: true
+
+reward_modules:
+  kill_loss:
+    enabled: true
+  win_loss:
+    enabled: true
+    win: 5.0
+    lose: -5.0
+    draw: 0.0
+  valid_fire:
+    enabled: true
+    coef: 0.02
+    only_when_opportunity: false
+  invalid_fire:
+    enabled: true
+    penalty: -0.05
+  fire_execution:
+    enabled: false
+    coef: 0.01
+  selected_exchange:
+    enabled: false
+    coef: 0.05

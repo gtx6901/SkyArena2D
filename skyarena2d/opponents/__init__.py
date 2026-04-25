@@ -1,5 +1,6 @@
 from .base import BaseRuleOpponent
 from .fix_rule_like import FixRuleLikeOpponent
+from .fix_rule_v2 import FixRuleV2Opponent
 from .no_attack_rule import NoAttackRuleOpponent
 from .patrol_rule import PatrolRuleOpponent
 from .random_rule import RandomRuleOpponent
@@ -11,6 +12,7 @@ RULES = {
     "patrol_rule": PatrolRuleOpponent,
     "random_rule": RandomRuleOpponent,
     "fix_rule_like": FixRuleLikeOpponent,
+    "fix_rule_v2": FixRuleV2Opponent,
 }
 
 __all__ = [
@@ -20,5 +22,6 @@ __all__ = [
     "PatrolRuleOpponent",
     "RandomRuleOpponent",
     "FixRuleLikeOpponent",
+    "FixRuleV2Opponent",
     "RULES",
 ]

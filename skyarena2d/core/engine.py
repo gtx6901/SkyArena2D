@@ -380,6 +380,15 @@ class SkyArenaEngine:
             launch_records=[],
             resolved_records=[],
             strike_list=strike_list,
+            red_attempted_fire=np.zeros((red.total_units,), dtype=bool),
+            blue_attempted_fire=np.zeros((blue.total_units,), dtype=bool),
+            red_selected_long=np.zeros((red.total_units,), dtype=bool),
+            red_selected_short=np.zeros((red.total_units,), dtype=bool),
+            blue_selected_long=np.zeros((blue.total_units,), dtype=bool),
+            blue_selected_short=np.zeros((blue.total_units,), dtype=bool),
+            red_selected_target_idx=np.full((red.total_units,), -1, dtype=np.int32),
+            blue_selected_target_idx=np.full((blue.total_units,), -1, dtype=np.int32),
+            reward_components={},
         )
 
         obs = self._build_observations()
@@ -504,6 +513,15 @@ class SkyArenaEngine:
             launch_records=weapon_result.launch_records,
             resolved_records=weapon_result.resolved_records,
             strike_list=strike_list,
+            red_attempted_fire=weapon_result.red_attempted_fire,
+            blue_attempted_fire=weapon_result.blue_attempted_fire,
+            red_selected_long=weapon_result.red_selected_long,
+            red_selected_short=weapon_result.red_selected_short,
+            blue_selected_long=weapon_result.blue_selected_long,
+            blue_selected_short=weapon_result.blue_selected_short,
+            red_selected_target_idx=weapon_result.red_selected_target_idx,
+            blue_selected_target_idx=weapon_result.blue_selected_target_idx,
+            reward_components=reward_output.components,
         )
 
         update_tracker(
@@ -530,6 +548,7 @@ class SkyArenaEngine:
             "winner": termination_result.winner,
             "reason": termination_result.reason,
             "metrics": metrics,
+            "reward_components": reward_output.components,
             "maca_reward": reward_output.maca_reward,
         }
 

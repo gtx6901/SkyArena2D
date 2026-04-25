@@ -21,6 +21,7 @@ class PixelRenderer:
         self.render_width = int(config.render.width)
         self.render_height = int(config.render.height)
         self.debug_overlay = bool(config.render.debug_overlay)
+        self.scoreboard_height = 80
         self._window = None
         self._clock = None
         self._pygame_ready = False
@@ -30,11 +31,12 @@ class PixelRenderer:
 
     def _world_to_screen(self, x: float, y: float) -> tuple[int, int]:
         sx = int(np.clip((x / max(1.0, self.config.map.width)) * self.render_width, 0, self.render_width - 1))
-        sy = int(
+        map_render_height = self.render_height - self.scoreboard_height
+        sy = self.scoreboard_height + int(
             np.clip(
-                (y / max(1.0, self.config.map.height)) * self.render_height,
+                (y / max(1.0, self.config.map.height)) * map_render_height,
                 0,
-                self.render_height - 1,
+                map_render_height - 1,
             )
         )
         return sx, sy
@@ -54,8 +56,8 @@ class PixelRenderer:
             return
         step = 40
         for x in range(0, self.render_width, step):
-            pygame.draw.line(surface, palette.GRID, (x, 0), (x, self.render_height), 1)
-        for y in range(0, self.render_height, step):
+            pygame.draw.line(surface, palette.GRID, (x, self.scoreboard_height), (x, self.render_height), 1)
+        for y in range(self.scoreboard_height, self.render_height, step):
             pygame.draw.line(surface, palette.GRID, (0, y), (self.render_width, y), 1)
 
     def _draw_cone(
@@ -172,11 +174,100 @@ class PixelRenderer:
                 draw_detector(surface, x, y, color, radius=5)
             draw_heading_tick(surface, x, y, float(team.heading[i]), 10, palette.WHITE)
 
-    def _render_surface(self, state: EnvState):
+    def _draw_scoreboard(self, surface, state: EnvState, metrics: dict | None) -> None:
+        if pygame is None:
+            return
+        # Dark background bar
+        pygame.draw.rect(surface, palette.SCOREBOARD_BG, (0, 0, self.render_width, self.scoreboard_height))
+
+        try:
+            font = pygame.font.SysFont(None, 20)
+        except Exception:
+            return
+
+        max_steps = getattr(self.config, "max_steps", 2000)
+
+        # Row 1: step, winner, alive counts, kills
+        red_alive = state.red.alive_count
+        red_total = state.red.num_fighters
+        blue_alive = state.blue.alive_count
+        blue_total = state.blue.num_fighters
+        red_kills = state.red.kills
+        blue_kills = state.blue.kills
+        red_missiles = state.red.remaining_missiles()
+        blue_missiles = state.blue.remaining_missiles()
+
+        # Row 2: metrics
+        if metrics is not None:
+            red_fire_edges = metrics.get("red_fireable_edges", "---")
+            blue_fire_edges = metrics.get("blue_fireable_edges", "---")
+            exch = metrics.get("expected_exchange_proxy", None)
+            exch_str = f"{exch:+.1f}" if exch is not None else "---"
+            sel_exch = metrics.get("selected_expected_exchange", None)
+            sel_exch_str = f"{sel_exch:+.1f}" if sel_exch is not None else "---"
+            red_exec = metrics.get("red_fire_execution_rate_given_opportunity", None)
+            blue_exec = metrics.get("blue_fire_execution_rate_given_opportunity", None)
+            red_exec_str = f"{red_exec:.2f}" if red_exec is not None else "---"
+            blue_exec_str = f"{blue_exec:.2f}" if blue_exec is not None else "---"
+            contact = metrics.get("first_contact_step", None)
+            contact_str = str(contact) if contact is not None else "---"
+            fire_opp = metrics.get("first_fire_opportunity_step", None)
+            fire_opp_str = str(fire_opp) if fire_opp is not None else "---"
+        else:
+            red_fire_edges = blue_fire_edges = "---"
+            exch_str = sel_exch_str = "---"
+            red_exec_str = blue_exec_str = "---"
+            contact_str = fire_opp_str = "---"
+
+        W = palette.SCOREBOARD_TEXT
+        R = palette.SCOREBOARD_RED
+        B = palette.SCOREBOARD_BLUE
+
+        # Build row 1 as segments: (text, color)
+        row1_segments = [
+            (f"step={state.step_count}/{max_steps}  winner={state.winner}  ", W),
+            (f"RED:{red_alive}/{red_total}", R),
+            ("  ", W),
+            (f"BLUE:{blue_alive}/{blue_total}", B),
+            ("  kills R:", W),
+            (f"{red_kills}", R),
+            (" B:", W),
+            (f"{blue_kills}", B),
+            ("  missiles R:", W),
+            (f"{red_missiles}", R),
+            (" B:", W),
+            (f"{blue_missiles}", B),
+        ]
+
+        row2_segments = [
+            ("fireable R:", W),
+            (f"{red_fire_edges}", R),
+            (" B:", W),
+            (f"{blue_fire_edges}", B),
+            (f"  exch={exch_str}  sel_exch={sel_exch_str}  exec R:", W),
+            (f"{red_exec_str}", R),
+            (" B:", W),
+            (f"{blue_exec_str}", B),
+            (f"  contact={contact_str}  fire_opp={fire_opp_str}", W),
+        ]
+
+        def render_row(segments, y_offset: int) -> None:
+            x = 4
+            for text, color in segments:
+                surf = font.render(text, True, color)
+                surface.blit(surf, (x, y_offset))
+                x += surf.get_width()
+
+        render_row(row1_segments, 6)
+        render_row(row2_segments, 28)
+
+    def _render_surface(self, state: EnvState, metrics: dict | None = None):
         if pygame is None:
             return None
         surface = pygame.Surface((self.render_width, self.render_height))
         surface.fill(palette.BACKGROUND)
+        # Fill scoreboard area with its own background
+        pygame.draw.rect(surface, palette.SCOREBOARD_BG, (0, 0, self.render_width, self.scoreboard_height))
         self._draw_grid(surface)
         self._draw_team(surface, state, "red")
         self._draw_team(surface, state, "blue")
@@ -184,18 +275,28 @@ class PixelRenderer:
         if self.debug_overlay:
             self._draw_edges(surface, state)
             self._draw_missiles(surface, state)
+
+        self._draw_scoreboard(surface, state, metrics)
         return surface
 
     def _fallback_rgb(self, state: EnvState) -> np.ndarray:
         h, w = self.render_height, self.render_width
         frame = np.zeros((h, w, 3), dtype=np.uint8)
-        frame[:, :, 0] = palette.BACKGROUND[0]
-        frame[:, :, 1] = palette.BACKGROUND[1]
-        frame[:, :, 2] = palette.BACKGROUND[2]
 
+        # Scoreboard area: dark color
+        frame[: self.scoreboard_height, :, 0] = palette.SCOREBOARD_BG[0]
+        frame[: self.scoreboard_height, :, 1] = palette.SCOREBOARD_BG[1]
+        frame[: self.scoreboard_height, :, 2] = palette.SCOREBOARD_BG[2]
+
+        # Map area: background color
+        frame[self.scoreboard_height :, :, 0] = palette.BACKGROUND[0]
+        frame[self.scoreboard_height :, :, 1] = palette.BACKGROUND[1]
+        frame[self.scoreboard_height :, :, 2] = palette.BACKGROUND[2]
+
+        # Grid lines in map area only
         for x in range(0, w, 40):
-            frame[:, x : x + 1, :] = np.array(palette.GRID, dtype=np.uint8)
-        for y in range(0, h, 40):
+            frame[self.scoreboard_height :, x : x + 1, :] = np.array(palette.GRID, dtype=np.uint8)
+        for y in range(self.scoreboard_height, h, 40):
             frame[y : y + 1, :, :] = np.array(palette.GRID, dtype=np.uint8)
 
         def draw_dot(px: int, py: int, color: tuple[int, int, int]) -> None:
@@ -214,7 +315,7 @@ class PixelRenderer:
 
         return frame
 
-    def render(self, state: EnvState, mode: str = "rgb_array") -> np.ndarray | None:
+    def render(self, state: EnvState, mode: str = "rgb_array", metrics: dict | None = None) -> np.ndarray | None:
         if mode not in {"human", "rgb_array"}:
             raise ValueError(f"Unsupported render mode: {mode}")
 
@@ -224,7 +325,7 @@ class PixelRenderer:
             return self._fallback_rgb(state)
 
         self._ensure_pygame()
-        surface = self._render_surface(state)
+        surface = self._render_surface(state, metrics)
         assert surface is not None
 
         if mode == "human":

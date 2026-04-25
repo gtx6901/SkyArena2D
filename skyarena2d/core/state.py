@@ -109,6 +109,21 @@ class MetricsTracker:
     unique_targets_engaged_blue: set[int] = field(default_factory=set)
     overkill_values_red: list[int] = field(default_factory=list)
     overkill_values_blue: list[int] = field(default_factory=list)
+    # --- new: fireable/attempted/selected tracking ---
+    fire_attempts_red: int = 0
+    fire_attempts_blue: int = 0
+    fire_opportunities_red: int = 0   # step-agent count with fireable opportunity
+    fire_opportunities_blue: int = 0
+    fire_executions_red: int = 0      # step-agent count that fired given opportunity
+    fire_executions_blue: int = 0
+    invalid_fire_count_red: int = 0
+    invalid_fire_count_blue: int = 0
+    unique_selected_targets_red: set[int] = field(default_factory=set)
+    unique_selected_targets_blue: set[int] = field(default_factory=set)
+    selected_overkill_values_red: list[int] = field(default_factory=list)
+    selected_overkill_values_blue: list[int] = field(default_factory=list)
+    selected_expected_exchange_acc: float = 0.0
+    selected_expected_exchange_steps: int = 0
 
 
 @dataclass(slots=True)
@@ -126,6 +141,16 @@ class StepCache:
     launch_records: list[LaunchRecord]
     resolved_records: list[dict[str, Any]]
     strike_list: list[dict[str, Any]]
+    # --- new: attempted/selected per-agent arrays ---
+    red_attempted_fire: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    blue_attempted_fire: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    red_selected_long: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    red_selected_short: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    blue_selected_long: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    blue_selected_short: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    red_selected_target_idx: np.ndarray = field(default_factory=lambda: np.full(0, -1, dtype=np.int32))
+    blue_selected_target_idx: np.ndarray = field(default_factory=lambda: np.full(0, -1, dtype=np.int32))
+    reward_components: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

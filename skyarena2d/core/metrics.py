@@ -47,6 +47,42 @@ def _expected_kill_proxy(
     return expected, unique_targets, overkill_mean, edges, fireable_agents
 
 
+def _selected_expected_kills(
+    selected_long: np.ndarray,
+    selected_short: np.ndarray,
+    selected_target_idx: np.ndarray,
+    long_p: np.ndarray,
+    short_p: np.ndarray,
+    num_enemies: int,
+) -> tuple[float, int, float]:
+    """Compute expected kills based on actually selected (launched) targets."""
+    if selected_long.size == 0 or num_enemies == 0:
+        return 0.0, 0, 0.0
+
+    # group by target
+    target_probs: dict[int, list[float]] = defaultdict(list)
+    for i in range(len(selected_long)):
+        t = int(selected_target_idx[i])
+        if t < 0:
+            continue
+        if bool(selected_long[i]) and i < len(long_p):
+            target_probs[t].append(float(long_p[i]))
+        elif bool(selected_short[i]) and i < len(short_p):
+            target_probs[t].append(float(short_p[i]))
+
+    expected = 0.0
+    unique_targets = len(target_probs)
+    overkill_vals: list[float] = []
+    for t, probs in target_probs.items():
+        probs_arr = np.clip(np.array(probs, dtype=np.float32), 0.0, 1.0)
+        kill_prob = 1.0 - float(np.prod(1.0 - probs_arr))
+        expected += kill_prob
+        overkill_vals.append(max(0.0, float(len(probs) - 1)))
+
+    overkill_mean = float(np.mean(overkill_vals)) if overkill_vals else 0.0
+    return expected, unique_targets, overkill_mean
+
+
 def update_tracker(
     *,
     state: EnvState,
@@ -93,6 +129,62 @@ def update_tracker(
     for count in incoming_count_red.values():
         tracker.overkill_values_blue.append(max(0, count - 1))
 
+    # --- new: attempted/selected tracking ---
+    if weapon_result.red_attempted_fire.size > 0:
+        tracker.fire_attempts_red += int(np.count_nonzero(weapon_result.red_attempted_fire))
+    if weapon_result.blue_attempted_fire.size > 0:
+        tracker.fire_attempts_blue += int(np.count_nonzero(weapon_result.blue_attempted_fire))
+
+    # fire opportunities = agents with any fireable edge
+    if weapon_result.red_fireable_long.size > 0:
+        red_opp = int(np.count_nonzero(np.any(
+            weapon_result.red_fireable_long | weapon_result.red_fireable_short, axis=1
+        )))
+        tracker.fire_opportunities_red += red_opp
+    if weapon_result.blue_fireable_long.size > 0:
+        blue_opp = int(np.count_nonzero(np.any(
+            weapon_result.blue_fireable_long | weapon_result.blue_fireable_short, axis=1
+        )))
+        tracker.fire_opportunities_blue += blue_opp
+
+    # fire executions = agents that actually fired (valid)
+    if weapon_result.red_valid_fire.size > 0:
+        tracker.fire_executions_red += int(np.count_nonzero(weapon_result.red_valid_fire))
+    if weapon_result.blue_valid_fire.size > 0:
+        tracker.fire_executions_blue += int(np.count_nonzero(weapon_result.blue_valid_fire))
+
+    # invalid fire counts
+    if weapon_result.red_invalid_fire.size > 0:
+        tracker.invalid_fire_count_red += int(np.count_nonzero(weapon_result.red_invalid_fire))
+    if weapon_result.blue_invalid_fire.size > 0:
+        tracker.invalid_fire_count_blue += int(np.count_nonzero(weapon_result.blue_invalid_fire))
+
+    # selected targets tracking
+    if weapon_result.red_selected_target_idx.size > 0:
+        for t in weapon_result.red_selected_target_idx:
+            if int(t) >= 0:
+                tracker.unique_selected_targets_red.add(int(t))
+    if weapon_result.blue_selected_target_idx.size > 0:
+        for t in weapon_result.blue_selected_target_idx:
+            if int(t) >= 0:
+                tracker.unique_selected_targets_blue.add(int(t))
+
+    # selected overkill
+    sel_incoming_blue: dict[int, int] = defaultdict(int)
+    sel_incoming_red: dict[int, int] = defaultdict(int)
+    if weapon_result.red_selected_target_idx.size > 0:
+        for t in weapon_result.red_selected_target_idx:
+            if int(t) >= 0:
+                sel_incoming_blue[int(t)] += 1
+    if weapon_result.blue_selected_target_idx.size > 0:
+        for t in weapon_result.blue_selected_target_idx:
+            if int(t) >= 0:
+                sel_incoming_red[int(t)] += 1
+    for count in sel_incoming_blue.values():
+        tracker.selected_overkill_values_red.append(max(0, count - 1))
+    for count in sel_incoming_red.values():
+        tracker.selected_overkill_values_blue.append(max(0, count - 1))
+
 
 def build_metrics_snapshot(state: EnvState, weapon_result: WeaponStepResult) -> dict[str, float | int | None]:
     red_expected, red_unique, red_overkill, red_edges, red_fireable_agents = _expected_kill_proxy(
@@ -108,12 +200,49 @@ def build_metrics_snapshot(state: EnvState, weapon_result: WeaponStepResult) -> 
         state.blue.short_hit_prob,
     )
 
+    # selected expected kills
+    num_blue = state.blue.num_fighters
+    num_red = state.red.num_fighters
+    red_sel_exp, red_sel_unique, red_sel_overkill = _selected_expected_kills(
+        weapon_result.red_selected_long,
+        weapon_result.red_selected_short,
+        weapon_result.red_selected_target_idx,
+        state.red.long_hit_prob,
+        state.red.short_hit_prob,
+        num_blue,
+    )
+    blue_sel_exp, blue_sel_unique, blue_sel_overkill = _selected_expected_kills(
+        weapon_result.blue_selected_long,
+        weapon_result.blue_selected_short,
+        weapon_result.blue_selected_target_idx,
+        state.blue.long_hit_prob,
+        state.blue.short_hit_prob,
+        num_red,
+    )
+
+    # attempted/selected edges
+    red_attempted_edges = int(np.count_nonzero(weapon_result.red_attempted_fire)) if weapon_result.red_attempted_fire.size > 0 else 0
+    blue_attempted_edges = int(np.count_nonzero(weapon_result.blue_attempted_fire)) if weapon_result.blue_attempted_fire.size > 0 else 0
+    red_selected_edges = int(np.count_nonzero(weapon_result.red_selected_long | weapon_result.red_selected_short)) if weapon_result.red_selected_long.size > 0 else 0
+    blue_selected_edges = int(np.count_nonzero(weapon_result.blue_selected_long | weapon_result.blue_selected_short)) if weapon_result.blue_selected_long.size > 0 else 0
+
     tracker = state.tracker
     contact_gap = None
     if tracker.first_contact_step is not None and tracker.first_fire_opportunity_step is not None:
         contact_gap = tracker.first_fire_opportunity_step - tracker.first_contact_step
 
+    # fire execution rate given opportunity
+    red_exec_rate = (
+        float(tracker.fire_executions_red) / float(tracker.fire_opportunities_red)
+        if tracker.fire_opportunities_red > 0 else 0.0
+    )
+    blue_exec_rate = (
+        float(tracker.fire_executions_blue) / float(tracker.fire_opportunities_blue)
+        if tracker.fire_opportunities_blue > 0 else 0.0
+    )
+
     return {
+        # --- original fields ---
         "red_alive": state.red.alive_count,
         "blue_alive": state.blue.alive_count,
         "red_kills": state.red.kills,
@@ -145,4 +274,25 @@ def build_metrics_snapshot(state: EnvState, weapon_result: WeaponStepResult) -> 
         "missiles_missed": tracker.missiles_missed,
         "jammed_detection_count": tracker.jammed_detection_count,
         "passive_detection_count": tracker.passive_detection_count,
+        # --- new: attempted/selected ---
+        "red_attempted_edges": red_attempted_edges,
+        "blue_attempted_edges": blue_attempted_edges,
+        "red_selected_edges": red_selected_edges,
+        "blue_selected_edges": blue_selected_edges,
+        "selected_edge_advantage": red_selected_edges - blue_selected_edges,
+        "red_fire_execution_rate_given_opportunity": red_exec_rate,
+        "blue_fire_execution_rate_given_opportunity": blue_exec_rate,
+        "selected_expected_red_kills": red_sel_exp,
+        "selected_expected_blue_kills": blue_sel_exp,
+        "selected_expected_exchange": red_sel_exp - blue_sel_exp,
+        "red_unique_selected_targets": len(tracker.unique_selected_targets_red) or red_sel_unique,
+        "blue_unique_selected_targets": len(tracker.unique_selected_targets_blue) or blue_sel_unique,
+        "red_selected_overkill_mean": float(np.mean(tracker.selected_overkill_values_red))
+        if tracker.selected_overkill_values_red else red_sel_overkill,
+        "blue_selected_overkill_mean": float(np.mean(tracker.selected_overkill_values_blue))
+        if tracker.selected_overkill_values_blue else blue_sel_overkill,
+        "red_invalid_fire_count": tracker.invalid_fire_count_red,
+        "blue_invalid_fire_count": tracker.invalid_fire_count_blue,
+        "red_fire_attempts": tracker.fire_attempts_red,
+        "blue_fire_attempts": tracker.fire_attempts_blue,
     }

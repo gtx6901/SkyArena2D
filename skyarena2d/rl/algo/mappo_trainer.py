@@ -1,0 +1,502 @@
+"""SkyArena MAPPO trainer.
+
+Ported from MaCA-master/algo/mappo_trainer.py.
+"""
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from skyarena2d.adapters.action_types import SkyArenaSideAction
+from skyarena2d.training.action_adapter import SkyArenaActionAdapter
+
+from ..adapters.skyarena_mappo_env import SkyArenaMAPPOEnv
+from ..models.actor import SkyArenaActor
+from ..models.critic import SkyArenaCritic
+from ..utils.checkpoint import (
+    ensure_run_dirs,
+    latest_checkpoint,
+    load_checkpoint,
+    save_checkpoint,
+    save_run_config,
+)
+from ..utils.tb import build_writer, log_scalars
+from .rollout import (
+    RolloutBatch,
+    allocate_batched_obs,
+    allocate_rollout_obs,
+    compute_gae,
+    fill_batched_obs,
+    masked_categorical,
+    sample_policy_actions,
+    stack_env_obs,
+    to_torch_batch,
+)
+from .search_goal_manager import TeamSearchPlanner, TeamSearchPlannerConfig
+
+
+class SkyArenaMAPPOTrainer:
+    """Minimal recurrent MAPPO trainer for SkyArena2D."""
+
+    def __init__(self, cfg: Dict[str, Any]):
+        self.cfg = cfg
+        self.train_cfg = cfg["train"]
+        self.env_cfg = cfg["env"]
+        self.model_cfg = cfg["model"]
+        self.logging_cfg = cfg.get("logging", {})
+
+        self.num_envs = int(self.train_cfg.get("num_envs", 2))
+        self.rollout_steps = int(self.train_cfg.get("rollout_steps", 64))
+        self.total_env_steps = int(self.train_cfg.get("total_env_steps", 100000))
+        self.save_interval = int(self.train_cfg.get("save_interval", 10000))
+        self.eval_interval = int(self.train_cfg.get("eval_interval", 10000))
+        self.ppo_epochs = int(self.train_cfg.get("ppo_epochs", 3))
+        self.gamma = float(self.train_cfg.get("gamma", 0.99))
+        self.gae_lambda = float(self.train_cfg.get("gae_lambda", 0.95))
+        self.clip_coef = float(self.train_cfg.get("clip_coef", 0.2))
+        self.ent_coef = float(self.train_cfg.get("entropy_coef", 0.01))
+        self.vf_coef = float(self.train_cfg.get("value_coef", 0.5))
+        self.max_grad_norm = float(self.train_cfg.get("max_grad_norm", 0.5))
+        self.search_goal_grid_size = int(self.env_cfg.get("search_goal_grid_size", 8))
+        self.search_goal_bins = self.search_goal_grid_size ** 2
+        self.candidate_slots = int(self.env_cfg.get("candidate_slots", 6))
+
+        device_str = str(self.train_cfg.get("device", "cpu"))
+        self.device = torch.device(device_str)
+
+        # Build environments
+        self.envs = [SkyArenaMAPPOEnv(cfg, seed_offset=i) for i in range(self.num_envs)]
+        self.num_agents = self.envs[0].red_fighter_num
+        obs_shapes = self.envs[0].obs_shapes()
+
+        # Build search goal manager
+        engine_cfg = self.envs[0].engine_config
+        self.search_goal_manager = TeamSearchPlanner(
+            TeamSearchPlannerConfig(
+                num_envs=self.num_envs,
+                num_agents=self.num_agents,
+                map_size_x=engine_cfg.map.width,
+                map_size_y=engine_cfg.map.height,
+                search_goal_grid_size=self.search_goal_grid_size,
+                goal_hold_steps=int(self.env_cfg.get("goal_hold_steps", 10)),
+                goal_reach_radius=float(self.env_cfg.get("goal_reach_radius", 90.0)),
+            )
+        )
+
+        # Build actor and critic
+        self.actor = SkyArenaActor(
+            self_dim=obs_shapes["self_features"][1],
+            entity_dim=obs_shapes["entity_features"][2],
+            map_channels=obs_shapes["semantic_map"][1],
+            candidate_slots=self.candidate_slots,
+            num_agents=self.num_agents,
+            course_bins=16,
+            search_goal_bins=self.search_goal_bins,
+            region_feature_dim=obs_shapes["region_features"][2],
+            trunk_dim=int(self.model_cfg.get("trunk_dim", 192)),
+            lstm_hidden_dim=int(self.model_cfg.get("lstm_hidden_dim", 192)),
+            entity_embed_dim=int(self.model_cfg.get("entity_embed_dim", 96)),
+            map_embed_dim=int(self.model_cfg.get("map_embed_dim", 96)),
+            semantic_map_size=int(self.model_cfg.get("semantic_map_size", 100)),
+            current_goal_embed_dim=int(self.model_cfg.get("current_goal_embed_dim", 32)),
+            agent_id_embed_dim=int(self.model_cfg.get("agent_id_embed_dim", 16)),
+            region_embed_dim=int(self.model_cfg.get("region_embed_dim", 64)),
+        ).to(self.device)
+
+        self.critic = SkyArenaCritic(
+            global_state_dim=obs_shapes["global_state"][0],
+            hidden_dim=int(self.model_cfg.get("critic_hidden_dim", 256)),
+        ).to(self.device)
+
+        self.optimizer = torch.optim.Adam(
+            list(self.actor.parameters()) + list(self.critic.parameters()),
+            lr=float(self.train_cfg.get("learning_rate", 3e-4)),
+        )
+
+        # Build action adapter
+        self.action_adapter = SkyArenaActionAdapter(
+            candidate_slots=self.candidate_slots,
+            course_bins=16,
+            search_goal_grid_size=self.search_goal_grid_size,
+            map_width=engine_cfg.map.width,
+            map_height=engine_cfg.map.height,
+        )
+
+        # Setup run dirs
+        run_train_cfg = dict(self.train_cfg)
+        run_train_cfg["logging"] = self.logging_cfg
+        self.run_dirs = ensure_run_dirs(run_train_cfg)
+        save_run_config(self.run_dirs, cfg)
+
+        self.env_steps = 0
+        self.update_idx = 0
+
+        # Resume from checkpoint if requested
+        if bool(self.train_cfg.get("resume", False)):
+            ckpt_path = latest_checkpoint(run_train_cfg)
+            if ckpt_path is not None:
+                ckpt = load_checkpoint(ckpt_path, self.actor, self.critic, self.optimizer, map_location=self.device)
+                self.env_steps = int(ckpt.get("env_steps", 0))
+                self.update_idx = int(ckpt.get("update_idx", 0))
+                print(f"[resume] loaded checkpoint {ckpt_path} env_steps={self.env_steps}", flush=True)
+
+        # Initialize obs and hidden states
+        self.current_obs = [env.reset() for env in self.envs]
+        self.search_goal_manager.reset_all()
+        hidden_dim = self.actor.lstm_hidden_dim
+        self.actor_h = torch.zeros((self.num_envs, self.num_agents, hidden_dim), dtype=torch.float32, device=self.device)
+        self.actor_c = torch.zeros((self.num_envs, self.num_agents, hidden_dim), dtype=torch.float32, device=self.device)
+
+        self.writer = build_writer(run_train_cfg, purge_step=(self.env_steps if self.env_steps > 0 else None))
+        self.next_save_step = self.env_steps + self.save_interval
+        self.next_eval_step = self.env_steps + self.eval_interval
+
+    def _collect_rollout(self) -> RolloutBatch:
+        """Collect rollout_steps of experience from all envs."""
+        example_obs = self.current_obs[0]
+        rollout_obs = allocate_rollout_obs(example_obs, self.rollout_steps, self.num_envs)
+        rollout_course = np.zeros((self.rollout_steps, self.num_envs, self.num_agents), dtype=np.int64)
+        rollout_search_goal = np.zeros((self.rollout_steps, self.num_envs, self.num_agents), dtype=np.int64)
+        rollout_search_goal_refresh = np.zeros((self.rollout_steps, self.num_envs, self.num_agents), dtype=np.bool_)
+        rollout_target = np.zeros((self.rollout_steps, self.num_envs, self.num_agents), dtype=np.int64)
+        rollout_fire = np.zeros((self.rollout_steps, self.num_envs, self.num_agents), dtype=np.int64)
+        rollout_log_prob = np.zeros((self.rollout_steps, self.num_envs, self.num_agents), dtype=np.float32)
+        rollout_reward = np.zeros((self.rollout_steps, self.num_envs), dtype=np.float32)
+        rollout_done = np.zeros((self.rollout_steps, self.num_envs), dtype=np.float32)
+        rollout_value = np.zeros((self.rollout_steps, self.num_envs), dtype=np.float32)
+        initial_h = self.actor_h.detach().cpu().numpy().copy()
+        initial_c = self.actor_c.detach().cpu().numpy().copy()
+        episode_stats: List[Dict[str, Any]] = []
+
+        for step in range(self.rollout_steps):
+            obs_batch = stack_env_obs(self.current_obs)
+            batched_obs = allocate_batched_obs(example_obs, self.num_envs)
+            fill_batched_obs(batched_obs, self.current_obs)
+
+            with torch.no_grad():
+                sampled = sample_policy_actions(
+                    self.actor,
+                    batched_obs,
+                    (self.actor_h, self.actor_c),
+                    self.device,
+                    deterministic=False,
+                    search_goal_manager=self.search_goal_manager,
+                )
+                global_state_t = torch.as_tensor(batched_obs["global_state"], dtype=torch.float32, device=self.device)
+                value = self.critic(global_state_t).detach().cpu().numpy()
+
+            # Store obs
+            for key in rollout_obs:
+                rollout_obs[key][step] = batched_obs[key]
+            rollout_course[step] = sampled["course"]
+            rollout_search_goal[step] = sampled["search_goal"]
+            rollout_search_goal_refresh[step] = sampled["search_goal_refresh_mask"]
+            rollout_target[step] = sampled["target"]
+            rollout_fire[step] = sampled["fire"]
+            rollout_log_prob[step] = sampled["log_prob"]
+            rollout_value[step] = value
+
+            # Update hidden states
+            self.actor_h = sampled["next_h"].to(self.device)
+            self.actor_c = sampled["next_c"].to(self.device)
+
+            # Step each env
+            new_obs_list = []
+            for env_idx, env in enumerate(self.envs):
+                course_i = sampled["course"][env_idx]
+                search_goal_i = sampled["search_goal"][env_idx]
+                target_i = sampled["target"][env_idx]
+                fire_i = sampled["fire"][env_idx]
+
+                sky_action = self.action_adapter.decode(
+                    course_action=course_i,
+                    search_goal_action=search_goal_i,
+                    target_action=target_i,
+                    fire_action=fire_i,
+                    own=env.engine.state.red,
+                    candidate_ids=batched_obs["candidate_ids"][env_idx],
+                    candidate_can_long=batched_obs["candidate_can_long"][env_idx],
+                    candidate_can_short=batched_obs["candidate_can_short"][env_idx],
+                    has_active_contact=batched_obs["has_active_contact"][env_idx] > 0.5,
+                    current_heading=env.engine.state.red.heading[:env.red_fighter_num],
+                )
+
+                next_obs, reward, done, info = env.step(sky_action)
+                rollout_reward[step, env_idx] = reward
+                rollout_done[step, env_idx] = float(done)
+
+                if done:
+                    episode_stats.append({
+                        "winner": info.get("winner", "unknown"),
+                        "steps": env.engine.state.step_count,
+                    })
+                    next_obs = env.reset()
+                    self.search_goal_manager.reset_envs([env_idx])
+                    self.actor_h[env_idx] = 0.0
+                    self.actor_c[env_idx] = 0.0
+
+                new_obs_list.append(next_obs)
+
+            self.current_obs = new_obs_list
+            self.env_steps += self.num_envs
+
+        # Compute next value for GAE
+        with torch.no_grad():
+            final_batched = allocate_batched_obs(example_obs, self.num_envs)
+            fill_batched_obs(final_batched, self.current_obs)
+            global_state_t = torch.as_tensor(final_batched["global_state"], dtype=torch.float32, device=self.device)
+            next_value = self.critic(global_state_t).detach().cpu().numpy()
+
+        return RolloutBatch(
+            observations=rollout_obs,
+            initial_h=initial_h,
+            initial_c=initial_c,
+            course_action=rollout_course,
+            search_goal_action=rollout_search_goal,
+            search_goal_refresh_mask=rollout_search_goal_refresh,
+            target_action=rollout_target,
+            fire_action=rollout_fire,
+            log_prob=rollout_log_prob,
+            reward=rollout_reward,
+            done=rollout_done,
+            value=rollout_value,
+            next_value=next_value,
+            episode_stats=episode_stats,
+        )
+
+    def _ppo_update(self, batch: RolloutBatch) -> Dict[str, float]:
+        """Run PPO update on collected rollout batch."""
+        advantages, returns = compute_gae(
+            batch.reward, batch.value, batch.next_value, batch.done,
+            self.gamma, self.gae_lambda,
+        )
+        # Normalize advantages
+        adv_flat = advantages.flatten()
+        adv_mean = adv_flat.mean()
+        adv_std = adv_flat.std() + 1e-8
+        advantages = (advantages - adv_mean) / adv_std
+
+        T, E = batch.reward.shape
+        N = self.num_agents
+        total_loss_sum = 0.0
+        pg_loss_sum = 0.0
+        vf_loss_sum = 0.0
+        ent_loss_sum = 0.0
+        n_updates = 0
+
+        for _ in range(self.ppo_epochs):
+            # Flatten T*E for batch processing
+            obs_flat = {
+                key: torch.as_tensor(
+                    val.reshape(T * E, *val.shape[2:]), dtype=torch.float32, device=self.device
+                )
+                for key, val in batch.observations.items()
+                if key not in ("global_state",)
+            }
+            obs_flat["global_state"] = torch.as_tensor(
+                batch.observations["global_state"].reshape(T * E, -1), dtype=torch.float32, device=self.device
+            )
+
+            # Expand obs for agents: (T*E, N, ...) -> (T*E*N, ...)
+            self_feat = obs_flat["self_features"].reshape(T * E, N, -1)
+            entity_feat = obs_flat["entity_features"].reshape(T * E, N, *batch.observations["entity_features"].shape[3:])
+            entity_mask = obs_flat["entity_mask"].reshape(T * E, N, -1)
+            sem_map = obs_flat["semantic_map"].reshape(T * E, N, *batch.observations["semantic_map"].shape[3:])
+            goal_id = torch.as_tensor(batch.observations["current_search_goal_id"].reshape(T * E, N), dtype=torch.long, device=self.device)
+            agent_id = torch.as_tensor(batch.observations["agent_id"].reshape(T * E, N), dtype=torch.long, device=self.device)
+            region_feat = obs_flat["region_features"].reshape(T * E, N, *batch.observations["region_features"].shape[3:])
+
+            flat_actor_batch = {
+                "self_features": self_feat.reshape(T * E * N, -1),
+                "entity_features": entity_feat.reshape(T * E * N, *entity_feat.shape[2:]),
+                "entity_mask": entity_mask.reshape(T * E * N, -1),
+                "semantic_map": sem_map.reshape(T * E * N, *sem_map.shape[2:]),
+                "current_search_goal_id": goal_id.reshape(T * E * N),
+                "agent_id": agent_id.reshape(T * E * N),
+                "region_features": region_feat.reshape(T * E * N, *region_feat.shape[2:]),
+            }
+
+            h0 = torch.as_tensor(batch.initial_h.reshape(E * N, -1), dtype=torch.float32, device=self.device)
+            c0 = torch.as_tensor(batch.initial_c.reshape(E * N, -1), dtype=torch.float32, device=self.device)
+
+            # Forward pass through actor (step-by-step for LSTM)
+            all_course_logits = []
+            all_sg_logits = []
+            all_target_logits = []
+            all_fire_logits = []
+            h, c = h0, c0
+            for t in range(T):
+                step_batch = {k: v[t * E * N:(t + 1) * E * N] for k, v in flat_actor_batch.items()}
+                out = self.actor.step(step_batch, (h, c))
+                all_course_logits.append(out["course_logits"])
+                all_sg_logits.append(out["search_goal_logits"])
+                all_target_logits.append(out["target_logits"])
+                all_fire_logits.append(out["fire_logits"])
+                h, c = out["next_h"], out["next_c"]
+
+            course_logits = torch.stack(all_course_logits, dim=0).reshape(T, E, N, -1)
+            sg_logits = torch.stack(all_sg_logits, dim=0).reshape(T, E, N, -1)
+            target_logits = torch.stack(all_target_logits, dim=0).reshape(T, E, N, -1)
+            fire_logits_all = torch.stack(all_fire_logits, dim=0).reshape(T, E, N, -1, 3)
+
+            # Compute log probs
+            course_mask = torch.as_tensor(batch.observations["course_mask"].reshape(T, E, N, -1), dtype=torch.bool, device=self.device)
+            sg_mask = torch.as_tensor(batch.observations["search_goal_mask"].reshape(T, E, N, -1), dtype=torch.bool, device=self.device)
+            target_mask = torch.as_tensor(batch.observations["target_mask"].reshape(T, E, N, -1), dtype=torch.bool, device=self.device)
+
+            course_act = torch.as_tensor(batch.course_action.reshape(T, E, N), dtype=torch.long, device=self.device)
+            sg_act = torch.as_tensor(batch.search_goal_action.reshape(T, E, N), dtype=torch.long, device=self.device)
+            target_act = torch.as_tensor(batch.target_action.reshape(T, E, N), dtype=torch.long, device=self.device)
+            fire_act = torch.as_tensor(batch.fire_action.reshape(T, E, N), dtype=torch.long, device=self.device)
+
+            course_dist = masked_categorical(course_logits.reshape(T * E * N, -1), course_mask.reshape(T * E * N, -1))
+            sg_dist = masked_categorical(sg_logits.reshape(T * E * N, -1), sg_mask.reshape(T * E * N, -1))
+            target_dist = masked_categorical(target_logits.reshape(T * E * N, -1), target_mask.reshape(T * E * N, -1))
+
+            course_lp = course_dist.log_prob(course_act.reshape(T * E * N)).reshape(T, E, N)
+            sg_lp = sg_dist.log_prob(sg_act.reshape(T * E * N)).reshape(T, E, N)
+
+            # Fire log prob: select fire logits for chosen target
+            target_act_clamped = torch.clamp(target_act, min=0, max=fire_logits_all.shape[3] - 1)
+            fire_logits_sel = fire_logits_all.gather(
+                3, target_act_clamped.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, -1, 3)
+            ).squeeze(3)
+            fire_mask_t = torch.ones((T, E, N, 3), dtype=torch.bool, device=self.device)
+            fire_mask_t[..., 0] = True
+            fire_dist = masked_categorical(fire_logits_sel.reshape(T * E * N, 3), fire_mask_t.reshape(T * E * N, 3))
+            fire_lp = fire_dist.log_prob(fire_act.reshape(T * E * N)).reshape(T, E, N)
+
+            has_contact = torch.as_tensor(batch.observations["has_active_contact"].reshape(T, E, N), dtype=torch.float32, device=self.device) > 0.5
+            has_target = target_act > 0
+            new_log_prob = torch.where(has_contact, course_lp, sg_lp) + torch.where(has_target, fire_lp, torch.zeros_like(fire_lp))
+
+            old_log_prob = torch.as_tensor(batch.log_prob.reshape(T, E, N), dtype=torch.float32, device=self.device)
+            adv_t = torch.as_tensor(advantages.reshape(T, E), dtype=torch.float32, device=self.device).unsqueeze(-1).expand(-1, -1, N)
+
+            ratio = torch.exp(new_log_prob - old_log_prob)
+            pg_loss1 = -adv_t * ratio
+            pg_loss2 = -adv_t * torch.clamp(ratio, 1.0 - self.clip_coef, 1.0 + self.clip_coef)
+            pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+            # Value loss
+            global_state_t = torch.as_tensor(batch.observations["global_state"].reshape(T * E, -1), dtype=torch.float32, device=self.device)
+            new_value = self.critic(global_state_t).reshape(T, E)
+            returns_t = torch.as_tensor(returns, dtype=torch.float32, device=self.device)
+            vf_loss = F.mse_loss(new_value, returns_t)
+
+            # Entropy
+            ent = (course_dist.entropy() + sg_dist.entropy()).mean()
+
+            loss = pg_loss + self.vf_coef * vf_loss - self.ent_coef * ent
+            self.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(self.actor.parameters()) + list(self.critic.parameters()),
+                self.max_grad_norm,
+            )
+            self.optimizer.step()
+
+            total_loss_sum += loss.item()
+            pg_loss_sum += pg_loss.item()
+            vf_loss_sum += vf_loss.item()
+            ent_loss_sum += ent.item()
+            n_updates += 1
+
+        self.update_idx += 1
+        return {
+            "loss": total_loss_sum / max(n_updates, 1),
+            "pg_loss": pg_loss_sum / max(n_updates, 1),
+            "vf_loss": vf_loss_sum / max(n_updates, 1),
+            "entropy": ent_loss_sum / max(n_updates, 1),
+        }
+
+    def train(self) -> None:
+        """Main training loop."""
+        print(f"[train] Starting SkyArena MAPPO training. total_env_steps={self.total_env_steps}", flush=True)
+        while self.env_steps < self.total_env_steps:
+            batch = self._collect_rollout()
+            metrics = self._ppo_update(batch)
+
+            if batch.episode_stats:
+                wins = sum(1 for s in batch.episode_stats if s.get("winner") == "red")
+                metrics["win_rate"] = wins / len(batch.episode_stats)
+                metrics["episodes"] = len(batch.episode_stats)
+
+            log_scalars(self.writer, "train", metrics, self.env_steps)
+            print(
+                f"[train] steps={self.env_steps} loss={metrics['loss']:.4f} "
+                f"pg={metrics['pg_loss']:.4f} vf={metrics['vf_loss']:.4f} "
+                f"ent={metrics['entropy']:.4f}",
+                flush=True,
+            )
+
+            if self.env_steps >= self.next_save_step:
+                path = save_checkpoint(
+                    train_cfg=self.train_cfg,
+                    actor=self.actor,
+                    critic=self.critic,
+                    optimizer=self.optimizer,
+                    env_steps=self.env_steps,
+                    update_idx=self.update_idx,
+                )
+                print(f"[checkpoint] saved {path}", flush=True)
+                self.next_save_step += self.save_interval
+
+            if self.env_steps >= self.next_eval_step:
+                eval_metrics = self.evaluate(num_episodes=3)
+                log_scalars(self.writer, "eval", eval_metrics, self.env_steps)
+                self.next_eval_step += self.eval_interval
+
+        print(f"[train] Done. env_steps={self.env_steps}", flush=True)
+
+    def evaluate(self, num_episodes: int = 10, checkpoint_path: Optional[str] = None) -> Dict[str, float]:
+        """Evaluate current policy."""
+        if checkpoint_path is not None:
+            load_checkpoint(checkpoint_path, self.actor, self.critic, map_location=self.device)
+
+        eval_env = SkyArenaMAPPOEnv(self.cfg, seed_offset=9999)
+        hidden_dim = self.actor.lstm_hidden_dim
+        wins = 0
+        total_steps = 0
+
+        for ep in range(num_episodes):
+            obs = eval_env.reset()
+            h = torch.zeros((1, self.num_agents, hidden_dim), dtype=torch.float32, device=self.device)
+            c = torch.zeros((1, self.num_agents, hidden_dim), dtype=torch.float32, device=self.device)
+            done = False
+            ep_steps = 0
+
+            while not done:
+                obs_batch = {k: v[np.newaxis] for k, v in obs.items()}
+                with torch.no_grad():
+                    sampled = sample_policy_actions(
+                        self.actor, obs_batch, (h, c), self.device, deterministic=True,
+                    )
+                sky_action = self.action_adapter.decode(
+                    course_action=sampled["course"][0],
+                    search_goal_action=sampled["search_goal"][0],
+                    target_action=sampled["target"][0],
+                    fire_action=sampled["fire"][0],
+                    own=eval_env.engine.state.red,
+                    candidate_ids=obs_batch["candidate_ids"][0],
+                    candidate_can_long=obs_batch["candidate_can_long"][0],
+                    candidate_can_short=obs_batch["candidate_can_short"][0],
+                    has_active_contact=obs_batch["has_active_contact"][0] > 0.5,
+                    current_heading=eval_env.engine.state.red.heading[:eval_env.red_fighter_num],
+                )
+                obs, _, done, info = eval_env.step(sky_action)
+                h = sampled["next_h"].to(self.device)
+                c = sampled["next_c"].to(self.device)
+                ep_steps += 1
+
+            if info.get("winner") == "red":
+                wins += 1
+            total_steps += ep_steps
+
+        win_rate = wins / max(num_episodes, 1)
+        avg_steps = total_steps / max(num_episodes, 1)
+        print(f"[eval] episodes={num_episodes} win_rate={win_rate:.3f} avg_steps={avg_steps:.1f}", flush=True)
+        return {"win_rate": win_rate, "avg_steps": avg_steps}

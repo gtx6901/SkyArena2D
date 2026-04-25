@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -12,6 +13,8 @@ if str(ROOT) not in sys.path:
 
 from skyarena2d.core.config import load_config
 from skyarena2d.core.engine import SkyArenaEngine
+from skyarena2d.logging.episode_summary import EpisodeSummary
+from skyarena2d.logging.trace_recorder import TraceRecorder
 from skyarena2d.opponents import RULES
 
 
@@ -21,6 +24,10 @@ def main() -> None:
     parser.add_argument("--blue", default="patrol_rule")
     parser.add_argument("--episodes", type=int, default=20)
     parser.add_argument("--config", default="configs/env_10v10_full.yaml")
+    parser.add_argument("--record_trace", action="store_true", help="Record per-step trace JSONL files")
+    parser.add_argument("--trace_dir", type=str, default="logs/traces", help="Directory for trace JSONL files")
+    parser.add_argument("--record_summary", action="store_true", help="Record episode summary JSON")
+    parser.add_argument("--summary_path", type=str, default="logs/summary.json", help="Path for summary JSON output")
     args = parser.parse_args()
 
     if args.red not in RULES:
@@ -39,6 +46,7 @@ def main() -> None:
     red_kills: list[int] = []
     blue_kills: list[int] = []
     metrics_acc: list[dict[str, float | int | None]] = []
+    all_summaries: list[dict] = []
 
     for ep in range(args.episodes):
         obs, _ = env.reset(seed=ep)
@@ -50,6 +58,14 @@ def main() -> None:
         ret_blue = 0.0
         last_info = None
 
+        recorder: TraceRecorder | None = None
+        if args.record_trace:
+            recorder = TraceRecorder(trace_dir=args.trace_dir, episode=ep)
+
+        ep_summary: EpisodeSummary | None = None
+        if args.record_summary:
+            ep_summary = EpisodeSummary()
+
         while not done:
             state = env.get_state()
             red_action = red_rule.act(obs["red"], "red", state.step_count)
@@ -59,6 +75,21 @@ def main() -> None:
             ret_blue += float(reward["blue"])
             last_info = info
 
+            # Trace recording uses state.cache (populated after env.step)
+            if recorder is not None or ep_summary is not None:
+                post_state = env.get_state()
+                metrics = info.get("metrics", {})
+                reward_components = info.get("reward_components", {})
+
+                if recorder is not None:
+                    recorder.record_step(post_state, metrics, reward_components)
+
+                if ep_summary is not None:
+                    ep_summary.record_step(metrics, reward_components)
+
+        if recorder is not None:
+            recorder.close()
+
         assert last_info is not None
         winner = str(last_info["winner"])
         wins[winner] = wins.get(winner, 0) + 1
@@ -67,6 +98,12 @@ def main() -> None:
         red_kills.append(int(last_info["metrics"]["red_kills"]))
         blue_kills.append(int(last_info["metrics"]["blue_kills"]))
         metrics_acc.append(last_info["metrics"])
+
+        if ep_summary is not None:
+            final_state = env.get_state()
+            summary = ep_summary.finalize(final_state, last_info)
+            all_summaries.append(summary)
+
         print(
             f"episode={ep + 1} winner={winner} red_return={ret_red:.2f} blue_return={ret_blue:.2f} red_kills={red_kills[-1]} blue_kills={blue_kills[-1]}"
         )
@@ -84,6 +121,14 @@ def main() -> None:
     print("avg_fireability_edge_advantage:", avg_metric("fireability_edge_advantage"))
     print("avg_expected_exchange_proxy:", avg_metric("expected_exchange_proxy"))
     print("avg_contact_to_fire_gap:", avg_metric("contact_to_fire_gap"))
+
+    if args.record_summary and all_summaries:
+        summary_path = Path(args.summary_path)
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(all_summaries, f, indent=2)
+        print(f"Summary written to {summary_path}")
+
     env.close()
 
 

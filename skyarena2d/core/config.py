@@ -139,6 +139,8 @@ class EnvConfig(BaseModel):
     passive_detection: PassiveDetectionConfig = Field(default_factory=PassiveDetectionConfig)
     weapon: WeaponConfig = Field(default_factory=WeaponConfig)
     reward: RewardConfig = Field(default_factory=RewardConfig)
+    # reward_modules: optional dict controlling which reward components are active
+    reward_modules: dict = Field(default_factory=dict)
     render: RenderConfig = Field(default_factory=RenderConfig)
     red_fighter_profiles: list[FighterProfile] = Field(default_factory=list)
     blue_fighter_profiles: list[FighterProfile] = Field(default_factory=list)

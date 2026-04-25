@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -26,6 +26,16 @@ class WeaponStepResult:
     missiles_launched_short: int
     missiles_hit: int
     missiles_missed: int
+    # --- new: attempted = agent submitted fire_action > 0 ---
+    red_attempted_fire: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    blue_attempted_fire: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    # --- new: selected = attempted AND fireable (actually launched) ---
+    red_selected_long: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    red_selected_short: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    blue_selected_long: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    blue_selected_short: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    red_selected_target_idx: np.ndarray = field(default_factory=lambda: np.full(0, -1, dtype=np.int32))
+    blue_selected_target_idx: np.ndarray = field(default_factory=lambda: np.full(0, -1, dtype=np.int32))
 
 
 def _event_dict(event: MissileEvent) -> dict[str, object]:
@@ -110,11 +120,18 @@ def _queue_and_collect_launches(
     hit_targets: np.ndarray,
     fireable_long: np.ndarray,
     fireable_short: np.ndarray,
-) -> tuple[list[LaunchRecord], np.ndarray, np.ndarray, list[MissileEvent], int, int]:
+) -> tuple[list[LaunchRecord], np.ndarray, np.ndarray, list[MissileEvent], int, int,
+           np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Returns launch_records, valid, invalid, events, launched_long, launched_short,
+    attempted, selected_long, selected_short, selected_target_idx."""
     launch_records: list[LaunchRecord] = []
     events: list[MissileEvent] = []
     valid = np.zeros((own.total_units,), dtype=bool)
     invalid = np.zeros((own.total_units,), dtype=bool)
+    attempted = np.zeros((own.total_units,), dtype=bool)
+    selected_long = np.zeros((own.total_units,), dtype=bool)
+    selected_short = np.zeros((own.total_units,), dtype=bool)
+    selected_target_idx = np.full((own.total_units,), -1, dtype=np.int32)
     launched_long = 0
     launched_short = 0
 
@@ -124,6 +141,9 @@ def _queue_and_collect_launches(
         missile_type, target_idx = decode_hit_target(hit_code, max_enemy)
         if missile_type is None or target_idx is None:
             continue
+
+        # agent attempted to fire
+        attempted[i] = True
 
         can_fire = False
         reason = ""
@@ -156,12 +176,15 @@ def _queue_and_collect_launches(
             own.long_ammo[i] -= 1
             hit_prob = float(own.long_hit_prob[i])
             launched_long += 1
+            selected_long[i] = True
         else:
             own.short_ammo[i] -= 1
             hit_prob = float(own.short_hit_prob[i])
             launched_short += 1
+            selected_short[i] = True
 
         valid[i] = True
+        selected_target_idx[i] = target_idx
         launch_records.append(
             LaunchRecord(
                 attacker_side=state.red.side if side_name == "red" else state.blue.side,
@@ -187,7 +210,8 @@ def _queue_and_collect_launches(
             )
         )
 
-    return launch_records, valid, invalid, events, launched_long, launched_short
+    return (launch_records, valid, invalid, events, launched_long, launched_short,
+            attempted, selected_long, selected_short, selected_target_idx)
 
 
 def _resolve_due_events(
@@ -298,6 +322,10 @@ def process_weapons(
         red_events,
         red_launched_long,
         red_launched_short,
+        red_attempted,
+        red_sel_long,
+        red_sel_short,
+        red_sel_target,
     ) = _queue_and_collect_launches(
         state=state,
         config=config,
@@ -315,6 +343,10 @@ def process_weapons(
         blue_events,
         blue_launched_long,
         blue_launched_short,
+        blue_attempted,
+        blue_sel_long,
+        blue_sel_short,
+        blue_sel_target,
     ) = _queue_and_collect_launches(
         state=state,
         config=config,
@@ -366,4 +398,12 @@ def process_weapons(
         missiles_launched_short=red_launched_short + blue_launched_short,
         missiles_hit=missiles_hit,
         missiles_missed=missiles_missed,
+        red_attempted_fire=red_attempted,
+        blue_attempted_fire=blue_attempted,
+        red_selected_long=red_sel_long,
+        red_selected_short=red_sel_short,
+        blue_selected_long=blue_sel_long,
+        blue_selected_short=blue_sel_short,
+        red_selected_target_idx=red_sel_target,
+        blue_selected_target_idx=blue_sel_target,
     )

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+import numpy as np
 from pathlib import Path
 
 try:
@@ -25,13 +26,27 @@ def main() -> None:
     parser.add_argument("--blue", default="patrol_rule")
     parser.add_argument("--config", default="configs/env_10v10_full.yaml")
     parser.add_argument("--speed", type=float, default=30.0, help="steps per second")
+    parser.add_argument("--debug", action="store_true", help="Print debug info each step")
+    parser.add_argument("--no-jamming", action="store_true", help="Disable jamming in config")
+    parser.add_argument("--allow-passive-fire", action="store_true", help="Enable passive fire in config")
     args = parser.parse_args()
 
     if args.red not in RULES or args.blue not in RULES:
         raise ValueError("Unknown rule name")
 
     config = load_config(args.config)
+    if args.no_jamming:
+        config.jamming.enabled = False
+    if args.allow_passive_fire:
+        config.weapon.allow_passive_fire = True
+
     env = SkyArenaEngine(config, render_mode="human")
+    # Ensure pygame video system is initialized so pygame.event.* works
+    try:
+        pygame.init()
+        pygame.display.init()
+    except Exception:  # pragma: no cover - ignore environments without a display
+        pass
     red_rule = RULES[args.red]()
     blue_rule = RULES[args.blue]()
 
@@ -64,6 +79,30 @@ def main() -> None:
             blue_action = blue_rule.act(obs["blue"], "blue", state.step_count)
             obs, _, done, _, info = env.step({"red": red_action, "blue": blue_action})
             single_step = False
+            if args.debug:
+                try:
+                    state = env.get_state()
+                    cache = state.cache
+                    if cache is not None:
+                        red_vis = int(np.sum(cache.red_visible))
+                        blue_vis = int(np.sum(cache.blue_visible))
+                        red_long = int(np.sum(cache.red_fireable_long))
+                        red_short = int(np.sum(cache.red_fireable_short))
+                        blue_long = int(np.sum(cache.blue_fireable_long))
+                        blue_short = int(np.sum(cache.blue_fireable_short))
+                        print(
+                            f"Step {state.step_count}: red_vis={red_vis} blue_vis={blue_vis} "
+                            f"red_long={red_long} red_short={red_short} blue_long={blue_long} blue_short={blue_short}"
+                        )
+                        if cache.launch_records:
+                            for rec in cache.launch_records:
+                                print(
+                                    f"  LaunchRecord: {rec.attacker_side}#{rec.attacker_idx} -> {rec.target_side}#{rec.target_idx} "
+                                    f"type={rec.missile_type} valid={rec.valid} reason={rec.reason} hit_prob={rec.hit_prob}"
+                                )
+                except Exception:
+                    pass
+
             if done:
                 print(
                     f"Episode done. winner={info['winner']} reason={info['reason']} red_kills={info['metrics']['red_kills']} blue_kills={info['metrics']['blue_kills']}"

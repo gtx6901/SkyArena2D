@@ -1,0 +1,32 @@
+"""TensorBoard utilities for SkyArena MAPPO training."""
+from __future__ import annotations
+
+from typing import Dict, Optional
+
+from .checkpoint import tensorboard_dir
+
+
+def build_writer(train_cfg: dict, purge_step: Optional[int] = None):
+    """Build TensorBoard SummaryWriter if tensorboard logging is enabled."""
+    logging_cfg = train_cfg.get("logging", {})
+    if isinstance(logging_cfg, dict) and not bool(logging_cfg.get("tensorboard", True)):
+        return None
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except ImportError:
+        print("[tensorboard] SummaryWriter not available, skipping.", flush=True)
+        return None
+    tb_dir = tensorboard_dir(train_cfg)
+    tb_dir.mkdir(parents=True, exist_ok=True)
+    if purge_step is not None and int(purge_step) >= 0:
+        print("[tensorboard] log_dir=%s purge_step=%d" % (tb_dir, int(purge_step)), flush=True)
+        return SummaryWriter(log_dir=str(tb_dir), purge_step=int(purge_step))
+    return SummaryWriter(log_dir=str(tb_dir))
+
+
+def log_scalars(writer, prefix: str, values: Dict[str, float], step: int) -> None:
+    if writer is None:
+        return
+    for key, value in values.items():
+        writer.add_scalar(f"{prefix}/{key}", float(value), step)
+    writer.flush()

@@ -1,0 +1,42 @@
+train:
+  experiment_name: skyarena_mappo_smoke
+  train_dir: train_dir/skyarena_mappo
+  seed: 42
+  device: cpu
+  num_envs: 2
+  rollout_steps: 64
+  total_env_steps: 2048
+  learning_rate: 0.0003
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_coef: 0.2
+  entropy_coef: 0.01
+  value_coef: 0.5
+  ppo_epochs: 3
+  max_grad_norm: 0.5
+  save_interval: 1000
+  eval_interval: 1000
+  resume: false
+
+env:
+  config_path: configs/env_10v10_full.yaml
+  blue_rule: fix_rule_v2
+  candidate_slots: 6
+  search_goal_grid_size: 8
+  goal_hold_steps: 10
+  goal_reach_radius: 90.0
+  track_memory_steps: 10
+
+model:
+  semantic_map_size: 100
+  trunk_dim: 192
+  entity_embed_dim: 96
+  map_embed_dim: 96
+  current_goal_embed_dim: 32
+  agent_id_embed_dim: 16
+  region_embed_dim: 64
+  lstm_hidden_dim: 192
+  critic_hidden_dim: 256
+
+logging:
+  tensorboard: true
