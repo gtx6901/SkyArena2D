@@ -1,3 +1,5 @@
+"""Rule-based opponents used by stable rule-vs-rule evaluation flows."""
+
 from .base import BaseRuleOpponent
 from .fix_rule_like import FixRuleLikeOpponent
 from .fix_rule_v2 import FixRuleV2Opponent

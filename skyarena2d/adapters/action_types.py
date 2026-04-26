@@ -7,7 +7,12 @@ import numpy as np
 
 @dataclass(slots=True)
 class SkyArenaSideAction:
-    """Native SkyArena action for one side. Training pipeline uses this instead of MaCA fighter_action."""
+    """Native SkyArena action for one side.
+
+    The training pipeline uses this type as its internal action contract.
+    Conversion to MaCA-style fighter_action exists only as a legacy bridge for
+    current engine compatibility.
+    """
     course: np.ndarray        # (num_fighters,) float32, absolute heading degrees [0, 360)
     radar_freq: np.ndarray    # (num_fighters,) int32, 0=off, 1..freq_count=on
     jammer_freq: np.ndarray   # (num_fighters,) int32, 0=off, 1..freq_count+1=on
@@ -15,7 +20,11 @@ class SkyArenaSideAction:
     target_idx: np.ndarray    # (num_fighters,) int32, enemy index (0-based), -1=none
 
     def to_maca_fighter_action(self, max_enemy: int) -> np.ndarray:
-        """Convert to legacy MaCA fighter_action array (N, 4) for engine compatibility."""
+        """Convert to legacy MaCA fighter_action array (N, 4) for engine compatibility.
+
+        This conversion is a compatibility bridge, not a design goal to mirror
+        the complete MaCA API surface.
+        """
         n = len(self.course)
         arr = np.zeros((n, 4), dtype=np.float32)
         arr[:, 0] = self.course

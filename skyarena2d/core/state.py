@@ -1,3 +1,9 @@
+"""Core runtime state containers for SkyArenaEngine.
+
+These dataclasses define the stable in-memory contract used by engine.step,
+metrics, reward, rendering, and logging.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -35,6 +41,8 @@ class LaunchRecord:
 
 @dataclass(slots=True)
 class TeamState:
+    """Runtime tensors for one side (fighters + detectors)."""
+
     side: Literal["red", "blue"]
     num_fighters: int
     num_detectors: int
@@ -128,6 +136,13 @@ class MetricsTracker:
 
 @dataclass(slots=True)
 class StepCache:
+    """Per-step derived matrices and diagnostics produced by engine.step.
+
+    This cache is consumed by metrics, reward diagnostics, trace logging, and
+    training adapters. Fields here are intentionally explicit to keep debugging
+    transparent.
+    """
+
     red_visible: np.ndarray
     blue_visible: np.ndarray
     red_jammed: np.ndarray
@@ -141,7 +156,7 @@ class StepCache:
     launch_records: list[LaunchRecord]
     resolved_records: list[dict[str, Any]]
     strike_list: list[dict[str, Any]]
-    # --- new: attempted/selected per-agent arrays ---
+    # Fire decision snapshots (attempted vs selected) used by metrics/logging.
     red_attempted_fire: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
     blue_attempted_fire: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
     red_selected_long: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
@@ -163,6 +178,8 @@ class StepCache:
 
 @dataclass(slots=True)
 class EnvState:
+    """Full environment runtime state for one episode instance."""
+
     red: TeamState
     blue: TeamState
     step_count: int

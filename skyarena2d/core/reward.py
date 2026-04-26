@@ -1,3 +1,9 @@
+"""Reward composition for SkyArena2D.
+
+This module keeps reward semantics explicit and config-driven. It supports
+modular components while preserving existing training-facing reward outputs.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -13,6 +19,8 @@ from .weapons import WeaponStepResult
 
 @dataclass(slots=True)
 class RewardOutput:
+    """Reward outputs for both team-level training and legacy compatibility."""
+
     red_unit_rewards: np.ndarray
     blue_unit_rewards: np.ndarray
     red_team_reward: float
@@ -88,6 +96,9 @@ def _apply_resolution_rewards(
                 blue_kill_total += kill_reward
 
     return {"red_kill_loss": red_kill_total, "blue_kill_loss": blue_kill_total}
+
+
+# Public API
 
 
 def compute_rewards(

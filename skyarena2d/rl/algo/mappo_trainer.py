@@ -1,6 +1,8 @@
 """SkyArena MAPPO trainer.
 
 Ported from MaCA-master/algo/mappo_trainer.py.
+
+Status: experimental but runnable for smoke/integration checks.
 """
 from __future__ import annotations
 
@@ -40,7 +42,11 @@ from .search_goal_manager import TeamSearchPlanner, TeamSearchPlannerConfig
 
 
 class SkyArenaMAPPOTrainer:
-    """Minimal recurrent MAPPO trainer for SkyArena2D."""
+    """Minimal recurrent MAPPO trainer for SkyArena2D.
+
+    This trainer is intentionally kept close to current behavior and is treated
+    as experimental for convergence-sensitive workloads.
+    """
 
     def __init__(self, cfg: Dict[str, Any]):
         self.cfg = cfg

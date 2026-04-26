@@ -1,3 +1,8 @@
+"""Weapon fireability, launch scheduling, and delayed resolution logic.
+
+This module is part of the stable core combat semantics.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -10,6 +15,8 @@ from .state import EnvState, LaunchRecord, MissileEvent, TeamState
 
 @dataclass(slots=True)
 class WeaponStepResult:
+    """Structured output of one weapon-processing stage inside engine.step."""
+
     red_fireable_long: np.ndarray
     red_fireable_short: np.ndarray
     blue_fireable_long: np.ndarray
@@ -26,10 +33,10 @@ class WeaponStepResult:
     missiles_launched_short: int
     missiles_hit: int
     missiles_missed: int
-    # --- new: attempted = agent submitted fire_action > 0 ---
+    # attempted = agent submitted fire_action > 0
     red_attempted_fire: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
     blue_attempted_fire: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
-    # --- new: selected = attempted AND fireable (actually launched) ---
+    # selected = attempted and fireable (actually launched)
     red_selected_long: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
     red_selected_short: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
     blue_selected_long: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
@@ -116,6 +123,9 @@ def compute_fireable_matrix(
         & (own.short_ammo[:, None] > 0)
     )
     return long_fireable, short_fireable
+
+
+# Internal helpers
 
 
 def _queue_and_collect_launches(
@@ -308,6 +318,9 @@ def _resolve_due_events(
         state.blue.alive[np.array(killed_blue, dtype=np.int64)] = False
 
     return resolved_records, killed_red, killed_blue, missiles_hit, missiles_missed
+
+
+# Public API
 
 
 def process_weapons(

@@ -1,6 +1,8 @@
 """SkyArena MAPPO environment adapter.
 
 Wraps SkyArenaEngine for MAPPO training.
+
+Status: experimental but runnable.
 """
 from __future__ import annotations
 
@@ -22,6 +24,8 @@ class SkyArenaMAPPOEnv:
 
     Red side is controlled by MAPPO policy.
     Blue side is controlled by rule-based opponent.
+
+    This adapter is part of the experimental RL stack.
     """
 
     def __init__(self, cfg: dict, seed_offset: int = 0, deterministic_reset: bool = False):

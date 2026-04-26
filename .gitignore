@@ -30,6 +30,18 @@ htmlcov/
 # Runtime outputs and experiments
 logs/
 train_dir/
+runs/
+checkpoints/
+
+# Training/eval artifacts
+*.pt
+*.pth
+*.ckpt
+*.mp4
+*.gif
+*.npz
+events.out.tfevents.*
+config.resolved.json
 
 # Editor/system files
 .DS_Store
