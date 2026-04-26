@@ -45,7 +45,12 @@ class SkyArenaMAPPOEnv:
         blue_rule_name = env_cfg.get("blue_rule", "fix_rule_v2")
         if blue_rule_name not in RULES:
             raise ValueError(f"Unknown blue rule: {blue_rule_name}")
-        self.blue_opponent = RULES[blue_rule_name](seed=self._base_seed + seed_offset + 1000)
+        # Pass map dimensions for rules that need boundary awareness
+        opponent_kwargs: dict = {"seed": self._base_seed + seed_offset + 1000}
+        if blue_rule_name == "no_attack_rule":
+            opponent_kwargs["map_width"] = self.engine_config.map.width
+            opponent_kwargs["map_height"] = self.engine_config.map.height
+        self.blue_opponent = RULES[blue_rule_name](**opponent_kwargs)
 
         # Create obs builder
         self.obs_builder = SkyArenaTrainingObsBuilder(

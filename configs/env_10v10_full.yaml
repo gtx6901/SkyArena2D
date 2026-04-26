@@ -102,3 +102,7 @@ reward_modules:
   selected_exchange:
     enabled: false
     coef: 0.05
+  elimination_bonus:
+    enabled: true
+    red_eliminates_blue: 10.0
+    blue_eliminates_red: 10.0

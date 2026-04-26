@@ -272,6 +272,28 @@ def compute_rewards(
             "blue_round": float(blue_round),
         }
 
+    # --- elimination_bonus (terminal only, full-elimination wins) ---
+    if _mod_enabled("elimination_bonus") and termination_result.done:
+        reason = termination_result.reason
+        if reason in ("blue_eliminated", "red_eliminated"):
+            red_bonus = _mod_weight("elimination_bonus", "red_eliminates_blue", 10.0)
+            blue_bonus = _mod_weight("elimination_bonus", "blue_eliminates_red", 10.0)
+            delta_red = np.zeros_like(red_rewards)
+            delta_blue = np.zeros_like(blue_rewards)
+            if reason == "blue_eliminated":
+                delta_red += red_bonus
+                delta_blue -= red_bonus
+            else:  # red_eliminated
+                delta_blue += blue_bonus
+                delta_red -= blue_bonus
+            red_rewards += delta_red
+            blue_rewards += delta_blue
+            components["elimination_bonus"] = {
+                "red": float(np.sum(delta_red)),
+                "blue": float(np.sum(delta_blue)),
+                "reason": reason,
+            }
+
     state.last_round_reward_red = red_round
     state.last_round_reward_blue = blue_round
 
