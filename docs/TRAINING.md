@@ -29,6 +29,15 @@
 - `expected_exchange_proxy` 反映理论火力交换优势。
 - `selected_expected_exchange` 反映实际选择后的火力交换优势。
 
+### GUI 渲染说明
+
+在 GUI debug overlay 中，两种线的含义不同：
+
+- **虚线暗橙线（fireable edge）**：仅表示理论可开火机会（fireable edges），不代表导弹已发射。由 `show_fireable_edges` 控制。
+- **实线亮色线 + 端点圆点（missile launch）**：表示实际合法发射的导弹。长程导弹为亮黄色，短程导弹为亮红橙色。由 `show_target_allocations` 控制。
+
+Scoreboard 第二行新增 `attempt`、`selected`、`invalid` 计数（R/B），分别对应红蓝双方的尝试攻击边数、合法发射边数和非法开火次数。
+
 ## 训练产物管理
 
 不要把训练产物提交到 git：

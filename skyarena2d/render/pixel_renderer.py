@@ -60,6 +60,38 @@ class PixelRenderer:
         for y in range(self.scoreboard_height, self.render_height, step):
             pygame.draw.line(surface, palette.GRID, (0, y), (self.render_width, y), 1)
 
+    @staticmethod
+    def _draw_dashed_line(
+        surface,
+        color: tuple[int, int, int],
+        p1: tuple[int, int],
+        p2: tuple[int, int],
+        dash_len: int = 6,
+        gap_len: int = 4,
+        width: int = 1,
+    ) -> None:
+        """Draw a dashed line from p1 to p2."""
+        if pygame is None:
+            return
+        dx = p2[0] - p1[0]
+        dy = p2[1] - p1[1]
+        dist = math.hypot(dx, dy)
+        if dist < 1:
+            return
+        ux = dx / dist
+        uy = dy / dist
+        pos = 0.0
+        drawing = True
+        while pos < dist:
+            seg_len = dash_len if drawing else gap_len
+            seg_end = min(pos + seg_len, dist)
+            if drawing:
+                start_pt = (int(p1[0] + ux * pos), int(p1[1] + uy * pos))
+                end_pt = (int(p1[0] + ux * seg_end), int(p1[1] + uy * seg_end))
+                pygame.draw.line(surface, color, start_pt, end_pt, width)
+            pos = seg_end
+            drawing = not drawing
+
     def _draw_cone(
         self,
         surface,
@@ -121,13 +153,13 @@ class PixelRenderer:
             for i, j in red_fire.tolist():
                 p1 = self._world_to_screen(float(state.red.pos[i, 0]), float(state.red.pos[i, 1]))
                 p2 = self._world_to_screen(float(state.blue.pos[j, 0]), float(state.blue.pos[j, 1]))
-                pygame.draw.line(surface, palette.EDGE_FIREABLE, p1, p2, 1)
+                self._draw_dashed_line(surface, palette.EDGE_FIREABLE, p1, p2)
 
             blue_fire = np.argwhere(state.cache.blue_fireable_long | state.cache.blue_fireable_short)
             for i, j in blue_fire.tolist():
                 p1 = self._world_to_screen(float(state.blue.pos[i, 0]), float(state.blue.pos[i, 1]))
                 p2 = self._world_to_screen(float(state.red.pos[j, 0]), float(state.red.pos[j, 1]))
-                pygame.draw.line(surface, palette.EDGE_FIREABLE, p1, p2, 1)
+                self._draw_dashed_line(surface, palette.EDGE_FIREABLE, p1, p2)
 
     def _draw_missiles(self, surface, state: EnvState) -> None:
         if pygame is None or state.cache is None or not self.config.render.show_target_allocations:
@@ -145,7 +177,8 @@ class PixelRenderer:
                 color = palette.MISSILE_LONG if launch.missile_type == "long" else palette.MISSILE_SHORT
             p1 = self._world_to_screen(float(src[0]), float(src[1]))
             p2 = self._world_to_screen(float(dst[0]), float(dst[1]))
-            pygame.draw.line(surface, color, p1, p2, 1)
+            pygame.draw.line(surface, color, p1, p2, 2)
+            pygame.draw.circle(surface, color, p2, 3)
 
     def _draw_team(self, surface, state: EnvState, side: str) -> None:
         if pygame is None:
@@ -197,7 +230,20 @@ class PixelRenderer:
         red_missiles = state.red.remaining_missiles()
         blue_missiles = state.blue.remaining_missiles()
 
-        # Row 2: metrics
+        # Row 2: attempt / selected / invalid counts
+        if metrics is not None:
+            red_attempt = metrics.get("red_attempted_edges", "---")
+            blue_attempt = metrics.get("blue_attempted_edges", "---")
+            red_select = metrics.get("red_selected_edges", "---")
+            blue_select = metrics.get("blue_selected_edges", "---")
+            red_invalid = metrics.get("red_invalid_fire_count", "---")
+            blue_invalid = metrics.get("blue_invalid_fire_count", "---")
+        else:
+            red_attempt = blue_attempt = "---"
+            red_select = blue_select = "---"
+            red_invalid = blue_invalid = "---"
+
+        # Row 3: detailed metrics
         if metrics is not None:
             red_fire_edges = metrics.get("red_fireable_edges", "---")
             blue_fire_edges = metrics.get("blue_fireable_edges", "---")
@@ -240,6 +286,21 @@ class PixelRenderer:
         ]
 
         row2_segments = [
+            ("attempt R:", W),
+            (f"{red_attempt}", R),
+            (" B:", W),
+            (f"{blue_attempt}", B),
+            ("  selected R:", W),
+            (f"{red_select}", R),
+            (" B:", W),
+            (f"{blue_select}", B),
+            ("  invalid R:", W),
+            (f"{red_invalid}", R),
+            (" B:", W),
+            (f"{blue_invalid}", B),
+        ]
+
+        row3_segments = [
             ("fireable R:", W),
             (f"{red_fire_edges}", R),
             (" B:", W),
@@ -259,7 +320,8 @@ class PixelRenderer:
                 x += surf.get_width()
 
         render_row(row1_segments, 6)
-        render_row(row2_segments, 28)
+        render_row(row2_segments, 24)
+        render_row(row3_segments, 42)
 
     def _render_surface(self, state: EnvState, metrics: dict | None = None):
         if pygame is None:
