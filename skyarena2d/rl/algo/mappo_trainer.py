@@ -206,34 +206,124 @@ class SkyArenaMAPPOTrainer:
             elif render_mode == "human":
                 print("[gui_eval] mode=human, a live window will be opened during GUI eval", flush=True)
 
+    @staticmethod
+    def _mean_numeric_dicts(dicts: List[dict]) -> dict:
+        """Average numeric values across a list of dicts. Non-numeric keys are skipped."""
+        if not dicts:
+            return {}
+        result = {}
+        for key in dicts[0]:
+            values = []
+            for d in dicts:
+                v = d.get(key)
+                if v is not None and isinstance(v, (int, float, np.integer, np.floating, bool)):
+                    values.append(float(v))
+            if values:
+                result[key] = float(np.mean(values))
+        return result
+
+    def _collect_rollout_step_diagnostics(self, batch: RolloutBatch) -> dict:
+        """Compute per-step rollout diagnostics from actions / masks / obs."""
+        T, E = batch.reward.shape
+        N = self.num_agents
+
+        alive_mask = (batch.observations["alive_mask"][:, :, :N] > 0.5).astype(np.float32)
+        has_contact = (batch.observations["has_active_contact"][:, :, :N] > 0.5).astype(np.float32)
+        entity_mask = batch.observations["entity_mask"].reshape(T, E, N, -1).astype(np.float32)
+        candidate_ids = batch.observations["candidate_ids"].reshape(T, E, N, -1)
+        can_long = batch.observations["candidate_can_long"].reshape(T, E, N, -1).astype(np.float32)
+        can_short = batch.observations["candidate_can_short"].reshape(T, E, N, -1).astype(np.float32)
+        target_action = batch.target_action[:, :, :N]
+        fire_action = batch.fire_action[:, :, :N]
+
+        alive_count = alive_mask.sum(axis=-1)  # (T, E)
+        alive_rate = alive_count / max(N, 1)
+
+        # Per-agent entity count
+        entity_per_agent = entity_mask.sum(axis=-1)  # (T, E, N)
+        entity_valid_count = np.where(alive_mask > 0, entity_per_agent, 0.0).sum(axis=-1) / np.maximum(alive_count, 1)
+
+        # Contact rate among alive agents
+        contact_rate = (has_contact * alive_mask).sum(axis=-1) / np.maximum(alive_count, 1)
+
+        # Target / fire nonzero (binary per step: any alive agent selected target/fire > 0)
+        target_nonzero = np.any((target_action > 0) & (alive_mask > 0.5), axis=-1)
+        fire_nonzero = np.any((fire_action > 0) & (alive_mask > 0.5), axis=-1)
+
+        target_nonzero_rate = float(target_nonzero.mean())
+        fire_nonzero_rate = float(fire_nonzero.mean())
+
+        # no_target_rate: steps with alive agents but no target
+        has_alive = alive_count > 0
+        no_target_rate = float(np.where(has_alive, ~target_nonzero, 0.0).mean()) if has_alive.any() else 0.0
+
+        # no_fire_rate: steps with target but no fire
+        target_steps = max(int(target_nonzero.sum()), 1)
+        no_fire_rate = float((target_nonzero & ~fire_nonzero).sum()) / target_steps
+
+        # Target availability per alive agent
+        has_valid = np.any(candidate_ids >= 0, axis=-1)
+        target_available = np.where(alive_mask > 0, has_valid, 0.0).sum(axis=-1) / np.maximum(alive_count, 1)
+
+        # Long / short available rates among valid candidates
+        valid = candidate_ids >= 0
+        n_valid = valid.sum()
+        long_count = (can_long * valid).sum()
+        short_count = (can_short * valid).sum()
+
+        return {
+            "target_nonzero_rate": target_nonzero_rate,
+            "fire_nonzero_rate": fire_nonzero_rate,
+            "no_target_rate": no_target_rate,
+            "no_fire_rate": no_fire_rate,
+            "alive_rate": float(alive_rate.mean()),
+            "contact_rate": float(contact_rate.mean()),
+            "entity_valid_count": float(entity_valid_count.mean()),
+            "target_available_rate": float(target_available.mean()),
+            "long_available_rate": float(long_count / max(n_valid, 1)),
+            "short_available_rate": float(short_count / max(n_valid, 1)),
+        }
+
     def _summarize_rollout_episodes(self, episode_stats: List[Dict[str, Any]]) -> Dict[str, float]:
-        """Summarize naturally finished episodes seen inside the latest rollout."""
+        """Summarize naturally finished episodes seen inside the latest rollout.
+
+        Returns empty dict when no episodes finished (so nothing is logged).
+        """
         episodes_finished = len(episode_stats)
+        if episodes_finished == 0:
+            return {}
         red_wins = sum(1 for s in episode_stats if s.get("winner") == "red")
         blue_wins = sum(1 for s in episode_stats if s.get("winner") == "blue")
         draws = sum(1 for s in episode_stats if s.get("winner") not in ("red", "blue"))
-        finished_envs = {int(s.get("env_idx", -1)) for s in episode_stats if int(s.get("env_idx", -1)) >= 0}
-        ongoing_or_truncated = max(self.num_envs - len(finished_envs), 0)
-        avg_len = (
-            float(np.mean([float(s.get("episode_len", s.get("steps", 0))) for s in episode_stats]))
-            if episode_stats
-            else 0.0
-        )
-        avg_return = (
-            float(np.mean([float(s.get("episode_return", 0.0)) for s in episode_stats]))
-            if episode_stats
-            else 0.0
-        )
+        avg_len = float(np.mean([float(s.get("episode_len", s.get("steps", 0))) for s in episode_stats]))
+        avg_return = float(np.mean([float(s.get("episode_return", 0.0)) for s in episode_stats]))
         return {
-            "win_rate_finished_episodes": red_wins / max(episodes_finished, 1),
-            "episodes_finished": float(episodes_finished),
-            "red_wins_finished": float(red_wins),
-            "blue_wins_finished": float(blue_wins),
-            "draws_finished": float(draws),
-            "ongoing_or_truncated": float(ongoing_or_truncated),
-            "avg_episode_len_finished": avg_len,
-            "avg_return_finished": avg_return,
+            "win_rate": red_wins / max(episodes_finished, 1),
+            "episode_len": avg_len,
+            "episode_return": avg_return,
+            "red_wins": float(red_wins),
+            "blue_wins": float(blue_wins),
+            "draws": float(draws),
         }
+
+    @staticmethod
+    def _summarize_episode_metrics(episode_stats: List[Dict[str, Any]]) -> dict:
+        """Extract episode-level metrics from final info['metrics'] across episodes."""
+        if not episode_stats:
+            return {}
+        result = {}
+        for key in [
+            "red_kills", "blue_kills", "red_losses", "blue_losses",
+            "missiles_launched_long", "missiles_launched_short",
+            "missiles_hit", "missiles_missed",
+            "red_attempted_edges", "red_selected_edges", "red_invalid_fire_count",
+            "contact_to_fire_gap",
+        ]:
+            values = [float(s["final_metrics"][key]) for s in episode_stats
+                      if s.get("final_metrics") and key in s["final_metrics"]]
+            if values:
+                result[key] = float(np.mean(values))
+        return result
 
     def _collect_rollout(self) -> RolloutBatch:
         """Collect rollout_steps of experience from all envs."""
@@ -251,6 +341,7 @@ class SkyArenaMAPPOTrainer:
         initial_h = self.actor_h.detach().cpu().numpy().copy()
         initial_c = self.actor_c.detach().cpu().numpy().copy()
         episode_stats: List[Dict[str, Any]] = []
+        step_metrics_list: List[dict] = []
 
         for step in range(self.rollout_steps):
             obs_batch = stack_env_obs(self.current_obs)
@@ -314,6 +405,9 @@ class SkyArenaMAPPOTrainer:
                 self._episode_returns[env_idx] += float(reward)
                 self._episode_lengths[env_idx] += 1
 
+                # Collect per-step metrics
+                step_metrics_list.append(info.get("metrics", {}))
+
                 if done:
                     episode_stats.append({
                         "env_idx": env_idx,
@@ -322,6 +416,7 @@ class SkyArenaMAPPOTrainer:
                         "steps": env.engine.state.step_count,
                         "episode_len": int(self._episode_lengths[env_idx]),
                         "episode_return": float(self._episode_returns[env_idx]),
+                        "final_metrics": info.get("metrics", {}),
                     })
                     self._episode_returns[env_idx] = 0.0
                     self._episode_lengths[env_idx] = 0
@@ -343,7 +438,7 @@ class SkyArenaMAPPOTrainer:
             global_state_t = torch.as_tensor(final_batched["global_state"], dtype=torch.float32, device=self.device)
             next_value = self.critic(global_state_t).detach().cpu().numpy()
 
-        return RolloutBatch(
+        batch = RolloutBatch(
             observations=rollout_obs,
             initial_h=initial_h,
             initial_c=initial_c,
@@ -359,6 +454,7 @@ class SkyArenaMAPPOTrainer:
             next_value=next_value,
             episode_stats=episode_stats,
         )
+        return batch, step_metrics_list
 
     def _ppo_update(self, batch: RolloutBatch) -> Dict[str, float]:
         """Run PPO update on collected rollout batch."""
@@ -529,24 +625,47 @@ class SkyArenaMAPPOTrainer:
         """Main training loop."""
         print(f"[train] Starting SkyArena MAPPO training. total_env_steps={self.total_env_steps}", flush=True)
         while self.env_steps < self.total_env_steps:
-            batch = self._collect_rollout()
+            batch, step_metrics_list = self._collect_rollout()
             metrics = self._ppo_update(batch)
-            rollout_metrics = self._summarize_rollout_episodes(batch.episode_stats)
 
+            # --- Compute logging groups ---
+            # train/* (always written)
             log_scalars(self.writer, "train", metrics, self.env_steps)
-            log_scalars(self.writer, "rollout", rollout_metrics, self.env_steps)
+
+            # rollout_step/* (always written — per-step averages)
+            step_diags = self._collect_rollout_step_diagnostics(batch)
+            log_scalars(self.writer, "rollout_step", step_diags, self.env_steps)
+
+            # metrics_step/* (always written — from env info["metrics"])
+            metrics_step = self._mean_numeric_dicts(step_metrics_list)
+            log_scalars(self.writer, "metrics_step", metrics_step, self.env_steps)
+
+            # episode_mean/* (only when episodes finished)
+            episode_metrics = self._summarize_rollout_episodes(batch.episode_stats)
+            if episode_metrics:
+                log_scalars(self.writer, "episode_mean", episode_metrics, self.env_steps)
+
+            # episode/* (from final info["metrics"] of finished episodes)
+            episode_final = self._summarize_episode_metrics(batch.episode_stats)
+            if episode_final:
+                log_scalars(self.writer, "episode", episode_final, self.env_steps)
+
             print(
                 f"[train] steps={self.env_steps} loss={metrics['loss']:.4f} "
                 f"pg={metrics['pg_loss']:.4f} vf={metrics['vf_loss']:.4f} "
                 f"ent={metrics['entropy']:.4f}",
                 flush=True,
             )
-            print(
-                f"[rollout] finished={int(rollout_metrics['episodes_finished'])} "
-                f"red_win_rate={rollout_metrics['win_rate_finished_episodes']:.3f} "
-                f"avg_len={rollout_metrics['avg_episode_len_finished']:.1f}",
-                flush=True,
-            )
+            if episode_metrics:
+                n_finished = len(batch.episode_stats)
+                print(
+                    f"[rollout] finished={n_finished} "
+                    f"win_rate={episode_metrics['win_rate']:.3f} "
+                    f"avg_len={episode_metrics['episode_len']:.1f}",
+                    flush=True,
+                )
+            else:
+                print("[rollout] no episodes finished this update", flush=True)
 
             if self.env_steps >= self.next_save_step:
                 path = save_checkpoint(
@@ -888,7 +1007,13 @@ class SkyArenaMAPPOTrainer:
             "episode_len": avg_steps,
             "red_kills": avg_red_kills,
             "blue_kills": avg_blue_kills,
-            # Diagnostics
+            # Diagnostics — bare keys for direct consumption
+            "target_nonzero_rate": red_target_nonzero_rate,
+            "fire_nonzero_rate": red_fire_nonzero_rate,
+            "red_attempted_edges": red_attempted_edges,
+            "red_selected_edges": red_selected_edges,
+            "red_invalid_fire_count": red_invalid_fire_count,
+            # Diagnostics — prefixed for backward compat
             "diagnostics_red_target_nonzero_rate": red_target_nonzero_rate,
             "diagnostics_red_fire_nonzero_rate": red_fire_nonzero_rate,
             "diagnostics_red_attempted_edges": red_attempted_edges,
