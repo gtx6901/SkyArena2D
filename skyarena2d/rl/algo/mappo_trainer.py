@@ -901,6 +901,11 @@ class SkyArenaMAPPOTrainer:
         diag_fire_mask_long = 0.0
         diag_fire_mask_short = 0.0
         diag_fire_argmax_nonzero = 0.0
+        diag_adapter_zeroed_fire = 0
+        diag_fire_nonzero_count = 0
+        diag_target_nonzero_count = 0
+        diag_tgt_can_long_sum = 0.0
+        diag_tgt_can_short_sum = 0.0
         episode_records: list = []
 
         for ep in range(num_episodes):
@@ -942,6 +947,12 @@ class SkyArenaMAPPOTrainer:
             ep_fire_mask_long = 0.0
             ep_fire_mask_short = 0.0
             ep_fire_argmax_nonzero = 0.0
+            # Adapter zeroing diagnostics
+            ep_adapter_zeroed_fire = 0
+            ep_fire_nonzero_count = 0
+            ep_target_nonzero_count = 0
+            ep_tgt_can_long_sum = 0.0
+            ep_tgt_can_short_sum = 0.0
 
             frame_dir: Optional[Path] = None
             if save_visual and render_mode == "rgb_array" and output_dir is not None:
@@ -971,6 +982,26 @@ class SkyArenaMAPPOTrainer:
                     ew_state_key="eval",
                     step_count=eval_env.engine.state.step_count,
                 )
+                # --- Adapter zeroing diagnostics ---
+                fire_policy = sampled["fire"][0]  # (N,) raw policy fire action
+                fire_decoded = sky_action.fire_type  # (N,) decoded fire type
+                tgt_policy = sampled["target"][0]  # (N,) 1-indexed slot
+                tgt_decoded = sky_action.target_idx  # (N,) enemy index
+                alive = (obs_batch["alive_mask"][0] > 0.5)
+                can_long_arr = obs_batch["candidate_can_long"][0]
+                can_short_arr = obs_batch["candidate_can_short"][0]
+                # adapter zeroed: policy wanted fire but adapter set fire_type=0
+                adapter_zeroed = (fire_policy > 0) & (fire_decoded == 0) & alive
+                ep_adapter_zeroed_fire += int(np.count_nonzero(adapter_zeroed))
+                ep_fire_nonzero_count += int(np.count_nonzero((fire_policy > 0) & alive))
+                has_tgt = (tgt_policy > 0) & alive
+                n_tgt = int(np.count_nonzero(has_tgt))
+                ep_target_nonzero_count += n_tgt
+                if n_tgt > 0:
+                    slot_idx = np.clip(tgt_policy[has_tgt] - 1, 0, can_long_arr.shape[1] - 1)
+                    idx = np.arange(has_tgt.shape[0])[has_tgt]
+                    ep_tgt_can_long_sum += float(np.mean(can_long_arr[idx, slot_idx]))
+                    ep_tgt_can_short_sum += float(np.mean(can_short_arr[idx, slot_idx]))
                 eval_env.set_current_search_goal_id(sampled["search_goal"][0])
                 obs, reward, done, info = eval_env.step(sky_action)
                 ep_return += float(reward)
@@ -1139,6 +1170,12 @@ class SkyArenaMAPPOTrainer:
             ep_fire_mask_long_rate = ep_fire_mask_long / fp_denom
             ep_fire_mask_short_rate = ep_fire_mask_short / fp_denom
             ep_fire_argmax_nz_rate = ep_fire_argmax_nonzero / fp_denom
+            # Adapter diag rates
+            ep_adapter_zeroed_rate = ep_adapter_zeroed_fire / max(ep_fire_nonzero_count, 1)
+            ep_tgt_fireable_steps = max(ep_target_nonzero_count, 1)
+            ep_tgt_can_long_rate = ep_tgt_can_long_sum / ep_tgt_fireable_steps
+            ep_tgt_can_short_rate = ep_tgt_can_short_sum / ep_tgt_fireable_steps
+            ep_tgt_fireable_rate = (ep_tgt_can_long_sum + ep_tgt_can_short_sum) / ep_tgt_fireable_steps
 
             episode_records.append({
                 "episode": ep,
@@ -1175,6 +1212,11 @@ class SkyArenaMAPPOTrainer:
                 "fire_entropy_mean": float(ep_fire_ent_mean),
                 "fire_valid_mask_long_rate": float(ep_fire_mask_long_rate),
                 "fire_valid_mask_short_rate": float(ep_fire_mask_short_rate),
+                "adapter_zeroed_fire_rate": float(ep_adapter_zeroed_rate),
+                "target_selected_fireable_rate": float(ep_tgt_fireable_rate),
+                "target_selected_nonfireable_rate": 1.0 - float(ep_tgt_fireable_rate),
+                "selected_target_can_long_rate": float(ep_tgt_can_long_rate),
+                "selected_target_can_short_rate": float(ep_tgt_can_short_rate),
             })
 
             diag_missiles_long += int(metrics.get("missiles_launched_long", 0))
@@ -1196,6 +1238,12 @@ class SkyArenaMAPPOTrainer:
             diag_fire_prob_steps += ep_fire_prob_steps
             diag_fire_mask_long += ep_fire_mask_long
             diag_fire_mask_short += ep_fire_mask_short
+            diag_adapter_zeroed_fire += ep_adapter_zeroed_fire
+            diag_fire_nonzero_count += ep_fire_nonzero_count
+            diag_target_nonzero_count += ep_target_nonzero_count
+            diag_tgt_can_long_sum += ep_tgt_can_long_sum
+            diag_tgt_can_short_sum += ep_tgt_can_short_sum
+
             diag_fire_argmax_nonzero += ep_fire_argmax_nonzero
             diag_blue_fireable += int(metrics.get("blue_fireable_edges", 0))
 
@@ -1265,6 +1313,13 @@ class SkyArenaMAPPOTrainer:
         fire_mask_short_rate = diag_fire_mask_short / fire_prob_denom
         fire_argmax_nonzero_rate = diag_fire_argmax_nonzero / fire_prob_denom
 
+        # Adapter zeroing / target fireability diagnostics
+        adapter_zeroed_rate = diag_adapter_zeroed_fire / max(diag_fire_nonzero_count, 1)
+        tgt_fireable_denom = max(diag_target_nonzero_count, 1)
+        target_selected_fireable_rate = (diag_tgt_can_long_sum + diag_tgt_can_short_sum) / tgt_fireable_denom
+        selected_target_can_long_rate = diag_tgt_can_long_sum / tgt_fireable_denom
+        selected_target_can_short_rate = diag_tgt_can_short_sum / tgt_fireable_denom
+
         # --- Write eval report ---
         if write_report:
             n_eps = max(num_episodes, 1)
@@ -1306,6 +1361,12 @@ class SkyArenaMAPPOTrainer:
                 "fire_entropy_mean": fire_entropy_mean,
                 "fire_valid_mask_long_rate": fire_mask_long_rate,
                 "fire_valid_mask_short_rate": fire_mask_short_rate,
+                # Adapter zeroing / target fireability diagnostics
+                "adapter_zeroed_fire_rate": adapter_zeroed_rate,
+                "target_selected_fireable_rate": target_selected_fireable_rate,
+                "target_selected_nonfireable_rate": 1.0 - target_selected_fireable_rate,
+                "selected_target_can_long_rate": selected_target_can_long_rate,
+                "selected_target_can_short_rate": selected_target_can_short_rate,
                 # Backward-compat aliases
                 "target_nonzero_rate": red_target_nonzero_rate,
                 "fire_nonzero_rate": red_fire_nonzero_rate,
@@ -1353,6 +1414,12 @@ class SkyArenaMAPPOTrainer:
             "fire_entropy_mean": fire_entropy_mean,
             "fire_valid_mask_long_rate": fire_mask_long_rate,
             "fire_valid_mask_short_rate": fire_mask_short_rate,
+            # Adapter zeroing / target fireability diagnostics
+            "adapter_zeroed_fire_rate": adapter_zeroed_rate,
+            "target_selected_fireable_rate": target_selected_fireable_rate,
+            "target_selected_nonfireable_rate": 1.0 - target_selected_fireable_rate,
+            "selected_target_can_long_rate": selected_target_can_long_rate,
+            "selected_target_can_short_rate": selected_target_can_short_rate,
             # Diagnostics — prefixed for backward compat
             "diagnostics_red_target_nonzero_rate": red_target_nonzero_rate,
             "diagnostics_red_fire_nonzero_rate": red_fire_nonzero_rate,
