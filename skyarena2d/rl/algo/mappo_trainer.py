@@ -399,6 +399,7 @@ class SkyArenaMAPPOTrainer:
                     step_count=env.engine.state.step_count,
                 )
 
+                env.set_current_search_goal_id(search_goal_i)
                 next_obs, reward, done, info = env.step(sky_action)
                 rollout_reward[step, env_idx] = reward
                 rollout_done[step, env_idx] = float(done)
@@ -838,6 +839,7 @@ class SkyArenaMAPPOTrainer:
                     ew_state_key="eval",
                     step_count=eval_env.engine.state.step_count,
                 )
+                eval_env.set_current_search_goal_id(sampled["search_goal"][0])
                 obs, reward, done, info = eval_env.step(sky_action)
                 ep_return += float(reward)
                 h = sampled["next_h"].to(self.device)

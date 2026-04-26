@@ -77,6 +77,7 @@ class SkyArenaMAPPOEnv:
         self.blue_fighter_num = self.engine_config.teams.blue_fighters
         self._last_obs = None
         self._last_info = None
+        self._current_search_goal_id = np.zeros(self.red_fighter_num, dtype=np.int64)
 
     def reset(self) -> dict:
         """Reset environment and return initial policy obs for red."""
@@ -92,6 +93,7 @@ class SkyArenaMAPPOEnv:
         self._reset_counter += 1
         self.obs_builder.reset()
         self.action_adapter.reset_ew_state()
+        self._current_search_goal_id[:] = 0
 
         self._last_obs = obs
         self._last_info = info
@@ -140,6 +142,19 @@ class SkyArenaMAPPOEnv:
 
         return policy_obs, red_reward, done, info
 
+    def set_current_search_goal_id(self, goal_id: np.ndarray) -> None:
+        """Set current search goal ids for the next policy obs build.
+
+        goal_id: (red_fighter_num,) int64 array of goal bin indices
+        """
+        goal_id = np.asarray(goal_id, dtype=np.int64)
+        if goal_id.shape != (self.red_fighter_num,):
+            raise ValueError(
+                f"goal_id shape must be ({self.red_fighter_num},), got {goal_id.shape}"
+            )
+        max_goal = self.obs_builder.search_goal_grid_size ** 2
+        self._current_search_goal_id = np.clip(goal_id, 0, max_goal - 1).astype(np.int64, copy=True)
+
     def _build_policy_obs(self, obs: dict, info: dict) -> dict:
         """Build policy observation for red side."""
         # Use cached visible/fireable matrices from engine state
@@ -162,7 +177,7 @@ class SkyArenaMAPPOEnv:
             fireable_short=fireable_short,
             step_count=self.engine.state.step_count,
             max_steps=self.engine_config.max_steps,
-            current_search_goal_id=np.zeros(self.red_fighter_num, dtype=np.int64),
+            current_search_goal_id=self._current_search_goal_id.copy(),
         )
 
         # Add global state for critic
