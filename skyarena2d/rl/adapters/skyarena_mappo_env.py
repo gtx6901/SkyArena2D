@@ -82,8 +82,8 @@ class SkyArenaMAPPOEnv:
     def reset(self) -> dict:
         """Reset environment and return initial policy obs for red."""
         if self.deterministic_reset:
-            env_seed = self._base_seed + self.seed_offset
-            opp_seed = self._base_seed + self.seed_offset + 1000
+            env_seed = self._base_seed + self.seed_offset + self._reset_counter
+            opp_seed = self._base_seed + self.seed_offset + self._reset_counter + 1000
         else:
             env_seed = self._base_seed + self.seed_offset * 100000 + self._reset_counter
             opp_seed = self._base_seed + self.seed_offset * 100000 + self._reset_counter + 1000

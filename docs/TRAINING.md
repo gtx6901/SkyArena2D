@@ -29,6 +29,37 @@
 - `expected_exchange_proxy` 反映理论火力交换优势。
 - `selected_expected_exchange` 反映实际选择后的火力交换优势。
 
+### Fire Head 诊断
+
+eval report 新增以下 fire head 诊断指标，用于判断 fire head 塌缩原因：
+
+- `fire_argmax_nonzero_rate` — argmax 选非 no-fire 的比例
+- `fire_noop_prob_mean` — softmax 后 no-fire 通道的平均概率
+- `fire_long_prob_mean` / `fire_short_prob_mean` — long/short 通道平均概率
+- `fire_entropy_mean` — fire 分布的平均熵（接近 1.099 = 均匀分布）
+- `fire_valid_mask_long_rate` / `fire_valid_mask_short_rate` — fire mask 中 long/short 合法的比例
+
+判断逻辑：
+
+| 现象 | 可能原因 |
+|---|---|
+| `fire_action_nonzero_rate` ≈ 0，`fire_argmax_nonzero_rate` ≈ 0，`fire_noop_prob_mean` 很高 | fire head 偏向 no-fire |
+| `fire_action_nonzero_rate` ≈ 0，`fire_valid_mask_*_rate` ≈ 0 | 合法开火机会太少，fire mask 封锁 long/short |
+| `target_action_nonzero_rate` > 0，`fire_action_nonzero_rate` = 0 | target 已启动但 fire head 未启动 |
+
+### Eval Seed 说明
+
+- deterministic policy eval 不等于每 episode 相同 reset seed
+- 同一 eval 内每个 episode 使用 `base_seed + seed_offset + episode_idx` 生成不同初始状态
+- episode record 中 `seed` 字段记录本 episode 的实际 seed
+
+### 指标口径说明
+
+eval report 中指标按口径分为两类：
+
+- `*_mean` 后缀：step-mean 口径，在 episode 内每步平均
+- 无 `_mean` 后缀的累计指标（如 `red_kills`、`missiles_launched_long`）：episode-final 口径
+
 ### GUI 渲染说明
 
 在 GUI debug overlay 中，两种线的含义不同：

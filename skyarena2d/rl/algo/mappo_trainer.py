@@ -858,6 +858,18 @@ class SkyArenaMAPPOTrainer:
         diag_blue_selected = 0
         diag_blue_invalid = 0
         diag_blue_fireable = 0
+        diag_blue_fireable_count = 0
+        diag_sel_exch_steps = 0
+        ep_sel_exch_sum = 0.0
+        # Fire head diagnostics accumulators
+        diag_fire_prob_no_fire = 0.0
+        diag_fire_prob_long = 0.0
+        diag_fire_prob_short = 0.0
+        diag_fire_entropy = 0.0
+        diag_fire_prob_steps = 0
+        diag_fire_mask_long = 0.0
+        diag_fire_mask_short = 0.0
+        diag_fire_argmax_nonzero = 0.0
         episode_records: list = []
 
         for ep in range(num_episodes):
@@ -882,6 +894,23 @@ class SkyArenaMAPPOTrainer:
             ep_fireable_edges = 0
             ep_fireable_agents = 0
             ep_fireable_count = 0
+            # Blue per-episode accumulators (from cache, like red)
+            ep_blue_attempted = 0
+            ep_blue_selected = 0
+            ep_blue_invalid = 0
+            ep_blue_fireable = 0
+            ep_blue_fireable_count = 0
+            ep_sel_exch_sum = 0.0
+            ep_sel_exch_steps = 0
+            # Fire head diagnostics per-episode
+            ep_fire_prob_no_fire = 0.0
+            ep_fire_prob_long = 0.0
+            ep_fire_prob_short = 0.0
+            ep_fire_entropy = 0.0
+            ep_fire_prob_steps = 0
+            ep_fire_mask_long = 0.0
+            ep_fire_mask_short = 0.0
+            ep_fire_argmax_nonzero = 0.0
 
             frame_dir: Optional[Path] = None
             if save_visual and render_mode == "rgb_array" and output_dir is not None:
@@ -894,6 +923,7 @@ class SkyArenaMAPPOTrainer:
                 with torch.no_grad():
                     sampled = sample_policy_actions(
                         self.actor, obs_batch, (h, c), self.device, deterministic=deterministic,
+                        return_diagnostics=True,
                     )
                 sky_action = self.action_adapter.decode(
                     course_action=sampled["course"][0],
@@ -949,6 +979,50 @@ class SkyArenaMAPPOTrainer:
                     ep_fireable_edges += fe
                     ep_fireable_agents += fa
                     ep_fireable_count += 1
+                    # Blue metrics from cache (like red)
+                    b_att = int(np.count_nonzero(
+                        cache.blue_attempted_long_matrix | cache.blue_attempted_short_matrix
+                    )) if cache.blue_attempted_long_matrix.size > 0 else 0
+                    b_sel = int(np.count_nonzero(
+                        cache.blue_selected_long_matrix | cache.blue_selected_short_matrix
+                    )) if cache.blue_selected_long_matrix.size > 0 else 0
+                    ep_blue_attempted += b_att
+                    ep_blue_selected += b_sel
+                    ep_blue_invalid += max(0, b_att - b_sel)
+                    b_fe = int(np.count_nonzero(
+                        cache.blue_fireable_long | cache.blue_fireable_short
+                    ))
+                    ep_blue_fireable += b_fe
+                    ep_blue_fireable_count += 1
+                    # selected_expected_exchange per step
+                    sm = info.get("metrics", {})
+                    sel_ex = sm.get("selected_expected_exchange")
+                    if sel_ex is not None:
+                        ep_sel_exch_sum += float(sel_ex)
+                        ep_sel_exch_steps += 1
+
+                # --- Fire probability diagnostics per step ---
+                fire_logits_sel = sampled.get("fire_logits_selected")
+                fire_raw_mask = sampled.get("fire_mask")
+                if fire_logits_sel is not None and fire_raw_mask is not None and np.any(alive_mask):
+                    logits = fire_logits_sel[0].astype(np.float64)  # (N, 3)
+                    fmask = fire_raw_mask[0]  # (N, 3)
+                    logits = logits - logits.max(axis=-1, keepdims=True)
+                    exp_l = np.exp(logits)
+                    probs = exp_l / exp_l.sum(axis=-1, keepdims=True)  # (N, 3)
+                    alive_probs = probs[alive_mask]
+                    alive_fmask = fmask[alive_mask]
+                    if alive_probs.shape[0] > 0:
+                        ep_fire_prob_no_fire += float(alive_probs[:, 0].mean())
+                        ep_fire_prob_long += float(alive_probs[:, 1].mean())
+                        ep_fire_prob_short += float(alive_probs[:, 2].mean())
+                        eps = 1e-12
+                        ep_fire_entropy += float((-alive_probs * np.log(alive_probs + eps)).sum(axis=-1).mean())
+                        ep_fire_prob_steps += 1
+                        ep_fire_mask_long += float(alive_fmask[:, 1].mean())
+                        ep_fire_mask_short += float(alive_fmask[:, 2].mean())
+                        fire_argmax = np.argmax(logits[alive_mask], axis=-1)
+                        ep_fire_argmax_nonzero += float(np.mean(fire_argmax > 0))
 
                 # Candidate data from obs (before step)
                 cid = obs_batch["candidate_ids"][0]
@@ -1014,23 +1088,62 @@ class SkyArenaMAPPOTrainer:
             ep_fireable_mean = ep_fireable_edges / max(ep_fireable_count, 1)
             ep_red_missiles = int(np.sum(eval_env.engine.state.red.long_ammo[:eval_env.red_fighter_num])
                                   + np.sum(eval_env.engine.state.red.short_ammo[:eval_env.red_fighter_num]))
+            ep_blue_missiles = int(np.sum(eval_env.engine.state.blue.long_ammo[:eval_env.blue_fighter_num])
+                                   + np.sum(eval_env.engine.state.blue.short_ammo[:eval_env.blue_fighter_num]))
+
+            # Blue step-mean rates
+            ep_blue_attempted_mean = ep_blue_attempted / nz_steps
+            ep_blue_selected_mean = ep_blue_selected / nz_steps
+            ep_blue_fireable_mean = ep_blue_fireable / max(ep_blue_fireable_count, 1)
+            ep_blue_invalid_mean = ep_blue_invalid / nz_steps
+            # selected_expected_exchange step mean
+            ep_sel_exch_mean = ep_sel_exch_sum / max(ep_sel_exch_steps, 1)
+
+            # Fire prob means
+            fp_denom = max(ep_fire_prob_steps, 1)
+            ep_fire_noop_mean = ep_fire_prob_no_fire / fp_denom
+            ep_fire_long_mean = ep_fire_prob_long / fp_denom
+            ep_fire_short_mean = ep_fire_prob_short / fp_denom
+            ep_fire_ent_mean = ep_fire_entropy / fp_denom
+            ep_fire_mask_long_rate = ep_fire_mask_long / fp_denom
+            ep_fire_mask_short_rate = ep_fire_mask_short / fp_denom
+            ep_fire_argmax_nz_rate = ep_fire_argmax_nonzero / fp_denom
 
             episode_records.append({
                 "episode": ep,
+                "seed": int(self.cfg["train"].get("seed", 0) + 9999 + ep),
                 "winner": winner,
                 "reason": str(info.get("reason", "")),
                 "steps": ep_steps,
                 "return": float(ep_return),
                 "red_kills": float(metrics.get("red_kills", 0)),
                 "blue_kills": float(metrics.get("blue_kills", 0)),
-                "target_nonzero_rate": float(ep_target_rate),
-                "fire_nonzero_rate": float(ep_fire_rate),
-                "red_fireable_edges_mean": float(ep_fireable_mean),
-                "red_attempted_edges": float(ep_attempted_mean),
-                "red_selected_edges": float(ep_selected_mean),
-                "red_invalid_fire_count": int(ep_invalid_fire),
-                "selected_expected_exchange": float(metrics.get("selected_expected_exchange", 0.0)),
+                "red_alive": int(metrics.get("red_alive", 0)),
+                "blue_alive": int(metrics.get("blue_alive", 0)),
                 "red_missiles_remaining": int(ep_red_missiles),
+                "blue_missiles_remaining": int(ep_blue_missiles),
+                "target_action_nonzero_rate": float(ep_target_rate),
+                "fire_action_nonzero_rate": float(ep_fire_rate),
+                "red_fireable_edges_mean": float(ep_fireable_mean),
+                "blue_fireable_edges_mean": float(ep_blue_fireable_mean),
+                "red_attempted_edges_mean": float(ep_attempted_mean),
+                "blue_attempted_edges_mean": float(ep_blue_attempted_mean),
+                "red_selected_edges_mean": float(ep_selected_mean),
+                "blue_selected_edges_mean": float(ep_blue_selected_mean),
+                "red_invalid_fire_count_mean": float(ep_invalid_mean),
+                "blue_invalid_fire_count_mean": float(ep_blue_invalid_mean),
+                "selected_expected_exchange_mean": float(ep_sel_exch_mean),
+                "missiles_launched_long": int(metrics.get("missiles_launched_long", 0)),
+                "missiles_launched_short": int(metrics.get("missiles_launched_short", 0)),
+                "missiles_hit": int(metrics.get("missiles_hit", 0)),
+                "missiles_missed": int(metrics.get("missiles_missed", 0)),
+                "fire_argmax_nonzero_rate": float(ep_fire_argmax_nz_rate),
+                "fire_noop_prob_mean": float(ep_fire_noop_mean),
+                "fire_long_prob_mean": float(ep_fire_long_mean),
+                "fire_short_prob_mean": float(ep_fire_short_mean),
+                "fire_entropy_mean": float(ep_fire_ent_mean),
+                "fire_valid_mask_long_rate": float(ep_fire_mask_long_rate),
+                "fire_valid_mask_short_rate": float(ep_fire_mask_short_rate),
             })
 
             diag_missiles_long += int(metrics.get("missiles_launched_long", 0))
@@ -1038,9 +1151,21 @@ class SkyArenaMAPPOTrainer:
             diag_missiles_hit += int(metrics.get("missiles_hit", 0))
             diag_missiles_missed += int(metrics.get("missiles_missed", 0))
             diag_sel_exch += float(metrics.get("selected_expected_exchange", 0.0))
-            diag_blue_attempted += int(metrics.get("blue_attempted_edges", 0))
-            diag_blue_selected += int(metrics.get("blue_selected_edges", 0))
-            diag_blue_invalid += int(metrics.get("blue_invalid_fire_count", 0))
+            diag_blue_attempted += ep_blue_attempted
+            diag_blue_selected += ep_blue_selected
+            diag_blue_invalid += ep_blue_invalid
+            diag_blue_fireable += ep_blue_fireable
+            diag_blue_fireable_count += ep_blue_fireable_count
+            diag_sel_exch_steps += ep_sel_exch_steps
+            # Fire prob diag accumulation
+            diag_fire_prob_no_fire += ep_fire_prob_no_fire
+            diag_fire_prob_long += ep_fire_prob_long
+            diag_fire_prob_short += ep_fire_prob_short
+            diag_fire_entropy += ep_fire_entropy
+            diag_fire_prob_steps += ep_fire_prob_steps
+            diag_fire_mask_long += ep_fire_mask_long
+            diag_fire_mask_short += ep_fire_mask_short
+            diag_fire_argmax_nonzero += ep_fire_argmax_nonzero
             diag_blue_fireable += int(metrics.get("blue_fireable_edges", 0))
 
             diag_target_nonzero_steps += ep_target_nonzero_steps
@@ -1091,7 +1216,23 @@ class SkyArenaMAPPOTrainer:
         red_long_available_rate = diag_long_available / diag_candidate_denom
         red_short_available_rate = diag_short_available / diag_candidate_denom
         red_missiles_remaining = diag_missiles_remaining / diag_missile_denom
-        blue_missiles_remaining = None  # not tracked per-episode
+
+        # Blue step-mean metrics
+        blue_attempted_edges = diag_blue_attempted / diag_denom
+        blue_selected_edges = diag_blue_selected / diag_denom
+        blue_fireable_edges = diag_blue_fireable / max(diag_blue_fireable_count, 1)
+        blue_invalid_fire_count = float(diag_blue_invalid)
+        sel_exch_mean = diag_sel_exch / max(diag_sel_exch_steps, 1)
+
+        # Fire head diagnostics
+        fire_prob_denom = max(diag_fire_prob_steps, 1)
+        fire_noop_prob_mean = diag_fire_prob_no_fire / fire_prob_denom
+        fire_long_prob_mean = diag_fire_prob_long / fire_prob_denom
+        fire_short_prob_mean = diag_fire_prob_short / fire_prob_denom
+        fire_entropy_mean = diag_fire_entropy / fire_prob_denom
+        fire_mask_long_rate = diag_fire_mask_long / fire_prob_denom
+        fire_mask_short_rate = diag_fire_mask_short / fire_prob_denom
+        fire_argmax_nonzero_rate = diag_fire_argmax_nonzero / fire_prob_denom
 
         # --- Write eval report ---
         if write_report:
@@ -1108,23 +1249,39 @@ class SkyArenaMAPPOTrainer:
                 "draws": float(draws),
                 "red_kills": avg_red_kills,
                 "blue_kills": avg_blue_kills,
-                "target_nonzero_rate": red_target_nonzero_rate,
-                "fire_nonzero_rate": red_fire_nonzero_rate,
-                "red_fireable_edges": red_fireable_edges,
-                "blue_fireable_edges": diag_blue_fireable / n_eps,
-                "red_attempted_edges": red_attempted_edges,
-                "blue_attempted_edges": diag_blue_attempted / n_eps,
-                "red_selected_edges": red_selected_edges,
-                "blue_selected_edges": diag_blue_selected / n_eps,
-                "red_invalid_fire_count": red_invalid_fire_count,
-                "blue_invalid_fire_count": diag_blue_invalid / n_eps if diag_blue_invalid > 0 else 0,
-                "selected_expected_exchange": diag_sel_exch / n_eps,
+                # Step-mean metrics (per-step averages over episodes)
+                "target_action_nonzero_rate": red_target_nonzero_rate,
+                "fire_action_nonzero_rate": red_fire_nonzero_rate,
+                "red_fireable_edges_mean": red_fireable_edges,
+                "blue_fireable_edges_mean": blue_fireable_edges,
+                "red_attempted_edges_mean": red_attempted_edges,
+                "blue_attempted_edges_mean": blue_attempted_edges,
+                "red_selected_edges_mean": red_selected_edges,
+                "blue_selected_edges_mean": blue_selected_edges,
+                "red_invalid_fire_count_mean": red_invalid_fire_count,
+                "blue_invalid_fire_count_mean": blue_invalid_fire_count,
+                "selected_expected_exchange_mean": sel_exch_mean,
+                # Episode-final cumulative metrics
                 "missiles_launched_long": diag_missiles_long / n_eps,
                 "missiles_launched_short": diag_missiles_short / n_eps,
                 "missiles_hit": diag_missiles_hit / n_eps,
                 "missiles_missed": diag_missiles_missed / n_eps,
                 "red_missiles_remaining": red_missiles_remaining,
-                "blue_missiles_remaining": blue_missiles_remaining,
+                # Fire head diagnostics
+                "fire_argmax_nonzero_rate": fire_argmax_nonzero_rate,
+                "fire_noop_prob_mean": fire_noop_prob_mean,
+                "fire_long_prob_mean": fire_long_prob_mean,
+                "fire_short_prob_mean": fire_short_prob_mean,
+                "fire_entropy_mean": fire_entropy_mean,
+                "fire_valid_mask_long_rate": fire_mask_long_rate,
+                "fire_valid_mask_short_rate": fire_mask_short_rate,
+                # Backward-compat aliases
+                "target_nonzero_rate": red_target_nonzero_rate,
+                "fire_nonzero_rate": red_fire_nonzero_rate,
+                "red_fireable_edges": red_fireable_edges,
+                "red_attempted_edges": red_attempted_edges,
+                "red_selected_edges": red_selected_edges,
+                "red_invalid_fire_count": red_invalid_fire_count,
             }
             self._write_eval_report(
                 kind=kind,
@@ -1152,9 +1309,19 @@ class SkyArenaMAPPOTrainer:
             # Diagnostics — bare keys for direct consumption
             "target_nonzero_rate": red_target_nonzero_rate,
             "fire_nonzero_rate": red_fire_nonzero_rate,
+            "target_action_nonzero_rate": red_target_nonzero_rate,
+            "fire_action_nonzero_rate": red_fire_nonzero_rate,
             "red_attempted_edges": red_attempted_edges,
             "red_selected_edges": red_selected_edges,
             "red_invalid_fire_count": red_invalid_fire_count,
+            # Fire head diagnostics
+            "fire_argmax_nonzero_rate": fire_argmax_nonzero_rate,
+            "fire_noop_prob_mean": fire_noop_prob_mean,
+            "fire_long_prob_mean": fire_long_prob_mean,
+            "fire_short_prob_mean": fire_short_prob_mean,
+            "fire_entropy_mean": fire_entropy_mean,
+            "fire_valid_mask_long_rate": fire_mask_long_rate,
+            "fire_valid_mask_short_rate": fire_mask_short_rate,
             # Diagnostics — prefixed for backward compat
             "diagnostics_red_target_nonzero_rate": red_target_nonzero_rate,
             "diagnostics_red_fire_nonzero_rate": red_fire_nonzero_rate,

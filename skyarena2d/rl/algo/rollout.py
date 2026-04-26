@@ -95,6 +95,7 @@ def sample_policy_actions(
     deterministic: bool,
     *,
     search_goal_manager: Optional[SearchGoalManager] = None,
+    return_diagnostics: bool = False,
 ):
     """Sample actions from actor given numpy obs batch."""
     obs_t = to_torch_batch(obs_batch, device)
@@ -181,7 +182,7 @@ def sample_policy_actions(
         has_target_opportunity_t, attack_log_prob, torch.zeros_like(attack_log_prob),
     )
 
-    return {
+    result = {
         "course": course_action.reshape(num_envs, num_agents).cpu().numpy(),
         "search_goal": executed_search_goal_np.astype(np.int64, copy=False),
         "search_goal_refresh_mask": search_goal_refresh_mask_np,
@@ -192,6 +193,10 @@ def sample_policy_actions(
         "next_h": out["next_h"].reshape(num_envs, num_agents, -1),
         "next_c": out["next_c"].reshape(num_envs, num_agents, -1),
     }
+    if return_diagnostics:
+        result["fire_logits_selected"] = fire_logits.reshape(num_envs, num_agents, 3).detach().cpu().numpy()
+        result["fire_mask"] = fire_mask_t.reshape(num_envs, num_agents, 3).cpu().numpy()
+    return result
 
 
 @dataclass
