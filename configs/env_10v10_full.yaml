@@ -64,10 +64,10 @@ weapon:
 reward:
   valid_fire: 0.02
   invalid_fire: -0.05
-  kill_fighter: 1.0
-  kill_detector: 0.5
-  loss_fighter: -1.0
-  loss_detector: -0.5
+  kill_fighter: 2.0
+  kill_detector: 1.0
+  loss_fighter: -2.0
+  loss_detector: -1.0
   win: 5.0
   lose: -5.0
   draw: 0.0
@@ -109,3 +109,7 @@ reward_modules:
     enabled: true
     red_eliminates_blue: 10.0
     blue_eliminates_red: 10.0
+  discovery:
+    enabled: true
+    first_seen: 0.08
+    team_shared: true

@@ -50,13 +50,17 @@ class SkyArenaEngine:
         num_fighters: int,
         num_detectors: int,
         positions: np.ndarray,
-        heading_deg: float,
+        heading_deg: float | np.ndarray,
         profiles: list[FighterProfile],
     ) -> TeamState:
         total = num_fighters + num_detectors
         alive = np.ones((total,), dtype=bool)
         pos = positions.astype(np.float32).copy()
-        heading = np.full((total,), heading_deg, dtype=np.float32)
+        heading_arr = np.asarray(heading_deg, dtype=np.float32)
+        if heading_arr.ndim == 1 and heading_arr.shape[0] == total:
+            heading = heading_arr.copy()
+        else:
+            heading = np.full((total,), float(heading_deg), dtype=np.float32)
 
         speed = np.full((total,), self.config.dynamics.default_detector_speed, dtype=np.float32)
         speed[:num_fighters] = self.config.dynamics.default_fighter_speed
@@ -305,12 +309,12 @@ class SkyArenaEngine:
             0,
         )
 
-        red_heading = 0.0
-        blue_heading = 180.0
+        red_heading: float | np.ndarray = 0.0
+        blue_heading: float | np.ndarray = 180.0
         if self.config.spawn.spread and self.config.spawn.heading_spread > 0:
             hs = self.config.spawn.heading_spread
-            red_heading = float(rng.uniform(-hs, hs))
-            blue_heading = 180.0 + float(rng.uniform(-hs, hs))
+            red_heading = rng.uniform(-hs, hs, size=red_total).astype(np.float32)
+            blue_heading = 180.0 + rng.uniform(-hs, hs, size=blue_total).astype(np.float32)
 
         red = self._build_team(
             side="red",
@@ -499,6 +503,17 @@ class SkyArenaEngine:
         self.state.blue.kills += len(weapon_result.killed_red)
         self.state.red.losses += len(weapon_result.killed_red)
 
+        update_tracker(
+            state=self.state,
+            weapon_result=weapon_result,
+            red_visible=self._red_sensor.visible_matrix,
+            blue_visible=self._blue_sensor.visible_matrix,
+            red_jammed_count=red_jam.jammed_detection_count,
+            blue_jammed_count=blue_jam.jammed_detection_count,
+            passive_count_red=passive_count_red,
+            passive_count_blue=passive_count_blue,
+        )
+
         termination_result = check_termination(self.state, self.config)
         reward_output = compute_rewards(
             state=self.state,
@@ -547,16 +562,6 @@ class SkyArenaEngine:
             reward_components=reward_output.components,
         )
 
-        update_tracker(
-            state=self.state,
-            weapon_result=weapon_result,
-            red_visible=self._red_sensor.visible_matrix,
-            blue_visible=self._blue_sensor.visible_matrix,
-            red_jammed_count=red_jam.jammed_detection_count,
-            blue_jammed_count=blue_jam.jammed_detection_count,
-            passive_count_red=passive_count_red,
-            passive_count_blue=passive_count_blue,
-        )
         metrics = build_metrics_snapshot(self.state, weapon_result)
 
         obs = self._build_observations()

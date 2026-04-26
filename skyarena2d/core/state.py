@@ -132,6 +132,11 @@ class MetricsTracker:
     selected_overkill_values_blue: list[int] = field(default_factory=list)
     selected_expected_exchange_acc: float = 0.0
     selected_expected_exchange_steps: int = 0
+    # --- discovery tracking ---
+    discovered_enemy_ids_red: set[int] = field(default_factory=set)
+    discovered_enemy_ids_blue: set[int] = field(default_factory=set)
+    red_new_discoveries: int = 0
+    blue_new_discoveries: int = 0
 
 
 @dataclass(slots=True)

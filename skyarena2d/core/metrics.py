@@ -103,6 +103,20 @@ def update_tracker(
     if tracker.first_contact_step is None and (np.any(red_visible) or np.any(blue_visible)):
         tracker.first_contact_step = state.step_count
 
+    # Discovery: count enemy IDs seen for the first time this step
+    tracker.red_new_discoveries = 0
+    tracker.blue_new_discoveries = 0
+    if red_visible.size:
+        seen_red = set(int(j) for j in np.unique(np.argwhere(red_visible)[:, 1]))
+        new_red = seen_red - tracker.discovered_enemy_ids_red
+        tracker.red_new_discoveries = len(new_red)
+        tracker.discovered_enemy_ids_red |= new_red
+    if blue_visible.size:
+        seen_blue = set(int(j) for j in np.unique(np.argwhere(blue_visible)[:, 1]))
+        new_blue = seen_blue - tracker.discovered_enemy_ids_blue
+        tracker.blue_new_discoveries = len(new_blue)
+        tracker.discovered_enemy_ids_blue |= new_blue
+
     red_has_fire = np.any(weapon_result.red_fireable_long | weapon_result.red_fireable_short)
     blue_has_fire = np.any(weapon_result.blue_fireable_long | weapon_result.blue_fireable_short)
     if tracker.first_fire_opportunity_step is None and (red_has_fire or blue_has_fire):

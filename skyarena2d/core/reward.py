@@ -238,6 +238,25 @@ def compute_rewards(
             "coef": float(se_coef),
         }
 
+    # --- discovery module ---
+    if _mod_enabled("discovery"):
+        tracker = state.tracker
+        first_seen = _mod_weight("discovery", "first_seen", 0.08)
+        team_shared = _mod_weight("discovery", "team_shared", 1.0)  # bool-ish: >0 = team-shared
+        red_new = tracker.red_new_discoveries
+        blue_new = tracker.blue_new_discoveries
+        if red_new > 0:
+            red_rewards[state.red.alive] += first_seen * red_new
+        if blue_new > 0:
+            blue_rewards[state.blue.alive] += first_seen * blue_new
+        components["discovery"] = {
+            "red": float(first_seen * red_new * state.red.alive_count),
+            "blue": float(first_seen * blue_new * state.blue.alive_count),
+            "red_new_count": int(red_new),
+            "blue_new_count": int(blue_new),
+            "first_seen_coef": float(first_seen),
+        }
+
     # --- keep_alive_step ---
     if config.reward.keep_alive_step != 0.0:
         red_rewards[state.red.alive] += config.reward.keep_alive_step
