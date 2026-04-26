@@ -19,8 +19,13 @@ def build_writer(train_cfg: dict, purge_step: Optional[int] = None):
     tb_dir = tensorboard_dir(train_cfg)
     tb_dir.mkdir(parents=True, exist_ok=True)
     if purge_step is not None and int(purge_step) >= 0:
-        print("[tensorboard] log_dir=%s purge_step=%d" % (tb_dir, int(purge_step)), flush=True)
-        return SummaryWriter(log_dir=str(tb_dir), purge_step=int(purge_step))
+        # Use filename_suffix to create a fresh events file on resume,
+        # avoiding conflicts with stale data in old event files that
+        # purge_step alone may not reliably clean across PyTorch versions.
+        import time as _time
+        suffix = f"_resume_{int(_time.time())}"
+        print("[tensorboard] log_dir=%s purge_step=%d suffix=%s" % (tb_dir, int(purge_step), suffix), flush=True)
+        return SummaryWriter(log_dir=str(tb_dir), purge_step=int(purge_step), filename_suffix=suffix)
     return SummaryWriter(log_dir=str(tb_dir))
 
 
