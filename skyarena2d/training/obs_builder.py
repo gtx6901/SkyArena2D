@@ -48,9 +48,6 @@ class SkyArenaTrainingObsBuilder:
         # Each agent only tracks enemies it has personally observed.
         self._track_memory: dict[int, dict[int, dict[str, Any]]] = {}
 
-        # Precompute course offset LUT (16 bins)
-        self._course_offsets = _build_course_offset_lut(16)
-
         # Precompute region centers LUT
         self._region_centers = _build_region_centers(
             search_goal_grid_size, map_width, map_height
@@ -267,7 +264,7 @@ class SkyArenaTrainingObsBuilder:
         # Hit probs
         feat[:n, 17] = own.long_hit_prob[:n]
         feat[:n, 18] = own.short_hit_prob[:n]
-        # kills/losses encoded as 0 (team-level, not per-agent)
+        # column 19: reserved (kills/losses, currently team-level not per-agent)
         feat[:n, 19] = 0.0
 
         return feat
@@ -447,9 +444,9 @@ class SkyArenaTrainingObsBuilder:
             1: center_y (normalized)
             2: has_own
             3: has_visible_enemy
-            4: has_passive_enemy (placeholder)
-            5: visit_recency (placeholder, 0)
-            6: fireable_density (placeholder, 0)
+            4: has_passive_enemy (reserved, currently 0)
+            5: visit_recency (reserved, currently 0)
+            6: fireable_density (reserved, currently 0)
             7: ally_count (normalized)
             8: enemy_count (normalized, only visible)
             9: distance_to_region (normalized)
@@ -516,30 +513,6 @@ class SkyArenaTrainingObsBuilder:
             feat[i, :, 8] = enemy_counts / max(n_enemy, 1)
 
         return feat
-
-
-# ------------------------------------------------------------------
-# Module-level helpers
-# ------------------------------------------------------------------
-
-def _build_course_offset_lut(n_bins: int = 16) -> np.ndarray:
-    """Build course offset LUT.
-
-    bin 0 = 0 (straight ahead)
-    bins 1..n//2-1 = right turns (+22.5, +45, ...)
-    bin n//2 = 180 (U-turn)
-    bins n//2+1..n-1 = left turns (-157.5, ..., -22.5)
-    """
-    offsets = np.zeros(n_bins, dtype=np.float32)
-    step = 360.0 / n_bins
-    for k in range(n_bins):
-        if k == 0:
-            offsets[k] = 0.0
-        elif k <= n_bins // 2:
-            offsets[k] = k * step
-        else:
-            offsets[k] = (k - n_bins) * step
-    return offsets
 
 
 def _build_region_centers(

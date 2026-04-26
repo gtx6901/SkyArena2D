@@ -13,7 +13,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from skyarena2d.adapters.action_types import SkyArenaSideAction
 from skyarena2d.training.action_adapter import SkyArenaActionAdapter
 
 from ..adapters.skyarena_mappo_env import SkyArenaMAPPOEnv
@@ -37,7 +36,6 @@ from .rollout import (
     masked_categorical,
     sample_policy_actions,
     stack_env_obs,
-    to_torch_batch,
 )
 from .search_goal_manager import TeamSearchPlanner, TeamSearchPlannerConfig
 

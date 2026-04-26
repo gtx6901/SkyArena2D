@@ -242,51 +242,6 @@ def test_fire_allowed_when_can_long():
     assert action.target_idx[0] == 3, f"Expected target_idx=3, got {action.target_idx[0]}"
 
 
-def test_build_masks_shapes():
-    """Verify build_masks returns correct shapes."""
-    N = 3
-    own = _make_team(N, "red")
-    adapter = _make_adapter()
-
-    candidate_ids = np.full((N, 6), -1, dtype=np.int64)
-    candidate_ids[0, 0] = 2  # agent 0 has one valid candidate
-
-    fireable_long = np.zeros((N, 5), dtype=bool)
-    fireable_short = np.zeros((N, 5), dtype=bool)
-
-    masks = adapter.build_masks(own, fireable_long, fireable_short, candidate_ids)
-
-    assert masks["course_mask"].shape == (N, 16)
-    assert masks["search_goal_mask"].shape == (N, 64)
-    assert masks["target_mask"].shape == (N, 7)
-
-    # All alive agents should have all course bins enabled
-    assert masks["course_mask"][0].all()
-
-    # target_mask[0, 0] always True (no target option)
-    assert masks["target_mask"][0, 0]
-    # target_mask[0, 1] True because candidate_ids[0, 0] = 2 (valid)
-    assert masks["target_mask"][0, 1]
-    # target_mask[0, 2..] False because no more valid candidates
-    assert not masks["target_mask"][0, 2]
-
-
-def test_build_search_goal_lut():
-    """Verify search goal LUT shape and values."""
-    adapter = _make_adapter()
-    lut = adapter.build_search_goal_lut()
-
-    assert lut.shape == (64, 2), f"Expected (64, 2), got {lut.shape}"
-
-    # First region center: col=0, row=0
-    cell_w = 3000.0 / 8
-    cell_h = 4000.0 / 8
-    expected_cx = 0.5 * cell_w
-    expected_cy = 0.5 * cell_h
-    assert abs(lut[0, 0] - expected_cx) < 1e-3
-    assert abs(lut[0, 1] - expected_cy) < 1e-3
-
-
 def test_to_maca_fighter_action():
     """Verify SkyArenaSideAction.to_maca_fighter_action produces correct encoding."""
     N = 2

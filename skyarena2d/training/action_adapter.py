@@ -214,51 +214,6 @@ class SkyArenaActionAdapter:
         if self.ew_strategy is not None:
             self.ew_strategy.reset(ew_state_key)
 
-    def build_masks(
-        self,
-        own: TeamState,
-        fireable_long: np.ndarray,
-        fireable_short: np.ndarray,
-        candidate_ids: np.ndarray,
-    ) -> dict[str, np.ndarray]:
-        """Build action masks for actor.
-
-        Returns:
-            course_mask: (N, course_bins) bool
-            search_goal_mask: (N, grid_size*grid_size) bool
-            target_mask: (N, candidate_slots+1) bool
-        """
-        N = own.num_fighters
-        S = self.candidate_slots
-        G = self.search_goal_grid_size
-
-        course_mask = np.zeros((N, self.course_bins), dtype=bool)
-        search_goal_mask = np.ones((N, G * G), dtype=bool)
-        target_mask = np.zeros((N, S + 1), dtype=bool)
-
-        for i in range(N):
-            if own.alive[i]:
-                course_mask[i, :] = True
-            else:
-                course_mask[i, 0] = True
-
-            # Target mask: always can choose "no target" (index 0)
-            target_mask[i, 0] = True
-            for s in range(S):
-                cid = int(candidate_ids[i, s])
-                if cid >= 0:
-                    target_mask[i, s + 1] = True
-
-        return {
-            "course_mask": course_mask,
-            "search_goal_mask": search_goal_mask,
-            "target_mask": target_mask,
-        }
-
-    def build_search_goal_lut(self) -> np.ndarray:
-        """Build (grid_size*grid_size, 2) array of region center world coordinates."""
-        return self._region_centers.copy()
-
 
 # ------------------------------------------------------------------
 # Module-level helpers
