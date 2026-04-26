@@ -26,6 +26,14 @@ env:
   goal_hold_steps: 10
   goal_reach_radius: 90.0
   track_memory_steps: 10
+  use_jammer_strategy: true
+  radar_freq_count: 10
+  radar_cycle_interval: 8
+  radar_stride: 3
+  jammer_cycle_interval: 6
+  jammer_stride: 7
+  jammer_barrage_prob: 0.0
+  max_jammers_per_side: 3
 
 model:
   semantic_map_size: 100

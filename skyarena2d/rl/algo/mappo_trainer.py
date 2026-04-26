@@ -148,7 +148,14 @@ class SkyArenaMAPPOTrainer:
             search_goal_grid_size=self.search_goal_grid_size,
             map_width=engine_cfg.map.width,
             map_height=engine_cfg.map.height,
+            radar_freq=self.env_cfg.get("default_radar_freq", 1),
+            radar_freq_count=self.env_cfg.get("radar_freq_count", engine_cfg.radar.freq_count),
+            radar_cycle_interval=self.env_cfg.get("radar_cycle_interval", 8),
+            radar_stride=self.env_cfg.get("radar_stride", 3),
             jammer_freq=self.env_cfg.get("default_jammer_freq", 1),
+            jammer_cycle_interval=self.env_cfg.get("jammer_cycle_interval", 6),
+            jammer_stride=self.env_cfg.get("jammer_stride", 7),
+            jammer_barrage_prob=self.env_cfg.get("jammer_barrage_prob", 0.0),
             use_jammer_strategy=self.env_cfg.get("use_jammer_strategy", True),
             jammer_range=self.env_cfg.get("jammer_range", engine_cfg.jamming.range),
             jammer_memory_steps=self.env_cfg.get("jammer_memory_steps", 10),
@@ -624,6 +631,24 @@ class SkyArenaMAPPOTrainer:
         else:
             print(f"[eval] start step={step_value}", flush=True)
 
+        # Diagnostic accumulators (reset per-episode, averaged over episodes)
+        diag_target_nonzero_steps = 0
+        diag_fire_nonzero_steps = 0
+        diag_total_steps_diag = 0
+        diag_attempted_edges = 0
+        diag_selected_edges = 0
+        diag_invalid_fire = 0
+        diag_fireable_edges = 0
+        diag_fireable_agents = 0
+        diag_fireable_count = 0
+        diag_valid_candidates = 0
+        diag_valid_candidate_steps = 0
+        diag_long_available = 0
+        diag_short_available = 0
+        diag_candidate_pairs = 0
+        diag_missiles_remaining = 0
+        diag_missile_record_count = 0
+
         for ep in range(num_episodes):
             if eval_prefix == "gui_eval":
                 print(f"[gui_eval] episode {ep + 1}/{num_episodes} start", flush=True)
@@ -636,6 +661,16 @@ class SkyArenaMAPPOTrainer:
             ep_return = 0.0
             info: Dict[str, Any] = {}
             episode_truncated = False
+
+            # Per-episode diagnostic accumulators
+            ep_target_nonzero_steps = 0
+            ep_fire_nonzero_steps = 0
+            ep_attempted_edges = 0
+            ep_selected_edges = 0
+            ep_invalid_fire = 0
+            ep_fireable_edges = 0
+            ep_fireable_agents = 0
+            ep_fireable_count = 0
 
             frame_dir: Optional[Path] = None
             if save_visual and render_mode == "rgb_array" and output_dir is not None:
@@ -669,6 +704,52 @@ class SkyArenaMAPPOTrainer:
                 h = sampled["next_h"].to(self.device)
                 c = sampled["next_c"].to(self.device)
                 ep_steps += 1
+
+                # --- Diagnostics collection per step ---
+                alive_mask = (obs_batch["alive_mask"][0] > 0.5)
+                target = sampled["target"][0]
+                fire = sampled["fire"][0]
+                if np.any(alive_mask):
+                    if np.any(target[alive_mask] > 0):
+                        ep_target_nonzero_steps += 1
+                    if np.any(fire[alive_mask] > 0):
+                        ep_fire_nonzero_steps += 1
+
+                cache = eval_env.engine.state.cache
+                if cache is not None:
+                    attempted = int(np.count_nonzero(
+                        cache.red_attempted_long_matrix | cache.red_attempted_short_matrix
+                    )) if cache.red_attempted_long_matrix.size > 0 else 0
+                    selected = int(np.count_nonzero(
+                        cache.red_selected_long_matrix | cache.red_selected_short_matrix
+                    )) if cache.red_selected_long_matrix.size > 0 else 0
+                    ep_attempted_edges += attempted
+                    ep_selected_edges += selected
+                    # invalid = attempted but not selected
+                    ep_invalid_fire += max(0, attempted - selected)
+
+                    fe = int(np.count_nonzero(
+                        cache.red_fireable_long | cache.red_fireable_short
+                    ))
+                    fa = int(np.count_nonzero(
+                        np.any(cache.red_fireable_long | cache.red_fireable_short, axis=1)
+                    ))
+                    ep_fireable_edges += fe
+                    ep_fireable_agents += fa
+                    ep_fireable_count += 1
+
+                # Candidate data from obs (before step)
+                cid = obs_batch["candidate_ids"][0]
+                can_long = obs_batch["candidate_can_long"][0]
+                can_short = obs_batch["candidate_can_short"][0]
+                valid_mask = cid >= 0
+                n_valid = int(np.count_nonzero(valid_mask))
+                diag_valid_candidates += n_valid
+                diag_valid_candidate_steps += 1
+                if n_valid > 0:
+                    diag_long_available += int(np.count_nonzero(can_long & valid_mask))
+                    diag_short_available += int(np.count_nonzero(can_short & valid_mask))
+                    diag_candidate_pairs += n_valid
 
                 should_render = False
                 if render_mode == "human":
@@ -711,6 +792,41 @@ class SkyArenaMAPPOTrainer:
                     flush=True,
                 )
 
+            # --- Per-episode diagnostics accumulation ---
+            nz_steps = max(ep_steps, 1)
+            ep_target_rate = ep_target_nonzero_steps / nz_steps
+            ep_fire_rate = ep_fire_nonzero_steps / nz_steps
+            ep_attempted_mean = ep_attempted_edges / nz_steps
+            ep_selected_mean = ep_selected_edges / nz_steps
+            ep_invalid_mean = ep_invalid_fire / nz_steps
+            ep_fireable_mean = ep_fireable_edges / max(ep_fireable_count, 1)
+            ep_red_missiles = int(np.sum(eval_env.engine.state.red.long_ammo[:eval_env.red_fighter_num])
+                                  + np.sum(eval_env.engine.state.red.short_ammo[:eval_env.red_fighter_num]))
+
+            diag_target_nonzero_steps += ep_target_nonzero_steps
+            diag_fire_nonzero_steps += ep_fire_nonzero_steps
+            diag_total_steps_diag += ep_steps
+            diag_attempted_edges += ep_attempted_edges
+            diag_selected_edges += ep_selected_edges
+            diag_invalid_fire += ep_invalid_fire
+            diag_fireable_edges += ep_fireable_edges
+            diag_fireable_agents += ep_fireable_agents
+            diag_fireable_count += ep_fireable_count
+            diag_missiles_remaining += ep_red_missiles
+            diag_missile_record_count += 1
+
+            if eval_prefix == "gui_eval":
+                print(
+                    f"[gui_eval_diag] red_attempted={ep_attempted_mean:.2f} "
+                    f"red_selected={ep_selected_mean:.2f} "
+                    f"red_invalid={ep_invalid_mean:.2f} "
+                    f"red_fireable_edges_mean={ep_fireable_mean:.1f} "
+                    f"target_nonzero_rate={ep_target_rate:.3f} "
+                    f"fire_nonzero_rate={ep_fire_rate:.3f} "
+                    f"red_missiles_remaining={ep_red_missiles}",
+                    flush=True,
+                )
+
         eval_env.engine.close()
 
         win_rate = red_wins / max(num_episodes, 1)
@@ -718,6 +834,24 @@ class SkyArenaMAPPOTrainer:
         avg_return = total_return / max(num_episodes, 1)
         avg_red_kills = total_red_kills / max(num_episodes, 1)
         avg_blue_kills = total_blue_kills / max(num_episodes, 1)
+
+        # Overall diagnostic rates
+        diag_denom = max(diag_total_steps_diag, 1)
+        diag_fireable_denom = max(diag_fireable_count, 1)
+        diag_candidate_denom = max(diag_candidate_pairs, 1)
+        diag_missile_denom = max(diag_missile_record_count, 1)
+        red_target_nonzero_rate = diag_target_nonzero_steps / diag_denom
+        red_fire_nonzero_rate = diag_fire_nonzero_steps / diag_denom
+        red_attempted_edges = diag_attempted_edges / diag_denom
+        red_selected_edges = diag_selected_edges / diag_denom
+        red_invalid_fire_count = float(diag_invalid_fire)
+        red_fireable_edges = diag_fireable_edges / diag_fireable_denom
+        red_fireable_agents = diag_fireable_agents / diag_fireable_denom
+        red_candidate_valid_count = diag_valid_candidates / diag_denom
+        red_long_available_rate = diag_long_available / diag_candidate_denom
+        red_short_available_rate = diag_short_available / diag_candidate_denom
+        red_missiles_remaining = diag_missiles_remaining / diag_missile_denom
+
         print(
             f"[{eval_prefix}] done step={step_value} win_rate={win_rate:.3f} "
             f"avg_steps={avg_steps:.1f} avg_return={avg_return:.3f}",
@@ -734,4 +868,16 @@ class SkyArenaMAPPOTrainer:
             "episode_len": avg_steps,
             "red_kills": avg_red_kills,
             "blue_kills": avg_blue_kills,
+            # Diagnostics
+            "diagnostics_red_target_nonzero_rate": red_target_nonzero_rate,
+            "diagnostics_red_fire_nonzero_rate": red_fire_nonzero_rate,
+            "diagnostics_red_attempted_edges": red_attempted_edges,
+            "diagnostics_red_selected_edges": red_selected_edges,
+            "diagnostics_red_invalid_fire_count": red_invalid_fire_count,
+            "diagnostics_red_fireable_edges": red_fireable_edges,
+            "diagnostics_red_fireable_agents": red_fireable_agents,
+            "diagnostics_red_candidate_valid_count": red_candidate_valid_count,
+            "diagnostics_red_long_available_rate": red_long_available_rate,
+            "diagnostics_red_short_available_rate": red_short_available_rate,
+            "diagnostics_red_missiles_remaining": red_missiles_remaining,
         }

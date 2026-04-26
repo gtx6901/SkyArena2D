@@ -34,7 +34,13 @@ class SkyArenaActionAdapter:
         map_width: float = 3000.0,
         map_height: float = 4000.0,
         radar_freq: int = 1,
+        radar_freq_count: int = 10,
+        radar_cycle_interval: int = 8,
+        radar_stride: int = 3,
         jammer_freq: int = 1,
+        jammer_cycle_interval: int = 6,
+        jammer_stride: int = 7,
+        jammer_barrage_prob: float = 0.0,
         use_jammer_strategy: bool = True,
         jammer_initial_silent: bool = True,
         jammer_on_after_contact: bool = True,
@@ -54,7 +60,14 @@ class SkyArenaActionAdapter:
         self.ew_strategy = ew_strategy
         if self.use_jammer_strategy and self.ew_strategy is None:
             self.ew_strategy = EWHeuristicStrategy(
+                radar_freq=radar_freq,
+                radar_freq_count=radar_freq_count,
+                radar_cycle_interval=radar_cycle_interval,
+                radar_stride=radar_stride,
                 jammer_freq=jammer_freq,
+                jammer_cycle_interval=jammer_cycle_interval,
+                jammer_stride=jammer_stride,
+                jammer_barrage_prob=jammer_barrage_prob,
                 enabled=True,
                 initial_silent=jammer_initial_silent,
                 on_after_contact=jammer_on_after_contact,
@@ -143,9 +156,6 @@ class SkyArenaActionAdapter:
                 heading = np.degrees(np.arctan2(dy, dx)) % 360.0
                 course[i] = heading
 
-            # --- Radar fixed. Jammer is filled after actor action decoding. ---
-            radar_freq_out[i] = self.radar_freq
-
             # --- Target and Fire ---
             tgt_act = int(target_action[i])
             if tgt_act == 0:
@@ -179,7 +189,7 @@ class SkyArenaActionAdapter:
                     fire_type[i] = 0
 
         if self.ew_strategy is not None:
-            jammer_freq_out = self.ew_strategy.compute_jammer_freq(
+            radar_freq_out, jammer_freq_out = self.ew_strategy.compute(
                 key=ew_state_key,
                 n_agents=N,
                 alive=own.alive[:N],
@@ -189,6 +199,7 @@ class SkyArenaActionAdapter:
                 step_count=step_count,
             )
         else:
+            radar_freq_out[own.alive[:N]] = int(self.radar_freq)
             jammer_freq_out[own.alive[:N]] = int(self.jammer_freq)
 
         return SkyArenaSideAction(

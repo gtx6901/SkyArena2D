@@ -15,7 +15,14 @@ class EWHeuristicStrategy:
 
     def __init__(
         self,
+        radar_freq: int = 1,
+        radar_freq_count: int = 10,
+        radar_cycle_interval: int = 8,
+        radar_stride: int = 3,
         jammer_freq: int = 1,
+        jammer_cycle_interval: int = 6,
+        jammer_stride: int = 7,
+        jammer_barrage_prob: float = 0.0,
         enabled: bool = True,
         initial_silent: bool = True,
         on_after_contact: bool = True,
@@ -25,7 +32,14 @@ class EWHeuristicStrategy:
         map_width: float = 3000.0,
         map_height: float = 4000.0,
     ) -> None:
+        self.radar_freq = int(radar_freq)
+        self.radar_freq_count = max(int(radar_freq_count), 1)
+        self.radar_cycle_interval = max(int(radar_cycle_interval), 1)
+        self.radar_stride = int(radar_stride)
         self.jammer_freq = int(jammer_freq)
+        self.jammer_cycle_interval = max(int(jammer_cycle_interval), 1)
+        self.jammer_stride = int(jammer_stride)
+        self.jammer_barrage_prob = float(np.clip(jammer_barrage_prob, 0.0, 1.0))
         self.enabled = bool(enabled)
         self.initial_silent = bool(initial_silent)
         self.on_after_contact = bool(on_after_contact)
@@ -45,7 +59,7 @@ class EWHeuristicStrategy:
         self._step_by_key.pop(key, None)
         self._last_contact_by_key.pop(key, None)
 
-    def compute_jammer_freq(
+    def compute(
         self,
         *,
         key: object,
@@ -55,10 +69,15 @@ class EWHeuristicStrategy:
         has_active_contact: np.ndarray,
         entity_features: np.ndarray | None,
         step_count: int | None = None,
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Compute rule-based radar and jammer frequencies.
+
+        Returns:
+            radar_freq: (n_agents,) int32
+            jammer_freq: (n_agents,) int32
+        """
+        radar_freq = np.zeros((n_agents,), dtype=np.int32)
         jammer_freq = np.zeros((n_agents,), dtype=np.int32)
-        if not self.enabled:
-            return jammer_freq
 
         alive = np.asarray(alive, dtype=bool)
         candidate_ids = np.asarray(candidate_ids, dtype=np.int64)
@@ -67,6 +86,14 @@ class EWHeuristicStrategy:
             entity_features = np.asarray(entity_features, dtype=np.float32)
 
         step = self._resolve_step(key, step_count)
+        for agent_idx in range(n_agents):
+            if agent_idx >= len(alive) or not bool(alive[agent_idx]):
+                continue
+            radar_freq[agent_idx] = self._radar_frequency(agent_idx, step)
+
+        if not self.enabled:
+            return radar_freq, jammer_freq
+
         last_contact = self._last_contact(key, n_agents)
         requests: list[tuple[int, float]] = []
 
@@ -86,8 +113,64 @@ class EWHeuristicStrategy:
                 requests.append((agent_idx, float(self.jammer_range)))
 
         for agent_idx, _distance in self._select_jammer_requests(requests):
-            jammer_freq[agent_idx] = int(max(self.jammer_freq, 1))
-        return jammer_freq
+            jammer_freq[agent_idx] = self._jammer_frequency(agent_idx, step)
+        return radar_freq, jammer_freq
+
+    def compute_jammer_freq(
+        self,
+        *,
+        key: object,
+        n_agents: int,
+        alive: np.ndarray,
+        candidate_ids: np.ndarray,
+        has_active_contact: np.ndarray,
+        entity_features: np.ndarray | None,
+        step_count: int | None = None,
+    ) -> np.ndarray:
+        return self.compute(
+            key=key,
+            n_agents=n_agents,
+            alive=alive,
+            candidate_ids=candidate_ids,
+            has_active_contact=has_active_contact,
+            entity_features=entity_features,
+            step_count=step_count,
+        )[1]
+
+    def compute_radar_freq(
+        self,
+        *,
+        key: object,
+        n_agents: int,
+        alive: np.ndarray,
+        candidate_ids: np.ndarray,
+        has_active_contact: np.ndarray,
+        entity_features: np.ndarray | None,
+        step_count: int | None = None,
+    ) -> np.ndarray:
+        return self.compute(
+            key=key,
+            n_agents=n_agents,
+            alive=alive,
+            candidate_ids=candidate_ids,
+            has_active_contact=has_active_contact,
+            entity_features=entity_features,
+            step_count=step_count,
+        )[0]
+
+    def _radar_frequency(self, agent_idx: int, step: int) -> int:
+        phase = int(step) // self.radar_cycle_interval
+        return 1 + ((int(agent_idx) * self.radar_stride + phase) % self.radar_freq_count)
+
+    def _jammer_frequency(self, agent_idx: int, step: int) -> int:
+        if self.jammer_barrage_prob > 0.0 and self._use_barrage(agent_idx, step):
+            return self.radar_freq_count + 1
+        phase = int(step) // self.jammer_cycle_interval
+        return 1 + ((int(agent_idx) * self.jammer_stride + phase) % self.radar_freq_count)
+
+    def _use_barrage(self, agent_idx: int, step: int) -> bool:
+        bucket = ((int(agent_idx) + 1) * 1103515245 + int(step) * 12345) % 10000
+        return (bucket / 10000.0) < self.jammer_barrage_prob
 
     def _resolve_step(self, key: object, step_count: int | None) -> int:
         if step_count is not None:
