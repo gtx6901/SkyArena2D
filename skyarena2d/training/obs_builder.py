@@ -136,11 +136,12 @@ class SkyArenaTrainingObsBuilder:
         search_goal_mask = np.ones((N, G * G), dtype=bool)
 
         # --- target_mask (N, S+1) ---
+        # Only fireable candidates are valid targets (can_long or can_short).
         target_mask = np.zeros((N, S + 1), dtype=bool)
         target_mask[:, 0] = True  # always can choose "no target"
         for i in range(N):
             for s in range(S):
-                if entity_mask[i, s]:
+                if entity_mask[i, s] and (candidate_can_long[i, s] or candidate_can_short[i, s]):
                     target_mask[i, s + 1] = True
 
         # --- agent_id (N,) ---

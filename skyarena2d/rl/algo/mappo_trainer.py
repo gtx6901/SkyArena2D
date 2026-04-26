@@ -906,6 +906,7 @@ class SkyArenaMAPPOTrainer:
         diag_target_nonzero_count = 0
         diag_tgt_can_long_sum = 0.0
         diag_tgt_can_short_sum = 0.0
+        diag_tgt_fireable_sum = 0.0
         episode_records: list = []
 
         for ep in range(num_episodes):
@@ -953,6 +954,7 @@ class SkyArenaMAPPOTrainer:
             ep_target_nonzero_count = 0
             ep_tgt_can_long_sum = 0.0
             ep_tgt_can_short_sum = 0.0
+            ep_tgt_fireable_sum = 0.0
 
             frame_dir: Optional[Path] = None
             if save_visual and render_mode == "rgb_array" and output_dir is not None:
@@ -1000,8 +1002,12 @@ class SkyArenaMAPPOTrainer:
                 if n_tgt > 0:
                     slot_idx = np.clip(tgt_policy[has_tgt] - 1, 0, can_long_arr.shape[1] - 1)
                     idx = np.arange(has_tgt.shape[0])[has_tgt]
-                    ep_tgt_can_long_sum += float(np.mean(can_long_arr[idx, slot_idx]))
-                    ep_tgt_can_short_sum += float(np.mean(can_short_arr[idx, slot_idx]))
+                    tgt_long = can_long_arr[idx, slot_idx]
+                    tgt_short = can_short_arr[idx, slot_idx]
+                    tgt_fireable = tgt_long | tgt_short
+                    ep_tgt_can_long_sum += float(np.sum(tgt_long))
+                    ep_tgt_can_short_sum += float(np.sum(tgt_short))
+                    ep_tgt_fireable_sum += float(np.sum(tgt_fireable))
                 eval_env.set_current_search_goal_id(sampled["search_goal"][0])
                 obs, reward, done, info = eval_env.step(sky_action)
                 ep_return += float(reward)
@@ -1175,7 +1181,7 @@ class SkyArenaMAPPOTrainer:
             ep_tgt_fireable_steps = max(ep_target_nonzero_count, 1)
             ep_tgt_can_long_rate = ep_tgt_can_long_sum / ep_tgt_fireable_steps
             ep_tgt_can_short_rate = ep_tgt_can_short_sum / ep_tgt_fireable_steps
-            ep_tgt_fireable_rate = (ep_tgt_can_long_sum + ep_tgt_can_short_sum) / ep_tgt_fireable_steps
+            ep_tgt_fireable_rate = ep_tgt_fireable_sum / ep_tgt_fireable_steps
 
             episode_records.append({
                 "episode": ep,
@@ -1243,6 +1249,7 @@ class SkyArenaMAPPOTrainer:
             diag_target_nonzero_count += ep_target_nonzero_count
             diag_tgt_can_long_sum += ep_tgt_can_long_sum
             diag_tgt_can_short_sum += ep_tgt_can_short_sum
+            diag_tgt_fireable_sum += ep_tgt_fireable_sum
 
             diag_fire_argmax_nonzero += ep_fire_argmax_nonzero
             diag_blue_fireable += int(metrics.get("blue_fireable_edges", 0))
@@ -1316,7 +1323,7 @@ class SkyArenaMAPPOTrainer:
         # Adapter zeroing / target fireability diagnostics
         adapter_zeroed_rate = diag_adapter_zeroed_fire / max(diag_fire_nonzero_count, 1)
         tgt_fireable_denom = max(diag_target_nonzero_count, 1)
-        target_selected_fireable_rate = (diag_tgt_can_long_sum + diag_tgt_can_short_sum) / tgt_fireable_denom
+        target_selected_fireable_rate = diag_tgt_fireable_sum / tgt_fireable_denom
         selected_target_can_long_rate = diag_tgt_can_long_sum / tgt_fireable_denom
         selected_target_can_short_rate = diag_tgt_can_short_sum / tgt_fireable_denom
 
