@@ -46,6 +46,8 @@
 - `num_envs` 更大。
 - `rollout_steps` 更稳定。
 - `save_interval` 和 `eval_interval` 不应过短，至少应接近一个 episode 的尺度。
+- `gui_eval_episodes` 可以较多；正式训练当前保留 `gui_eval_episodes: 15`。
+- 默认 `gui_eval_save_video: false` 和 `gui_eval_save_frames: false`，GUI eval 只记录指标，不保存逐帧文件。
 - 不建议频繁改变 reward、环境语义和模型结构。
 
 ## 4. `configs/mappo_skyarena.yaml`
@@ -64,6 +66,7 @@
 - 不要同时修改环境语义、reward 语义和模型结构。
 - 每次大改后先跑 smoke，再跑短训练，再跑长训练。
 - 对训练结果做对比时，固定 config、seed、checkpoint 和评估 episode 数。
+- 只有需要视觉回放时才开启 GUI eval 帧保存，避免 `frame_XXXXX.npz` 大量占用磁盘。
 
 ## 6. 配置之间的关系
 

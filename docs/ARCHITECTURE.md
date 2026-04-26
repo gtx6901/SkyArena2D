@@ -41,6 +41,7 @@ SkyArena2D 是一个透明、可控、可诊断的 2D 多智能体空战环境�
 - 构造 actor 使用的 policy obs。
 - 构造 centralized critic 使用的 `global_state`。
 - 将 actor 离散输出转换为 `SkyArenaSideAction`。
+- 使用 `ew_strategy.py` 中的训练侧电子战启发式，暂时让 jammer 由规则控制。
 - 维护 CTDE 边界：
   - actor policy obs 不泄露不可见敌机真值。
   - critic global_state 可以使用全局真值。
@@ -147,6 +148,7 @@ trace 适合排查：
 - search goal manager
 - semantic-map 分支
 - GUI eval 调度
+- training-side EW heuristic
 
 兼容层：
 

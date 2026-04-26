@@ -10,6 +10,7 @@
 | 修改运动规则 | `configs/env_10v10_full.yaml` + `skyarena2d/core/dynamics.py` | 速度、边界、转向 |
 | 修改雷达范围 | `configs/env_10v10_full.yaml` | `radar.fighter_range` |
 | 修改电子干扰 | `configs/env_10v10_full.yaml` + `skyarena2d/core/jamming.py` | 干扰范围、模式和命中探测逻辑 |
+| 修改电子战训练启发式 | `skyarena2d/training/ew_strategy.py` | 当前 jammer 由启发式控制，不是 actor head |
 | 修改被动探测 | `configs/env_10v10_full.yaml` + `skyarena2d/core/passive_detection.py` | 雷达/干扰辐射源的被动发现 |
 | 修改导弹射程 | `configs/env_10v10_full.yaml` | `weapon.long_range` / `weapon.short_range` |
 | 修改武器结算 | `skyarena2d/core/weapons.py` | fireable / attempted / selected / resolve |

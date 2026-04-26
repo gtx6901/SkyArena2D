@@ -8,6 +8,7 @@ import numpy as np
 
 from skyarena2d.adapters.action_types import SkyArenaSideAction
 from skyarena2d.core.state import TeamState
+from skyarena2d.training.ew_strategy import EWHeuristicStrategy
 
 
 class SkyArenaActionAdapter:
@@ -40,6 +41,7 @@ class SkyArenaActionAdapter:
         jammer_range: float = 320.0,
         jammer_memory_steps: int = 10,
         max_jammers_per_side: int = 3,
+        ew_strategy: EWHeuristicStrategy | None = None,
     ) -> None:
         self.candidate_slots = candidate_slots
         self.course_bins = course_bins
@@ -49,13 +51,19 @@ class SkyArenaActionAdapter:
         self.radar_freq = radar_freq
         self.jammer_freq = jammer_freq
         self.use_jammer_strategy = use_jammer_strategy
-        self.jammer_initial_silent = jammer_initial_silent
-        self.jammer_on_after_contact = jammer_on_after_contact
-        self.jammer_range = jammer_range
-        self.jammer_memory_steps = jammer_memory_steps
-        self.max_jammers_per_side = max_jammers_per_side
-        self._ew_step_by_key: dict[object, int] = {}
-        self._last_jammer_contact_by_key: dict[object, np.ndarray] = {}
+        self.ew_strategy = ew_strategy
+        if self.use_jammer_strategy and self.ew_strategy is None:
+            self.ew_strategy = EWHeuristicStrategy(
+                jammer_freq=jammer_freq,
+                enabled=True,
+                initial_silent=jammer_initial_silent,
+                on_after_contact=jammer_on_after_contact,
+                jammer_range=jammer_range,
+                memory_steps=jammer_memory_steps,
+                max_jammers_per_side=max_jammers_per_side,
+                map_width=map_width,
+                map_height=map_height,
+            )
 
         # Precompute course offset LUT
         self._course_offsets = _build_course_offset_lut(course_bins)
@@ -107,8 +115,6 @@ class SkyArenaActionAdapter:
         fire_action = np.asarray(fire_action, dtype=np.int32)
         has_active_contact = np.asarray(has_active_contact, dtype=bool)
         current_heading = np.asarray(current_heading, dtype=np.float32)
-        if entity_features is not None:
-            entity_features = np.asarray(entity_features, dtype=np.float32)
 
         # Initialize output arrays
         course = np.zeros(N, dtype=np.float32)
@@ -116,10 +122,6 @@ class SkyArenaActionAdapter:
         jammer_freq_out = np.zeros(N, dtype=np.int32)
         fire_type = np.zeros(N, dtype=np.int32)
         target_idx = np.full(N, -1, dtype=np.int32)
-
-        jammer_requests: list[tuple[int, float]] = []
-        ew_step = self._resolve_ew_step(ew_state_key, step_count)
-        last_jammer_contact = self._last_jammer_contact(ew_state_key, N)
 
         for i in range(N):
             if not own.alive[i]:
@@ -141,10 +143,8 @@ class SkyArenaActionAdapter:
                 heading = np.degrees(np.arctan2(dy, dx)) % 360.0
                 course[i] = heading
 
-            # --- Radar fixed, jammer rule-based ---
+            # --- Radar fixed. Jammer is filled after actor action decoding. ---
             radar_freq_out[i] = self.radar_freq
-            if not self.use_jammer_strategy:
-                jammer_freq_out[i] = self.jammer_freq
 
             # --- Target and Fire ---
             tgt_act = int(target_action[i])
@@ -178,23 +178,18 @@ class SkyArenaActionAdapter:
                 else:
                     fire_type[i] = 0
 
-            if self.use_jammer_strategy:
-                request_distance = self._jammer_request_distance(
-                    agent_idx=i,
-                    candidate_ids=candidate_ids,
-                    has_active_contact=has_active_contact,
-                    entity_features=entity_features,
-                )
-                if request_distance is not None:
-                    last_jammer_contact[i] = ew_step
-                    jammer_requests.append((i, request_distance))
-                elif self._should_hold_jammer(last_jammer_contact[i], ew_step):
-                    jammer_requests.append((i, float(self.jammer_range)))
-
-        if self.use_jammer_strategy:
-            jammer_freq_out[:] = 0
-            for i, _distance in self._select_jammer_requests(jammer_requests):
-                jammer_freq_out[i] = int(max(self.jammer_freq, 1))
+        if self.ew_strategy is not None:
+            jammer_freq_out = self.ew_strategy.compute_jammer_freq(
+                key=ew_state_key,
+                n_agents=N,
+                alive=own.alive[:N],
+                candidate_ids=candidate_ids,
+                has_active_contact=has_active_contact,
+                entity_features=entity_features,
+                step_count=step_count,
+            )
+        else:
+            jammer_freq_out[own.alive[:N]] = int(self.jammer_freq)
 
         return SkyArenaSideAction(
             course=course,
@@ -205,70 +200,8 @@ class SkyArenaActionAdapter:
         )
 
     def reset_ew_state(self, ew_state_key: object | None = None) -> None:
-        if ew_state_key is None:
-            self._ew_step_by_key.clear()
-            self._last_jammer_contact_by_key.clear()
-            return
-        self._ew_step_by_key.pop(ew_state_key, None)
-        self._last_jammer_contact_by_key.pop(ew_state_key, None)
-
-    def _resolve_ew_step(self, ew_state_key: object, step_count: int | None) -> int:
-        if step_count is not None:
-            step = int(step_count)
-            self._ew_step_by_key[ew_state_key] = step
-            return step
-        step = int(self._ew_step_by_key.get(ew_state_key, 0)) + 1
-        self._ew_step_by_key[ew_state_key] = step
-        return step
-
-    def _last_jammer_contact(self, ew_state_key: object, n: int) -> np.ndarray:
-        arr = self._last_jammer_contact_by_key.get(ew_state_key)
-        if arr is None or arr.shape != (n,):
-            arr = np.full(n, -10**9, dtype=np.int32)
-            self._last_jammer_contact_by_key[ew_state_key] = arr
-        return arr
-
-    def _jammer_request_distance(
-        self,
-        *,
-        agent_idx: int,
-        candidate_ids: np.ndarray,
-        has_active_contact: np.ndarray,
-        entity_features: np.ndarray | None,
-    ) -> float | None:
-        if not self.jammer_on_after_contact or not bool(has_active_contact[agent_idx]):
-            return None
-        valid = np.asarray(candidate_ids[agent_idx] >= 0, dtype=bool)
-        if not np.any(valid):
-            return None
-        if entity_features is None:
-            return 0.0
-        distances = np.asarray(entity_features[agent_idx, :, 2], dtype=np.float32)
-        valid_dist = distances[valid] * float(np.hypot(self.map_width, self.map_height))
-        if valid_dist.size == 0:
-            return None
-        nearest = float(np.min(valid_dist))
-        if nearest <= float(max(self.jammer_range, 0.0)):
-            return nearest
-        return None
-
-    def _should_hold_jammer(self, last_contact_step: int, ew_step: int) -> bool:
-        if not self.jammer_on_after_contact:
-            return False
-        return (int(ew_step) - int(last_contact_step)) <= max(int(self.jammer_memory_steps), 0)
-
-    def _select_jammer_requests(self, requests: list[tuple[int, float]]) -> list[tuple[int, float]]:
-        if not requests:
-            return []
-        max_jammers = max(int(self.max_jammers_per_side), 0)
-        if max_jammers == 0:
-            return []
-        unique_by_agent: dict[int, tuple[int, float]] = {}
-        for agent_idx, distance in requests:
-            previous = unique_by_agent.get(agent_idx)
-            if previous is None or distance < previous[1]:
-                unique_by_agent[agent_idx] = (int(agent_idx), float(distance))
-        return sorted(unique_by_agent.values(), key=lambda row: row[1])[:max_jammers]
+        if self.ew_strategy is not None:
+            self.ew_strategy.reset(ew_state_key)
 
     def build_masks(
         self,

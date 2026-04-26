@@ -20,6 +20,58 @@ from skyarena2d.core.engine import SkyArenaEngine
 from skyarena2d.opponents import RULES
 
 
+def _draw_settlement_page(env: SkyArenaEngine, info: dict, duration_s: float) -> bool:
+    """Show a short episode-settlement page. Returns False when user quits."""
+    if duration_s <= 0.0:
+        return True
+
+    env.render("human")
+    surface = pygame.display.get_surface()
+    if surface is None:
+        return True
+
+    metrics = info.get("metrics", {})
+    winner = str(info.get("winner", "unknown"))
+    reason = str(info.get("reason", ""))
+    lines = [
+        "Episode Finished",
+        f"Winner: {winner}",
+        f"Reason: {reason}",
+        f"Red kills: {metrics.get('red_kills', 0)}    Blue kills: {metrics.get('blue_kills', 0)}",
+        f"Red losses: {metrics.get('red_losses', 0)}    Blue losses: {metrics.get('blue_losses', 0)}",
+        f"First contact: {metrics.get('first_contact_step', '---')}",
+        f"First fire opportunity: {metrics.get('first_fire_opportunity_step', '---')}",
+        "Next episode starts shortly...",
+    ]
+
+    clock = pygame.time.Clock()
+    start = time.perf_counter()
+    while time.perf_counter() - start < duration_s:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return False
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                return False
+
+        surface.fill((8, 10, 18))
+        width, height = surface.get_size()
+        title_font = pygame.font.SysFont(None, 54)
+        body_font = pygame.font.SysFont(None, 30)
+        y = max(80, height // 2 - 150)
+        for idx, text in enumerate(lines):
+            font = title_font if idx == 0 else body_font
+            color = (245, 245, 245) if idx == 0 else (210, 215, 225)
+            if idx == 1:
+                color = (255, 120, 120) if winner == "red" else (120, 170, 255) if winner == "blue" else (230, 230, 160)
+            rendered = font.render(text, True, color)
+            x = (width - rendered.get_width()) // 2
+            surface.blit(rendered, (x, y))
+            y += 56 if idx == 0 else 34
+        pygame.display.flip()
+        clock.tick(30)
+    return True
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--red", default="rush_rule")
@@ -29,6 +81,7 @@ def main() -> None:
     parser.add_argument("--debug", action="store_true", help="Print debug info each step")
     parser.add_argument("--no-jamming", action="store_true", help="Disable jamming in config")
     parser.add_argument("--allow-passive-fire", action="store_true", help="Enable passive fire in config")
+    parser.add_argument("--settlement-seconds", type=float, default=3.0, help="Seconds to show episode summary before reset")
     args = parser.parse_args()
 
     if args.red not in RULES or args.blue not in RULES:
@@ -50,7 +103,10 @@ def main() -> None:
     red_rule = RULES[args.red]()
     blue_rule = RULES[args.blue]()
 
-    obs, _ = env.reset(seed=0)
+    episode_idx = 0
+    obs, _ = env.reset(seed=episode_idx)
+    red_rule.reset(episode_idx)
+    blue_rule.reset(episode_idx + 10000)
     paused = False
     single_step = False
     running = True
@@ -107,7 +163,13 @@ def main() -> None:
                 print(
                     f"Episode done. winner={info['winner']} reason={info['reason']} red_kills={info['metrics']['red_kills']} blue_kills={info['metrics']['blue_kills']}"
                 )
-                obs, _ = env.reset()
+                running = _draw_settlement_page(env, info, args.settlement_seconds)
+                if not running:
+                    break
+                episode_idx += 1
+                obs, _ = env.reset(seed=episode_idx)
+                red_rule.reset(episode_idx)
+                blue_rule.reset(episode_idx + 10000)
 
         env.render("human")
         frame_budget = 1.0 / max(1.0, args.speed)

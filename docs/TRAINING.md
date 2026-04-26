@@ -39,6 +39,20 @@
 
 这些文件应放在 `train_dir/`、`logs/` 或本地临时目录中。
 
+## GUI Eval 策略
+
+GUI eval 的 episode 数可以较多，例如正式训练中保留 `gui_eval_episodes: 15`。这用于获得更稳定的评估指标，不应为了省磁盘而减少评估次数。
+
+默认配置下：
+
+- GUI eval 仍会按 `gui_eval_interval` 运行。
+- 仍会记录 TensorBoard 指标，例如 `win_rate`、`episode_len`、`red_kills`、`blue_kills`。
+- 默认 `gui_eval_save_video: false` 且 `gui_eval_save_frames: false`。
+- 不保存每一步 `frame_XXXXX.npz`，也不生成 mp4/gif。
+- 训练默认不弹出 human GUI，只有显式传入 `--gui_eval_human` 才会打开窗口。
+
+如果确实需要视觉回放，再手动开启帧保存；开启前应确认磁盘空间足够。
+
 ## 排查训练问题的推荐顺序
 
 1. 先跑 rule-vs-rule，确认环境和规则基线行为正常。
@@ -78,6 +92,12 @@ MAPPO 正式训练：
 
 ```bash
 python scripts/train_mappo.py --config configs/mappo_skyarena_train.yaml --device cuda
+```
+
+禁用 GUI eval 的训练 smoke：
+
+```bash
+python scripts/train_mappo.py --config configs/mappo_skyarena_smoke.yaml --total_env_steps 1024 --device cpu --disable_gui_eval
 ```
 
 MAPPO checkpoint 评估：

@@ -91,6 +91,7 @@ class SkyArenaMAPPOEnv:
         self.blue_opponent.reset(seed=opp_seed)
         self._reset_counter += 1
         self.obs_builder.reset()
+        self.action_adapter.reset_ew_state()
 
         self._last_obs = obs
         self._last_info = info

@@ -68,7 +68,13 @@ class SkyArenaMAPPOTrainer:
         self.gui_eval_episodes = int(self.eval_cfg.get("gui_eval_episodes", 1))
         self.gui_eval_max_steps = int(self.eval_cfg.get("gui_eval_max_steps", 2000))
         self.gui_eval_render_mode = str(self.eval_cfg.get("gui_eval_render_mode", "rgb_array"))
-        self.gui_eval_save_video = bool(self.eval_cfg.get("gui_eval_save_video", True))
+        self.gui_eval_save_frames = bool(
+            self.eval_cfg.get(
+                "gui_eval_save_frames",
+                self.eval_cfg.get("gui_eval_save_video", False),
+            )
+        )
+        self.gui_eval_render_every = max(1, int(self.eval_cfg.get("gui_eval_render_every", 1)))
         self.gui_eval_dir = str(self.eval_cfg.get("gui_eval_dir", "gui_eval"))
         self.gui_eval_deterministic = bool(self.eval_cfg.get("gui_eval_deterministic", True))
         self.gui_eval_human = bool(self.eval_cfg.get("gui_eval_human", False))
@@ -489,11 +495,14 @@ class SkyArenaMAPPOTrainer:
 
             if self.next_gui_eval_step is not None and self.env_steps >= self.next_gui_eval_step:
                 render_mode = "human" if self.gui_eval_human else self.gui_eval_render_mode
-                output_dir = (
-                    self.run_dirs["exp_dir"]
-                    / self.gui_eval_dir
-                    / f"step_{self.env_steps:09d}"
-                )
+                save_frames = bool(render_mode == "rgb_array" and self.gui_eval_save_frames)
+                output_dir = None
+                if save_frames:
+                    output_dir = (
+                        self.run_dirs["exp_dir"]
+                        / self.gui_eval_dir
+                        / f"step_{self.env_steps:09d}"
+                    )
                 gui_metrics = self.evaluate(
                     num_episodes=self.gui_eval_episodes,
                     deterministic=self.gui_eval_deterministic,
@@ -501,11 +510,13 @@ class SkyArenaMAPPOTrainer:
                     render_mode=render_mode,
                     max_steps=self.gui_eval_max_steps,
                     output_dir=output_dir,
-                    save_visual=bool(render_mode == "rgb_array" and self.gui_eval_save_video),
+                    save_visual=save_frames,
+                    render_every=self.gui_eval_render_every,
                     step_tag=self.env_steps,
                 )
                 log_scalars(self.writer, "gui_eval", gui_metrics, self.env_steps)
-                print(f"[gui_eval] artifacts={output_dir}", flush=True)
+                if output_dir is not None:
+                    print(f"[gui_eval] frame_artifacts={output_dir}", flush=True)
                 self.next_gui_eval_step += self.gui_eval_interval
 
         print(f"[train] Done. env_steps={self.env_steps}", flush=True)
@@ -521,6 +532,7 @@ class SkyArenaMAPPOTrainer:
         max_steps: Optional[int] = None,
         output_dir: Optional[Path] = None,
         save_visual: bool = False,
+        render_every: int = 1,
         step_tag: Optional[int] = None,
     ) -> Dict[str, float]:
         """Evaluate current policy."""
@@ -542,11 +554,12 @@ class SkyArenaMAPPOTrainer:
         total_red_kills = 0.0
         total_blue_kills = 0.0
 
-        if output_dir is not None:
+        if save_visual and output_dir is not None:
             output_dir.mkdir(parents=True, exist_ok=True)
 
         eval_prefix = "gui_eval" if render_mode is not None else "eval"
         step_value = int(self.env_steps if step_tag is None else step_tag)
+        render_every = max(1, int(render_every))
 
         for ep in range(num_episodes):
             obs = eval_env.reset()
@@ -591,7 +604,7 @@ class SkyArenaMAPPOTrainer:
                 c = sampled["next_c"].to(self.device)
                 ep_steps += 1
 
-                if render_mode is not None:
+                if render_mode is not None and (ep_steps % render_every == 0):
                     frame = eval_env.engine.render(render_mode)
                     if frame is not None and save_visual:
                         if frame_dir is not None:

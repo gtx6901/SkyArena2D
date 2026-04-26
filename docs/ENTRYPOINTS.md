@@ -34,6 +34,12 @@ python scripts/train_mappo.py --config configs/mappo_skyarena_smoke.yaml --total
 python scripts/train_mappo.py --config configs/mappo_skyarena_train.yaml --device cuda
 ```
 
+默认配置会保留 GUI eval 次数并记录指标，但不会保存逐帧文件。需要完全跳过 GUI eval 时可显式关闭：
+
+```bash
+python scripts/train_mappo.py --config configs/mappo_skyarena_smoke.yaml --total_env_steps 1024 --device cpu --disable_gui_eval
+```
+
 ## MAPPO 评估
 
 用指定 checkpoint 跑评估。

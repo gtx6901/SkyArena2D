@@ -49,6 +49,8 @@ evaluation:
   gui_eval_episodes: 1
   gui_eval_max_steps: 1000
   gui_eval_render_mode: rgb_array
-  gui_eval_save_video: true
+  gui_eval_save_video: false
+  gui_eval_save_frames: false
+  gui_eval_render_every: 1
   gui_eval_dir: gui_eval
   gui_eval_deterministic: true
