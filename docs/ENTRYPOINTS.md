@@ -48,6 +48,29 @@ python scripts/train_mappo.py --config configs/mappo_skyarena_smoke.yaml --total
 python scripts/evaluate_mappo.py --config configs/mappo_skyarena_train.yaml --checkpoint <path> --episodes 10 --device cuda
 ```
 
+## TensorBoard
+
+训练日志和评估指标写入 `<exp_dir>/tb/`。启动 TensorBoard：
+
+```bash
+tensorboard --logdir train_dir/skyarena_mappo_train/train_v1.2/tb
+```
+
+若有多个实验，可以指向父目录一次加载多个 run：
+
+```bash
+tensorboard --logdir train_dir/skyarena_mappo_train
+```
+
+常用分组：
+- `train/*` — PPO loss、pg_loss、vf_loss、entropy
+- `rollout_step/*` — 每步平均动作/mask 诊断
+- `metrics_step/*` — info["metrics"] 步均诊断
+- `episode_mean/*` — 仅在有 episode 结束时写入的 episode 级指标
+- `episode/*` — 最终 info["metrics"] 的 episode 级指标
+- `eval/*` — policy eval 聚合指标
+- `gui_eval/*` — GUI eval 聚合指标
+
 ## Trace 评估
 
 用于生成 step-level JSONL trace 和 episode summary，便于排查指标、发射行为和 reward component。
