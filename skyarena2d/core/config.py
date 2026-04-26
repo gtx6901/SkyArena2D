@@ -61,6 +61,9 @@ class SpawnConfig(BaseModel):
     edge_margin_ratio: float = 0.05
     min_y_gap_ratio: float = 0.02
     curriculum: list[CurriculumStage] = Field(default_factory=list)
+    spread: bool = False
+    x_spread: float = 120.0
+    heading_spread: float = 8.0
 
 
 class RadarConfig(BaseModel):

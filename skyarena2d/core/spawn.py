@@ -54,6 +54,11 @@ def _spawn_fixed_scaled(
 ) -> tuple[np.ndarray, np.ndarray]:
     red_x = np.full((red_count,), width * cfg.red_x_ratio, dtype=np.float32)
     blue_x = np.full((blue_count,), width * cfg.blue_x_ratio, dtype=np.float32)
+    if cfg.spread and cfg.x_spread > 0:
+        red_x += rng.uniform(-cfg.x_spread, cfg.x_spread, size=red_count).astype(np.float32)
+        blue_x += rng.uniform(-cfg.x_spread, cfg.x_spread, size=blue_count).astype(np.float32)
+        red_x = np.clip(red_x, 0.0, width)
+        blue_x = np.clip(blue_x, 0.0, width)
 
     y_low = height * cfg.y_min_ratio
     y_high = height * cfg.y_max_ratio

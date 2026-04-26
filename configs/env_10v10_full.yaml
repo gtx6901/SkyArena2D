@@ -23,7 +23,10 @@ spawn:
   blue_x_ratio: 0.82
   y_min_ratio: 0.12
   y_max_ratio: 0.88
-  jitter: 10.0
+  jitter: 80.0
+  spread: true
+  x_spread: 120.0
+  heading_spread: 8.0
 
 radar:
   enabled: true

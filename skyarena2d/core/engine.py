@@ -305,12 +305,19 @@ class SkyArenaEngine:
             0,
         )
 
+        red_heading = 0.0
+        blue_heading = 180.0
+        if self.config.spawn.spread and self.config.spawn.heading_spread > 0:
+            hs = self.config.spawn.heading_spread
+            red_heading = float(rng.uniform(-hs, hs))
+            blue_heading = 180.0 + float(rng.uniform(-hs, hs))
+
         red = self._build_team(
             side="red",
             num_fighters=self.config.teams.red_fighters,
             num_detectors=self.config.teams.red_detectors,
             positions=red_pos,
-            heading_deg=0.0,
+            heading_deg=red_heading,
             profiles=self.config.red_fighter_profiles,
         )
         blue = self._build_team(
@@ -318,7 +325,7 @@ class SkyArenaEngine:
             num_fighters=self.config.teams.blue_fighters,
             num_detectors=self.config.teams.blue_detectors,
             positions=blue_pos,
-            heading_deg=180.0,
+            heading_deg=blue_heading,
             profiles=self.config.blue_fighter_profiles,
         )
 
