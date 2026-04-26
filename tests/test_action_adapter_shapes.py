@@ -316,3 +316,121 @@ def test_to_maca_fighter_action():
     assert maca[0, 3] == 6.0, f"Expected 6.0, got {maca[0, 3]}"
     # Agent 1 no fire
     assert maca[1, 3] == 0.0, f"Expected 0.0, got {maca[1, 3]}"
+
+
+def test_rule_based_jammer_opens_on_contact_without_actor_head():
+    N = 2
+    own = _make_team(N, "red")
+    adapter = SkyArenaActionAdapter(
+        candidate_slots=6,
+        course_bins=16,
+        search_goal_grid_size=8,
+        map_width=3000.0,
+        map_height=4000.0,
+        radar_freq=1,
+        jammer_freq=1,
+        use_jammer_strategy=True,
+        jammer_range=320.0,
+        max_jammers_per_side=1,
+    )
+
+    candidate_ids = np.array([[0, -1, -1, -1, -1, -1], [1, -1, -1, -1, -1, -1]], dtype=np.int64)
+    candidate_can_long = np.zeros((N, 6), dtype=bool)
+    candidate_can_short = np.zeros((N, 6), dtype=bool)
+    entity_features = np.zeros((N, 6, 10), dtype=np.float32)
+    diag = np.hypot(3000.0, 4000.0)
+    entity_features[0, 0, 2] = 300.0 / diag
+    entity_features[1, 0, 2] = 100.0 / diag
+
+    action = adapter.decode(
+        course_action=np.zeros(N, dtype=np.int32),
+        search_goal_action=np.zeros(N, dtype=np.int32),
+        target_action=np.zeros(N, dtype=np.int32),
+        fire_action=np.zeros(N, dtype=np.int32),
+        own=own,
+        candidate_ids=candidate_ids,
+        candidate_can_long=candidate_can_long,
+        candidate_can_short=candidate_can_short,
+        has_active_contact=np.ones(N, dtype=bool),
+        current_heading=np.full(N, 90.0, dtype=np.float32),
+        entity_features=entity_features,
+        ew_state_key="test",
+        step_count=5,
+    )
+
+    assert action.jammer_freq[0] == 0
+    assert action.jammer_freq[1] == 1
+
+
+def test_rule_based_jammer_memory_holds_then_expires():
+    N = 1
+    own = _make_team(N, "red")
+    adapter = SkyArenaActionAdapter(
+        candidate_slots=6,
+        course_bins=16,
+        search_goal_grid_size=8,
+        map_width=3000.0,
+        map_height=4000.0,
+        radar_freq=1,
+        jammer_freq=2,
+        use_jammer_strategy=True,
+        jammer_range=320.0,
+        jammer_memory_steps=2,
+    )
+
+    candidate_ids = np.array([[0, -1, -1, -1, -1, -1]], dtype=np.int64)
+    candidate_can_long = np.zeros((N, 6), dtype=bool)
+    candidate_can_short = np.zeros((N, 6), dtype=bool)
+    entity_features = np.zeros((N, 6, 10), dtype=np.float32)
+    entity_features[0, 0, 2] = 100.0 / np.hypot(3000.0, 4000.0)
+
+    adapter.decode(
+        course_action=np.zeros(N, dtype=np.int32),
+        search_goal_action=np.zeros(N, dtype=np.int32),
+        target_action=np.zeros(N, dtype=np.int32),
+        fire_action=np.zeros(N, dtype=np.int32),
+        own=own,
+        candidate_ids=candidate_ids,
+        candidate_can_long=candidate_can_long,
+        candidate_can_short=candidate_can_short,
+        has_active_contact=np.ones(N, dtype=bool),
+        current_heading=np.full(N, 90.0, dtype=np.float32),
+        entity_features=entity_features,
+        ew_state_key="test-memory",
+        step_count=10,
+    )
+
+    no_candidates = np.full((N, 6), -1, dtype=np.int64)
+    held = adapter.decode(
+        course_action=np.zeros(N, dtype=np.int32),
+        search_goal_action=np.zeros(N, dtype=np.int32),
+        target_action=np.zeros(N, dtype=np.int32),
+        fire_action=np.zeros(N, dtype=np.int32),
+        own=own,
+        candidate_ids=no_candidates,
+        candidate_can_long=candidate_can_long,
+        candidate_can_short=candidate_can_short,
+        has_active_contact=np.zeros(N, dtype=bool),
+        current_heading=np.full(N, 90.0, dtype=np.float32),
+        entity_features=entity_features,
+        ew_state_key="test-memory",
+        step_count=12,
+    )
+    expired = adapter.decode(
+        course_action=np.zeros(N, dtype=np.int32),
+        search_goal_action=np.zeros(N, dtype=np.int32),
+        target_action=np.zeros(N, dtype=np.int32),
+        fire_action=np.zeros(N, dtype=np.int32),
+        own=own,
+        candidate_ids=no_candidates,
+        candidate_can_long=candidate_can_long,
+        candidate_can_short=candidate_can_short,
+        has_active_contact=np.zeros(N, dtype=bool),
+        current_heading=np.full(N, 90.0, dtype=np.float32),
+        entity_features=entity_features,
+        ew_state_key="test-memory",
+        step_count=13,
+    )
+
+    assert held.jammer_freq[0] == 2
+    assert expired.jammer_freq[0] == 0

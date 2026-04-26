@@ -34,23 +34,55 @@ def test_attempted_invalid_fire():
     env = _make_env(seed=2)
     assert env.state is not None
     red_n = env.state.red.num_fighters
-    blue_n = env.state.blue.num_fighters
 
-    # Encode fire action targeting enemy index 1 via long missile (code = 1)
+    # Force out-of-range geometry to make this test deterministic.
+    env.state.red.pos[:red_n, 0] = 100.0
+    env.state.red.pos[:red_n, 1] = np.linspace(100.0, 900.0, red_n, dtype=np.float32)
+    env.state.blue.pos[:, 0] = 2900.0
+    env.state.blue.pos[:, 1] = np.linspace(100.0, 900.0, env.state.blue.num_fighters, dtype=np.float32)
+
+    # code=1 means long fire to enemy index 0.
     fighter_action = np.zeros((red_n, 4), dtype=np.float32)
-    fighter_action[:, 3] = 1.0  # hit_target = 1 (long missile at enemy 0)
+    fighter_action[:, 3] = 1.0
 
     obs, reward, done, trunc, info = env.step({
         "red": {"fighter_action": fighter_action},
         "blue": {},
     })
     metrics = info["metrics"]
+    assert env.state.cache is not None
+    cache = env.state.cache
+
     # Agents attempted to fire
-    assert metrics["red_fire_attempts"] > 0 or metrics["red_attempted_edges"] > 0
-    # Since units are far apart at step 1, selected should be 0 (not fireable)
-    # OR if somehow in range, selected >= 0 (valid test either way)
-    assert metrics["red_selected_edges"] >= 0
-    assert metrics["red_invalid_fire_count"] >= 0  # may be 0 if in range
+    assert metrics["red_fire_attempts"] > 0
+    assert metrics["red_attempted_edges"] > 0
+    # enemy index 0 should be recorded in attempted matrix, but not selected when invalid.
+    assert cache.red_attempted_long_matrix[0, 0]
+    assert not cache.red_selected_long_matrix[0, 0]
+    assert metrics["red_selected_edges"] == 0
+    assert metrics["red_invalid_fire_count"] >= 1
+
+
+def test_attempted_and_selected_matrix_on_valid_fire():
+    """Valid launch should appear in both attempted and selected matrices with enemy-0 index."""
+    env = _make_env(seed=21)
+    assert env.state is not None
+    red_n = env.state.red.num_fighters
+
+    # Force in-range geometry for deterministic valid fire.
+    env.state.red.pos[:, :] = np.array([100.0, 200.0], dtype=np.float32)
+    env.state.blue.pos[:, :] = np.array([150.0, 200.0], dtype=np.float32)
+
+    fighter_action = np.zeros((red_n, 4), dtype=np.float32)
+    fighter_action[:, 1] = 1.0
+    fighter_action[:, 3] = 1.0  # long fire to enemy index 0
+    _, _, _, _, info = env.step({"red": {"fighter_action": fighter_action}, "blue": {}})
+
+    assert env.state.cache is not None
+    cache = env.state.cache
+    assert cache.red_attempted_long_matrix[0, 0]
+    assert cache.red_selected_long_matrix[0, 0]
+    assert info["metrics"]["red_attempted_edges"] >= info["metrics"]["red_selected_edges"] >= 1
 
 
 def test_selected_fire_execution_rate():

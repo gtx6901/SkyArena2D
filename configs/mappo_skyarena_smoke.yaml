@@ -1,11 +1,11 @@
 train:
-  experiment_name: skyarena_mappo_train
-  train_dir: train_dir/skyarena_mappo_train
+  experiment_name: skyarena_mappo_smoke
+  train_dir: train_dir/skyarena_mappo_smoke
   seed: 42
-  device: cuda
-  num_envs: 8
-  rollout_steps: 256
-  total_env_steps: 5000000
+  device: cpu
+  num_envs: 2
+  rollout_steps: 64
+  total_env_steps: 2048
   learning_rate: 0.0003
   gamma: 0.99
   gae_lambda: 0.95
@@ -14,8 +14,8 @@ train:
   value_coef: 0.5
   ppo_epochs: 3
   max_grad_norm: 0.5
-  save_interval: 100000
-  eval_interval: 50000
+  save_interval: 2048
+  eval_interval: 2048
   resume: false
 
 env:
@@ -42,12 +42,12 @@ logging:
   tensorboard: true
 
 evaluation:
-  policy_eval_interval: 50000
-  policy_eval_episodes: 5
+  policy_eval_interval: 2048
+  policy_eval_episodes: 3
   gui_eval_enabled: true
-  gui_eval_interval: 100000
+  gui_eval_interval: 2048
   gui_eval_episodes: 1
-  gui_eval_max_steps: 2000
+  gui_eval_max_steps: 1000
   gui_eval_render_mode: rgb_array
   gui_eval_save_video: true
   gui_eval_dir: gui_eval

@@ -4,6 +4,7 @@ Ported from MaCA-master/algo/mappo_trainer.py.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -47,12 +48,24 @@ class SkyArenaMAPPOTrainer:
         self.env_cfg = cfg["env"]
         self.model_cfg = cfg["model"]
         self.logging_cfg = cfg.get("logging", {})
+        self.eval_cfg = cfg.get("evaluation", {})
 
         self.num_envs = int(self.train_cfg.get("num_envs", 2))
         self.rollout_steps = int(self.train_cfg.get("rollout_steps", 64))
         self.total_env_steps = int(self.train_cfg.get("total_env_steps", 100000))
         self.save_interval = int(self.train_cfg.get("save_interval", 10000))
         self.eval_interval = int(self.train_cfg.get("eval_interval", 10000))
+        self.policy_eval_interval = int(self.eval_cfg.get("policy_eval_interval", self.eval_interval))
+        self.policy_eval_episodes = int(self.eval_cfg.get("policy_eval_episodes", 3))
+        self.gui_eval_enabled = bool(self.eval_cfg.get("gui_eval_enabled", True))
+        self.gui_eval_interval = int(self.eval_cfg.get("gui_eval_interval", 0))
+        self.gui_eval_episodes = int(self.eval_cfg.get("gui_eval_episodes", 1))
+        self.gui_eval_max_steps = int(self.eval_cfg.get("gui_eval_max_steps", 2000))
+        self.gui_eval_render_mode = str(self.eval_cfg.get("gui_eval_render_mode", "rgb_array"))
+        self.gui_eval_save_video = bool(self.eval_cfg.get("gui_eval_save_video", True))
+        self.gui_eval_dir = str(self.eval_cfg.get("gui_eval_dir", "gui_eval"))
+        self.gui_eval_deterministic = bool(self.eval_cfg.get("gui_eval_deterministic", True))
+        self.gui_eval_human = bool(self.eval_cfg.get("gui_eval_human", False))
         self.ppo_epochs = int(self.train_cfg.get("ppo_epochs", 3))
         self.gamma = float(self.train_cfg.get("gamma", 0.99))
         self.gae_lambda = float(self.train_cfg.get("gae_lambda", 0.95))
@@ -123,6 +136,11 @@ class SkyArenaMAPPOTrainer:
             search_goal_grid_size=self.search_goal_grid_size,
             map_width=engine_cfg.map.width,
             map_height=engine_cfg.map.height,
+            jammer_freq=self.env_cfg.get("default_jammer_freq", 1),
+            use_jammer_strategy=self.env_cfg.get("use_jammer_strategy", True),
+            jammer_range=self.env_cfg.get("jammer_range", engine_cfg.jamming.range),
+            jammer_memory_steps=self.env_cfg.get("jammer_memory_steps", 10),
+            max_jammers_per_side=self.env_cfg.get("max_jammers_per_side", 3),
         )
 
         # Setup run dirs
@@ -152,7 +170,12 @@ class SkyArenaMAPPOTrainer:
 
         self.writer = build_writer(run_train_cfg, purge_step=(self.env_steps if self.env_steps > 0 else None))
         self.next_save_step = self.env_steps + self.save_interval
-        self.next_eval_step = self.env_steps + self.eval_interval
+        self.next_eval_step = self.env_steps + self.policy_eval_interval
+        self.next_gui_eval_step = (
+            self.env_steps + self.gui_eval_interval
+            if self.gui_eval_enabled and self.gui_eval_interval > 0
+            else None
+        )
 
     def _collect_rollout(self) -> RolloutBatch:
         """Collect rollout_steps of experience from all envs."""
@@ -222,6 +245,9 @@ class SkyArenaMAPPOTrainer:
                     candidate_can_short=batched_obs["candidate_can_short"][env_idx],
                     has_active_contact=batched_obs["has_active_contact"][env_idx] > 0.5,
                     current_heading=env.engine.state.red.heading[:env.red_fighter_num],
+                    entity_features=batched_obs["entity_features"][env_idx],
+                    ew_state_key=env_idx,
+                    step_count=env.engine.state.step_count,
                 )
 
                 next_obs, reward, done, info = env.step(sky_action)
@@ -235,6 +261,7 @@ class SkyArenaMAPPOTrainer:
                     })
                     next_obs = env.reset()
                     self.search_goal_manager.reset_envs([env_idx])
+                    self.action_adapter.reset_ew_state(env_idx)
                     self.actor_h[env_idx] = 0.0
                     self.actor_c[env_idx] = 0.0
 
@@ -446,34 +473,96 @@ class SkyArenaMAPPOTrainer:
                 self.next_save_step += self.save_interval
 
             if self.env_steps >= self.next_eval_step:
-                eval_metrics = self.evaluate(num_episodes=3)
+                eval_metrics = self.evaluate(
+                    num_episodes=self.policy_eval_episodes,
+                    deterministic=True,
+                    deterministic_reset=True,
+                )
                 log_scalars(self.writer, "eval", eval_metrics, self.env_steps)
-                self.next_eval_step += self.eval_interval
+                self.next_eval_step += self.policy_eval_interval
+
+            if self.next_gui_eval_step is not None and self.env_steps >= self.next_gui_eval_step:
+                render_mode = "human" if self.gui_eval_human else self.gui_eval_render_mode
+                output_dir = (
+                    self.run_dirs["exp_dir"]
+                    / self.gui_eval_dir
+                    / f"step_{self.env_steps:09d}"
+                )
+                gui_metrics = self.evaluate(
+                    num_episodes=self.gui_eval_episodes,
+                    deterministic=self.gui_eval_deterministic,
+                    deterministic_reset=self.gui_eval_deterministic,
+                    render_mode=render_mode,
+                    max_steps=self.gui_eval_max_steps,
+                    output_dir=output_dir,
+                    save_visual=bool(render_mode == "rgb_array" and self.gui_eval_save_video),
+                    step_tag=self.env_steps,
+                )
+                log_scalars(self.writer, "gui_eval", gui_metrics, self.env_steps)
+                print(f"[gui_eval] artifacts={output_dir}", flush=True)
+                self.next_gui_eval_step += self.gui_eval_interval
 
         print(f"[train] Done. env_steps={self.env_steps}", flush=True)
 
-    def evaluate(self, num_episodes: int = 10, checkpoint_path: Optional[str] = None) -> Dict[str, float]:
+    def evaluate(
+        self,
+        num_episodes: int = 10,
+        checkpoint_path: Optional[str] = None,
+        *,
+        deterministic: bool = True,
+        deterministic_reset: bool = True,
+        render_mode: Optional[str] = None,
+        max_steps: Optional[int] = None,
+        output_dir: Optional[Path] = None,
+        save_visual: bool = False,
+        step_tag: Optional[int] = None,
+    ) -> Dict[str, float]:
         """Evaluate current policy."""
         if checkpoint_path is not None:
             load_checkpoint(checkpoint_path, self.actor, self.critic, map_location=self.device)
 
-        eval_env = SkyArenaMAPPOEnv(self.cfg, seed_offset=9999)
+        eval_env = SkyArenaMAPPOEnv(
+            self.cfg,
+            seed_offset=9999,
+            deterministic_reset=deterministic_reset,
+        )
+        if render_mode is not None:
+            eval_env.engine.render_mode = render_mode
+
         hidden_dim = self.actor.lstm_hidden_dim
         wins = 0
         total_steps = 0
+        total_return = 0.0
+        total_red_kills = 0.0
+        total_blue_kills = 0.0
+
+        if output_dir is not None:
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+        eval_prefix = "gui_eval" if render_mode is not None else "eval"
+        step_value = int(self.env_steps if step_tag is None else step_tag)
 
         for ep in range(num_episodes):
             obs = eval_env.reset()
+            self.action_adapter.reset_ew_state("eval")
             h = torch.zeros((1, self.num_agents, hidden_dim), dtype=torch.float32, device=self.device)
             c = torch.zeros((1, self.num_agents, hidden_dim), dtype=torch.float32, device=self.device)
             done = False
             ep_steps = 0
+            ep_return = 0.0
+            info: Dict[str, Any] = {}
 
-            while not done:
+            frame_dir: Optional[Path] = None
+            if save_visual and render_mode == "rgb_array" and output_dir is not None:
+                stem = f"step_{step_value:09d}_episode_{ep:03d}"
+                frame_dir = output_dir / f"{stem}_frames"
+                frame_dir.mkdir(parents=True, exist_ok=True)
+
+            while not done and (max_steps is None or ep_steps < max_steps):
                 obs_batch = {k: v[np.newaxis] for k, v in obs.items()}
                 with torch.no_grad():
                     sampled = sample_policy_actions(
-                        self.actor, obs_batch, (h, c), self.device, deterministic=True,
+                        self.actor, obs_batch, (h, c), self.device, deterministic=deterministic,
                     )
                 sky_action = self.action_adapter.decode(
                     course_action=sampled["course"][0],
@@ -486,17 +575,50 @@ class SkyArenaMAPPOTrainer:
                     candidate_can_short=obs_batch["candidate_can_short"][0],
                     has_active_contact=obs_batch["has_active_contact"][0] > 0.5,
                     current_heading=eval_env.engine.state.red.heading[:eval_env.red_fighter_num],
+                    entity_features=obs_batch["entity_features"][0],
+                    ew_state_key="eval",
+                    step_count=eval_env.engine.state.step_count,
                 )
-                obs, _, done, info = eval_env.step(sky_action)
+                obs, reward, done, info = eval_env.step(sky_action)
+                ep_return += float(reward)
                 h = sampled["next_h"].to(self.device)
                 c = sampled["next_c"].to(self.device)
                 ep_steps += 1
 
+                if render_mode is not None:
+                    frame = eval_env.engine.render(render_mode)
+                    if frame is not None and save_visual:
+                        if frame_dir is not None:
+                            np.savez_compressed(frame_dir / f"frame_{ep_steps:05d}.npz", frame=frame)
+
+            if not done and max_steps is not None:
+                done = True
+
             if info.get("winner") == "red":
                 wins += 1
             total_steps += ep_steps
+            total_return += ep_return
+            metrics = info.get("metrics", {})
+            total_red_kills += float(metrics.get("red_kills", 0.0))
+            total_blue_kills += float(metrics.get("blue_kills", 0.0))
+
+        eval_env.engine.close()
 
         win_rate = wins / max(num_episodes, 1)
         avg_steps = total_steps / max(num_episodes, 1)
-        print(f"[eval] episodes={num_episodes} win_rate={win_rate:.3f} avg_steps={avg_steps:.1f}", flush=True)
-        return {"win_rate": win_rate, "avg_steps": avg_steps}
+        avg_return = total_return / max(num_episodes, 1)
+        avg_red_kills = total_red_kills / max(num_episodes, 1)
+        avg_blue_kills = total_blue_kills / max(num_episodes, 1)
+        print(
+            f"[{eval_prefix}] episodes={num_episodes} win_rate={win_rate:.3f} "
+            f"avg_steps={avg_steps:.1f} avg_return={avg_return:.3f}",
+            flush=True,
+        )
+        return {
+            "win_rate": win_rate,
+            "avg_steps": avg_steps,
+            "avg_return": avg_return,
+            "episode_len": avg_steps,
+            "red_kills": avg_red_kills,
+            "blue_kills": avg_blue_kills,
+        }

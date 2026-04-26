@@ -24,9 +24,12 @@ class SkyArenaMAPPOEnv:
     Blue side is controlled by rule-based opponent.
     """
 
-    def __init__(self, cfg: dict, seed_offset: int = 0):
+    def __init__(self, cfg: dict, seed_offset: int = 0, deterministic_reset: bool = False):
         self.cfg = cfg
         self.seed_offset = seed_offset
+        self.deterministic_reset = bool(deterministic_reset)
+        self._reset_counter = 0
+        self._base_seed = int(cfg["train"].get("seed", 0))
         env_cfg = cfg["env"]
 
         # Load engine config
@@ -38,7 +41,7 @@ class SkyArenaMAPPOEnv:
         blue_rule_name = env_cfg.get("blue_rule", "fix_rule_v2")
         if blue_rule_name not in RULES:
             raise ValueError(f"Unknown blue rule: {blue_rule_name}")
-        self.blue_opponent = RULES[blue_rule_name](seed=cfg["train"]["seed"] + seed_offset + 1000)
+        self.blue_opponent = RULES[blue_rule_name](seed=self._base_seed + seed_offset + 1000)
 
         # Create obs builder
         self.obs_builder = SkyArenaTrainingObsBuilder(
@@ -59,7 +62,11 @@ class SkyArenaMAPPOEnv:
             map_width=self.engine_config.map.width,
             map_height=self.engine_config.map.height,
             radar_freq=1,
-            jammer_freq=0,
+            jammer_freq=env_cfg.get("default_jammer_freq", 1),
+            use_jammer_strategy=env_cfg.get("use_jammer_strategy", True),
+            jammer_range=env_cfg.get("jammer_range", self.engine_config.jamming.range),
+            jammer_memory_steps=env_cfg.get("jammer_memory_steps", 10),
+            max_jammers_per_side=env_cfg.get("max_jammers_per_side", 3),
         )
 
         self.red_fighter_num = self.engine_config.teams.red_fighters
@@ -69,8 +76,16 @@ class SkyArenaMAPPOEnv:
 
     def reset(self) -> dict:
         """Reset environment and return initial policy obs for red."""
-        obs, info = self.engine.reset(seed=self.cfg["train"]["seed"] + self.seed_offset)
-        self.blue_opponent.reset(seed=self.cfg["train"]["seed"] + self.seed_offset + 1000)
+        if self.deterministic_reset:
+            env_seed = self._base_seed + self.seed_offset
+            opp_seed = self._base_seed + self.seed_offset + 1000
+        else:
+            env_seed = self._base_seed + self.seed_offset * 100000 + self._reset_counter
+            opp_seed = self._base_seed + self.seed_offset * 100000 + self._reset_counter + 1000
+
+        obs, info = self.engine.reset(seed=env_seed)
+        self.blue_opponent.reset(seed=opp_seed)
+        self._reset_counter += 1
         self.obs_builder.reset()
 
         self._last_obs = obs

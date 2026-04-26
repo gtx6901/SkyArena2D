@@ -150,6 +150,14 @@ class StepCache:
     blue_selected_short: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
     red_selected_target_idx: np.ndarray = field(default_factory=lambda: np.full(0, -1, dtype=np.int32))
     blue_selected_target_idx: np.ndarray = field(default_factory=lambda: np.full(0, -1, dtype=np.int32))
+    red_attempted_long_matrix: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=bool))
+    red_attempted_short_matrix: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=bool))
+    blue_attempted_long_matrix: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=bool))
+    blue_attempted_short_matrix: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=bool))
+    red_selected_long_matrix: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=bool))
+    red_selected_short_matrix: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=bool))
+    blue_selected_long_matrix: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=bool))
+    blue_selected_short_matrix: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=bool))
     reward_components: dict[str, Any] = field(default_factory=dict)
 
 

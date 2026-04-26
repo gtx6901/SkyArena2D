@@ -73,3 +73,23 @@ def test_render_rgb_array_shape():
     assert frame.shape[1] == config.render.width
     assert frame.shape[2] == 3
     assert frame.dtype == np.uint8
+
+
+def test_engine_render_passes_metrics(monkeypatch):
+    config = load_config("configs/env_10v10_full.yaml")
+    env = SkyArenaEngine(config, render_mode="rgb_array")
+    env.reset(seed=123)
+    env.step({"red": {}, "blue": {}})
+
+    captured = {"metrics": None}
+
+    def _fake_render(self, state, mode="rgb_array", metrics=None):
+        captured["metrics"] = metrics
+        return np.zeros((self.render_height, self.render_width, 3), dtype=np.uint8)
+
+    monkeypatch.setattr(PixelRenderer, "render", _fake_render)
+    frame = env.render("rgb_array")
+
+    assert frame is not None
+    assert isinstance(captured["metrics"], dict)
+    assert "expected_exchange_proxy" in captured["metrics"]

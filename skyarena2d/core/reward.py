@@ -123,55 +123,82 @@ def compute_rewards(
 
     # --- kill_loss module ---
     if _mod_enabled("kill_loss"):
+        delta_red = np.zeros_like(red_rewards)
+        delta_blue = np.zeros_like(blue_rewards)
         kl = _apply_resolution_rewards(
             state=state,
             config=config,
             weapon_result=weapon_result,
-            red_rewards=red_rewards,
-            blue_rewards=blue_rewards,
+            red_rewards=delta_red,
+            blue_rewards=delta_blue,
         )
-        components["kill_loss"] = kl
+        red_rewards += delta_red
+        blue_rewards += delta_blue
+        components["kill_loss"] = {
+            **kl,
+            "red": float(np.sum(delta_red)),
+            "blue": float(np.sum(delta_blue)),
+        }
 
     # --- valid_fire / invalid_fire module ---
     if _mod_enabled("valid_fire"):
+        delta_red = np.zeros_like(red_rewards)
+        delta_blue = np.zeros_like(blue_rewards)
         vf_coef = _mod_weight("valid_fire", "coef", config.reward.valid_fire)
         only_opp = _mod_weight("valid_fire", "only_when_opportunity", 0.0)
         if only_opp and weapon_result.red_fireable_long.size > 0:
             red_has_opp = np.any(weapon_result.red_fireable_long | weapon_result.red_fireable_short, axis=1)
             blue_has_opp = np.any(weapon_result.blue_fireable_long | weapon_result.blue_fireable_short, axis=1)
-            red_rewards[weapon_result.red_valid_fire & red_has_opp] += vf_coef
-            blue_rewards[weapon_result.blue_valid_fire & blue_has_opp] += vf_coef
+            delta_red[weapon_result.red_valid_fire & red_has_opp] += vf_coef
+            delta_blue[weapon_result.blue_valid_fire & blue_has_opp] += vf_coef
         else:
-            red_rewards[weapon_result.red_valid_fire] += vf_coef
-            blue_rewards[weapon_result.blue_valid_fire] += vf_coef
+            delta_red[weapon_result.red_valid_fire] += vf_coef
+            delta_blue[weapon_result.blue_valid_fire] += vf_coef
+        red_rewards += delta_red
+        blue_rewards += delta_blue
         components["valid_fire"] = {
-            "red": float(np.sum(red_rewards[weapon_result.red_valid_fire])),
-            "blue": float(np.sum(blue_rewards[weapon_result.blue_valid_fire])),
+            "red": float(np.sum(delta_red)),
+            "blue": float(np.sum(delta_blue)),
+            "coef": float(vf_coef),
         }
 
     if _mod_enabled("invalid_fire"):
+        delta_red = np.zeros_like(red_rewards)
+        delta_blue = np.zeros_like(blue_rewards)
         inv_penalty = _mod_weight("invalid_fire", "penalty", config.reward.invalid_fire)
-        red_rewards[weapon_result.red_invalid_fire] += inv_penalty
-        blue_rewards[weapon_result.blue_invalid_fire] += inv_penalty
+        delta_red[weapon_result.red_invalid_fire] += inv_penalty
+        delta_blue[weapon_result.blue_invalid_fire] += inv_penalty
+        red_rewards += delta_red
+        blue_rewards += delta_blue
         components["invalid_fire"] = {
-            "red": float(np.sum(red_rewards[weapon_result.red_invalid_fire])),
-            "blue": float(np.sum(blue_rewards[weapon_result.blue_invalid_fire])),
+            "red": float(np.sum(delta_red)),
+            "blue": float(np.sum(delta_blue)),
+            "penalty": float(inv_penalty),
         }
 
     # --- fire_execution module: reward for firing when opportunity exists ---
     if _mod_enabled("fire_execution", default=False):
+        delta_red = np.zeros_like(red_rewards)
+        delta_blue = np.zeros_like(blue_rewards)
         fe_coef = _mod_weight("fire_execution", "coef", 0.01)
         if weapon_result.red_fireable_long.size > 0:
             red_has_opp = np.any(weapon_result.red_fireable_long | weapon_result.red_fireable_short, axis=1)
             blue_has_opp = np.any(weapon_result.blue_fireable_long | weapon_result.blue_fireable_short, axis=1)
-            red_rewards[weapon_result.red_valid_fire & red_has_opp] += fe_coef
-            blue_rewards[weapon_result.blue_valid_fire & blue_has_opp] += fe_coef
-        components["fire_execution"] = {"coef": fe_coef}
+            delta_red[weapon_result.red_valid_fire & red_has_opp] += fe_coef
+            delta_blue[weapon_result.blue_valid_fire & blue_has_opp] += fe_coef
+        red_rewards += delta_red
+        blue_rewards += delta_blue
+        components["fire_execution"] = {
+            "red": float(np.sum(delta_red)),
+            "blue": float(np.sum(delta_blue)),
+            "coef": float(fe_coef),
+        }
 
     # --- selected_exchange module ---
     if _mod_enabled("selected_exchange", default=False):
+        delta_red = np.zeros_like(red_rewards)
+        delta_blue = np.zeros_like(blue_rewards)
         se_coef = _mod_weight("selected_exchange", "coef", 0.05)
-        # reward agents that selected a target with positive expected exchange
         if weapon_result.red_selected_target_idx.size > 0:
             for i, t in enumerate(weapon_result.red_selected_target_idx):
                 if int(t) >= 0 and i < state.red.num_fighters:
@@ -181,8 +208,24 @@ def compute_rewards(
                         p = float(state.red.short_hit_prob[i])
                     else:
                         p = 0.0
-                    red_rewards[i] += se_coef * p
-        components["selected_exchange"] = {"coef": se_coef}
+                    delta_red[i] += se_coef * p
+        if weapon_result.blue_selected_target_idx.size > 0:
+            for i, t in enumerate(weapon_result.blue_selected_target_idx):
+                if int(t) >= 0 and i < state.blue.num_fighters:
+                    if bool(weapon_result.blue_selected_long[i]):
+                        p = float(state.blue.long_hit_prob[i])
+                    elif bool(weapon_result.blue_selected_short[i]):
+                        p = float(state.blue.short_hit_prob[i])
+                    else:
+                        p = 0.0
+                    delta_blue[i] += se_coef * p
+        red_rewards += delta_red
+        blue_rewards += delta_blue
+        components["selected_exchange"] = {
+            "red": float(np.sum(delta_red)),
+            "blue": float(np.sum(delta_blue)),
+            "coef": float(se_coef),
+        }
 
     # --- keep_alive_step ---
     if config.reward.keep_alive_step != 0.0:
@@ -193,6 +236,8 @@ def compute_rewards(
     red_round = 0.0
     blue_round = 0.0
     if _mod_enabled("win_loss") and termination_result.done:
+        delta_red = np.zeros_like(red_rewards)
+        delta_blue = np.zeros_like(blue_rewards)
         win_r = _mod_weight("win_loss", "win", config.reward.win)
         lose_r = _mod_weight("win_loss", "lose", config.reward.lose)
         draw_r = _mod_weight("win_loss", "draw", config.reward.draw)
@@ -205,9 +250,16 @@ def compute_rewards(
         else:
             red_round = draw_r
             blue_round = draw_r
-        red_rewards += red_round
-        blue_rewards += blue_round
-        components["win_loss"] = {"red": red_round, "blue": blue_round}
+        delta_red += red_round
+        delta_blue += blue_round
+        red_rewards += delta_red
+        blue_rewards += delta_blue
+        components["win_loss"] = {
+            "red": float(np.sum(delta_red)),
+            "blue": float(np.sum(delta_blue)),
+            "red_round": float(red_round),
+            "blue_round": float(blue_round),
+        }
 
     state.last_round_reward_red = red_round
     state.last_round_reward_blue = blue_round

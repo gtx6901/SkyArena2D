@@ -28,6 +28,12 @@ cd skyarena2d
 /usr/bin/python3 scripts/smoke_test_env.py --config configs/env_10v10_full.yaml --steps 100
 ```
 
+## 3.1 训练与评估文档
+
+MAPPO 训练、smoke/train 配置、policy eval 与 GUI eval 课表，请参考：
+
+- `docs/TRAINING.md`
+
 ## 4. 运行 rule vs rule eval
 
 ```bash
@@ -105,6 +111,12 @@ detector_action: `[num_detector, 2]`
 - `last_reward`
 
 ### Reward
+
+训练主 reward 语义：
+
+- `reward["red"] / reward["blue"]`: team-level reward（训练使用）
+- `reward["red_unit"] / reward["blue_unit"]`: unit-level reward 向量
+- `reward["red_unit_sum"] / reward["blue_unit_sum"]`: 仅用于诊断
 
 `info["maca_reward"]` 提供：
 

@@ -149,10 +149,10 @@ def sample_policy_actions(
         executed_search_goal_np.reshape(num_envs * num_agents), dtype=torch.long, device=device,
     )
 
+    entity_mask_t = obs_t["entity_mask"].reshape(num_envs * num_agents, -1)
     candidate_can_long_t = obs_t["candidate_can_long"].reshape(num_envs * num_agents, -1)
     candidate_can_short_t = obs_t["candidate_can_short"].reshape(num_envs * num_agents, -1)
-    candidate_ids_t = obs_t["candidate_ids"].reshape(num_envs * num_agents, -1)
-    has_target_opportunity_t = alive_mask_t & has_active_contact & torch.any(candidate_ids_t > 0, dim=1)
+    has_target_opportunity_t = alive_mask_t & has_active_contact & torch.any(entity_mask_t, dim=1)
     target_action = torch.where(has_target_opportunity_t, target_action, torch.zeros_like(target_action))
 
     fire_mask_t = build_fire_mask_from_selected_targets(
@@ -167,7 +167,7 @@ def sample_policy_actions(
         fire_action = torch.argmax(fire_logits.masked_fill(~fire_mask_t, torch.finfo(fire_logits.dtype).min), dim=-1)
     else:
         fire_action = fire_dist.sample()
-    has_fire_opportunity_t = alive_mask_t & torch.any(candidate_can_long_t | candidate_can_short_t, dim=1)
+    has_fire_opportunity_t = has_target_opportunity_t & torch.any(candidate_can_long_t | candidate_can_short_t, dim=1)
     fire_action = torch.where(has_fire_opportunity_t, fire_action, torch.zeros_like(fire_action))
 
     course_log_prob = course_dist.log_prob(course_action)

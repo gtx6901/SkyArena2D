@@ -48,35 +48,39 @@ def _expected_kill_proxy(
 
 
 def _selected_expected_kills(
-    selected_long: np.ndarray,
-    selected_short: np.ndarray,
-    selected_target_idx: np.ndarray,
+    selected_long_matrix: np.ndarray,
+    selected_short_matrix: np.ndarray,
     long_p: np.ndarray,
     short_p: np.ndarray,
-    num_enemies: int,
 ) -> tuple[float, int, float]:
-    """Compute expected kills based on actually selected (launched) targets."""
-    if selected_long.size == 0 or num_enemies == 0:
+    """Compute expected kills based on actually selected (launched) target-allocation matrices."""
+    if selected_long_matrix.size == 0 or selected_short_matrix.size == 0:
         return 0.0, 0, 0.0
 
-    # group by target
-    target_probs: dict[int, list[float]] = defaultdict(list)
-    for i in range(len(selected_long)):
-        t = int(selected_target_idx[i])
-        if t < 0:
-            continue
-        if bool(selected_long[i]) and i < len(long_p):
-            target_probs[t].append(float(long_p[i]))
-        elif bool(selected_short[i]) and i < len(short_p):
-            target_probs[t].append(float(short_p[i]))
-
     expected = 0.0
-    unique_targets = len(target_probs)
+    unique_targets = 0
     overkill_vals: list[float] = []
-    for t, probs in target_probs.items():
+
+    target_n = selected_long_matrix.shape[1]
+    for t in range(target_n):
+        incoming_long = np.where(selected_long_matrix[:, t])[0]
+        incoming_short = np.where(selected_short_matrix[:, t])[0]
+        if incoming_long.size == 0 and incoming_short.size == 0:
+            continue
+
+        probs: list[float] = []
+        if incoming_long.size:
+            probs.extend(long_p[incoming_long[incoming_long < len(long_p)]].tolist())
+        if incoming_short.size:
+            probs.extend(short_p[incoming_short[incoming_short < len(short_p)]].tolist())
+
+        if not probs:
+            continue
+
         probs_arr = np.clip(np.array(probs, dtype=np.float32), 0.0, 1.0)
         kill_prob = 1.0 - float(np.prod(1.0 - probs_arr))
         expected += kill_prob
+        unique_targets += 1
         overkill_vals.append(max(0.0, float(len(probs) - 1)))
 
     overkill_mean = float(np.mean(overkill_vals)) if overkill_vals else 0.0
@@ -130,9 +134,20 @@ def update_tracker(
         tracker.overkill_values_blue.append(max(0, count - 1))
 
     # --- new: attempted/selected tracking ---
-    if weapon_result.red_attempted_fire.size > 0:
+    if weapon_result.red_attempted_long_matrix.size > 0:
+        red_attempted_edges = int(np.count_nonzero(
+            weapon_result.red_attempted_long_matrix | weapon_result.red_attempted_short_matrix
+        ))
+        tracker.fire_attempts_red += red_attempted_edges
+    elif weapon_result.red_attempted_fire.size > 0:
         tracker.fire_attempts_red += int(np.count_nonzero(weapon_result.red_attempted_fire))
-    if weapon_result.blue_attempted_fire.size > 0:
+
+    if weapon_result.blue_attempted_long_matrix.size > 0:
+        blue_attempted_edges = int(np.count_nonzero(
+            weapon_result.blue_attempted_long_matrix | weapon_result.blue_attempted_short_matrix
+        ))
+        tracker.fire_attempts_blue += blue_attempted_edges
+    elif weapon_result.blue_attempted_fire.size > 0:
         tracker.fire_attempts_blue += int(np.count_nonzero(weapon_result.blue_attempted_fire))
 
     # fire opportunities = agents with any fireable edge
@@ -147,43 +162,63 @@ def update_tracker(
         )))
         tracker.fire_opportunities_blue += blue_opp
 
-    # fire executions = agents that actually fired (valid)
-    if weapon_result.red_valid_fire.size > 0:
-        tracker.fire_executions_red += int(np.count_nonzero(weapon_result.red_valid_fire))
-    if weapon_result.blue_valid_fire.size > 0:
-        tracker.fire_executions_blue += int(np.count_nonzero(weapon_result.blue_valid_fire))
+    if weapon_result.red_selected_long_matrix.size > 0:
+        red_selected_matrix = weapon_result.red_selected_long_matrix | weapon_result.red_selected_short_matrix
+        blue_selected_matrix = weapon_result.blue_selected_long_matrix | weapon_result.blue_selected_short_matrix
+        red_selected_edges = int(np.count_nonzero(red_selected_matrix))
+        blue_selected_edges = int(np.count_nonzero(blue_selected_matrix))
 
-    # invalid fire counts
-    if weapon_result.red_invalid_fire.size > 0:
-        tracker.invalid_fire_count_red += int(np.count_nonzero(weapon_result.red_invalid_fire))
-    if weapon_result.blue_invalid_fire.size > 0:
-        tracker.invalid_fire_count_blue += int(np.count_nonzero(weapon_result.blue_invalid_fire))
+        tracker.fire_executions_red += red_selected_edges
+        tracker.fire_executions_blue += blue_selected_edges
 
-    # selected targets tracking
-    if weapon_result.red_selected_target_idx.size > 0:
-        for t in weapon_result.red_selected_target_idx:
-            if int(t) >= 0:
-                tracker.unique_selected_targets_red.add(int(t))
-    if weapon_result.blue_selected_target_idx.size > 0:
-        for t in weapon_result.blue_selected_target_idx:
-            if int(t) >= 0:
-                tracker.unique_selected_targets_blue.add(int(t))
+        red_attempted_matrix = weapon_result.red_attempted_long_matrix | weapon_result.red_attempted_short_matrix
+        blue_attempted_matrix = weapon_result.blue_attempted_long_matrix | weapon_result.blue_attempted_short_matrix
+        tracker.invalid_fire_count_red += max(0, int(np.count_nonzero(red_attempted_matrix)) - red_selected_edges)
+        tracker.invalid_fire_count_blue += max(0, int(np.count_nonzero(blue_attempted_matrix)) - blue_selected_edges)
 
-    # selected overkill
-    sel_incoming_blue: dict[int, int] = defaultdict(int)
-    sel_incoming_red: dict[int, int] = defaultdict(int)
-    if weapon_result.red_selected_target_idx.size > 0:
-        for t in weapon_result.red_selected_target_idx:
-            if int(t) >= 0:
-                sel_incoming_blue[int(t)] += 1
-    if weapon_result.blue_selected_target_idx.size > 0:
-        for t in weapon_result.blue_selected_target_idx:
-            if int(t) >= 0:
-                sel_incoming_red[int(t)] += 1
-    for count in sel_incoming_blue.values():
-        tracker.selected_overkill_values_red.append(max(0, count - 1))
-    for count in sel_incoming_red.values():
-        tracker.selected_overkill_values_blue.append(max(0, count - 1))
+        for target_idx in np.where(np.any(red_selected_matrix, axis=0))[0].tolist():
+            tracker.unique_selected_targets_red.add(int(target_idx))
+        for target_idx in np.where(np.any(blue_selected_matrix, axis=0))[0].tolist():
+            tracker.unique_selected_targets_blue.add(int(target_idx))
+
+        for count in np.count_nonzero(red_selected_matrix, axis=0).tolist():
+            if count > 0:
+                tracker.selected_overkill_values_red.append(max(0, int(count) - 1))
+        for count in np.count_nonzero(blue_selected_matrix, axis=0).tolist():
+            if count > 0:
+                tracker.selected_overkill_values_blue.append(max(0, int(count) - 1))
+    else:
+        # Fallback to per-agent fields for compatibility with old data.
+        if weapon_result.red_valid_fire.size > 0:
+            tracker.fire_executions_red += int(np.count_nonzero(weapon_result.red_valid_fire))
+        if weapon_result.blue_valid_fire.size > 0:
+            tracker.fire_executions_blue += int(np.count_nonzero(weapon_result.blue_valid_fire))
+        if weapon_result.red_invalid_fire.size > 0:
+            tracker.invalid_fire_count_red += int(np.count_nonzero(weapon_result.red_invalid_fire))
+        if weapon_result.blue_invalid_fire.size > 0:
+            tracker.invalid_fire_count_blue += int(np.count_nonzero(weapon_result.blue_invalid_fire))
+        if weapon_result.red_selected_target_idx.size > 0:
+            for t in weapon_result.red_selected_target_idx:
+                if int(t) >= 0:
+                    tracker.unique_selected_targets_red.add(int(t))
+        if weapon_result.blue_selected_target_idx.size > 0:
+            for t in weapon_result.blue_selected_target_idx:
+                if int(t) >= 0:
+                    tracker.unique_selected_targets_blue.add(int(t))
+        sel_incoming_blue: dict[int, int] = defaultdict(int)
+        sel_incoming_red: dict[int, int] = defaultdict(int)
+        if weapon_result.red_selected_target_idx.size > 0:
+            for t in weapon_result.red_selected_target_idx:
+                if int(t) >= 0:
+                    sel_incoming_blue[int(t)] += 1
+        if weapon_result.blue_selected_target_idx.size > 0:
+            for t in weapon_result.blue_selected_target_idx:
+                if int(t) >= 0:
+                    sel_incoming_red[int(t)] += 1
+        for count in sel_incoming_blue.values():
+            tracker.selected_overkill_values_red.append(max(0, count - 1))
+        for count in sel_incoming_red.values():
+            tracker.selected_overkill_values_blue.append(max(0, count - 1))
 
 
 def build_metrics_snapshot(state: EnvState, weapon_result: WeaponStepResult) -> dict[str, float | int | None]:
@@ -200,31 +235,39 @@ def build_metrics_snapshot(state: EnvState, weapon_result: WeaponStepResult) -> 
         state.blue.short_hit_prob,
     )
 
-    # selected expected kills
-    num_blue = state.blue.num_fighters
-    num_red = state.red.num_fighters
+    # selected expected kills (matrix-priority)
     red_sel_exp, red_sel_unique, red_sel_overkill = _selected_expected_kills(
-        weapon_result.red_selected_long,
-        weapon_result.red_selected_short,
-        weapon_result.red_selected_target_idx,
+        weapon_result.red_selected_long_matrix,
+        weapon_result.red_selected_short_matrix,
         state.red.long_hit_prob,
         state.red.short_hit_prob,
-        num_blue,
     )
     blue_sel_exp, blue_sel_unique, blue_sel_overkill = _selected_expected_kills(
-        weapon_result.blue_selected_long,
-        weapon_result.blue_selected_short,
-        weapon_result.blue_selected_target_idx,
+        weapon_result.blue_selected_long_matrix,
+        weapon_result.blue_selected_short_matrix,
         state.blue.long_hit_prob,
         state.blue.short_hit_prob,
-        num_red,
     )
 
     # attempted/selected edges
-    red_attempted_edges = int(np.count_nonzero(weapon_result.red_attempted_fire)) if weapon_result.red_attempted_fire.size > 0 else 0
-    blue_attempted_edges = int(np.count_nonzero(weapon_result.blue_attempted_fire)) if weapon_result.blue_attempted_fire.size > 0 else 0
-    red_selected_edges = int(np.count_nonzero(weapon_result.red_selected_long | weapon_result.red_selected_short)) if weapon_result.red_selected_long.size > 0 else 0
-    blue_selected_edges = int(np.count_nonzero(weapon_result.blue_selected_long | weapon_result.blue_selected_short)) if weapon_result.blue_selected_long.size > 0 else 0
+    if weapon_result.red_attempted_long_matrix.size > 0:
+        red_attempted_edges = int(np.count_nonzero(
+            weapon_result.red_attempted_long_matrix | weapon_result.red_attempted_short_matrix
+        ))
+        blue_attempted_edges = int(np.count_nonzero(
+            weapon_result.blue_attempted_long_matrix | weapon_result.blue_attempted_short_matrix
+        ))
+        red_selected_edges = int(np.count_nonzero(
+            weapon_result.red_selected_long_matrix | weapon_result.red_selected_short_matrix
+        ))
+        blue_selected_edges = int(np.count_nonzero(
+            weapon_result.blue_selected_long_matrix | weapon_result.blue_selected_short_matrix
+        ))
+    else:
+        red_attempted_edges = int(np.count_nonzero(weapon_result.red_attempted_fire)) if weapon_result.red_attempted_fire.size > 0 else 0
+        blue_attempted_edges = int(np.count_nonzero(weapon_result.blue_attempted_fire)) if weapon_result.blue_attempted_fire.size > 0 else 0
+        red_selected_edges = int(np.count_nonzero(weapon_result.red_selected_long | weapon_result.red_selected_short)) if weapon_result.red_selected_long.size > 0 else 0
+        blue_selected_edges = int(np.count_nonzero(weapon_result.blue_selected_long | weapon_result.blue_selected_short)) if weapon_result.blue_selected_long.size > 0 else 0
 
     tracker = state.tracker
     contact_gap = None

@@ -32,6 +32,8 @@ def _alive_fighter(
         "id": idx + 1,
         "alive": True,
         "course": course,
+        "l_missile_left": 2,
+        "s_missile_left": 4,
         "r_visible_list": visible or [],
     }
 
@@ -122,8 +124,50 @@ def test_reset_clears_state() -> None:
     rule.first_contact_step = 10
     rule.agent_search_heading[0] = 45.0
     rule.agent_search_timer[0] = 5
+    rule.agent_last_jammer_contact[0] = 10
 
     rule.reset(seed=1)
     assert rule.first_contact_step is None
     assert len(rule.agent_search_heading) == 0
     assert len(rule.agent_search_timer) == 0
+    assert len(rule.agent_last_jammer_contact) == 0
+
+
+def test_jammer_silent_during_initial_push() -> None:
+    rule = FixRuleV2Opponent(seed=0, jammer_freq=3)
+    fighters = [_alive_fighter(0, course=0.0), _alive_fighter(1, course=0.0)]
+    action = rule.act(_make_side_obs(fighters), "red", step_count=0)
+    assert np.all(action["fighter_action"][:, 2] == 0)
+
+
+def test_jammer_uses_visible_target_frequency_after_contact() -> None:
+    rule = FixRuleV2Opponent(seed=0, jammer_freq=2, jammer_range=320.0, match_target_radar_freq=True)
+    visible_enemy = [{"id": 1, "distance": 250.0, "direction": 0.0, "r_fp": 4}]
+    fighters = [_alive_fighter(0, course=0.0, visible=visible_enemy)]
+    action = rule.act(_make_side_obs(fighters), "red", step_count=5)
+    assert int(action["fighter_action"][0, 2]) == 4
+
+
+def test_jammer_memory_holds_then_turns_off() -> None:
+    rule = FixRuleV2Opponent(seed=0, jammer_freq=2, jammer_range=320.0, jammer_memory_steps=2)
+    visible_enemy = [{"id": 1, "distance": 250.0, "direction": 0.0}]
+    fighters = [_alive_fighter(0, course=0.0, visible=visible_enemy)]
+    rule.act(_make_side_obs(fighters), "red", step_count=5)
+
+    no_contact = [_alive_fighter(0, course=0.0, visible=[])]
+    held = rule.act(_make_side_obs(no_contact), "red", step_count=7)
+    expired = rule.act(_make_side_obs(no_contact), "red", step_count=8)
+
+    assert int(held["fighter_action"][0, 2]) == 2
+    assert int(expired["fighter_action"][0, 2]) == 0
+
+
+def test_jammer_limits_active_emitters_to_nearest_targets() -> None:
+    rule = FixRuleV2Opponent(seed=0, jammer_freq=1, jammer_range=320.0, max_jammers_per_side=1)
+    fighters = [
+        _alive_fighter(0, visible=[{"id": 1, "distance": 300.0, "direction": 0.0}]),
+        _alive_fighter(1, visible=[{"id": 2, "distance": 100.0, "direction": 0.0}]),
+    ]
+    action = rule.act(_make_side_obs(fighters), "red", step_count=5)
+    assert action["fighter_action"][0, 2] == 0
+    assert action["fighter_action"][1, 2] == 1

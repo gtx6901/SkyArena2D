@@ -388,6 +388,14 @@ class SkyArenaEngine:
             blue_selected_short=np.zeros((blue.total_units,), dtype=bool),
             red_selected_target_idx=np.full((red.total_units,), -1, dtype=np.int32),
             blue_selected_target_idx=np.full((blue.total_units,), -1, dtype=np.int32),
+            red_attempted_long_matrix=np.zeros((red.total_units, blue.total_units), dtype=bool),
+            red_attempted_short_matrix=np.zeros((red.total_units, blue.total_units), dtype=bool),
+            blue_attempted_long_matrix=np.zeros((blue.total_units, red.total_units), dtype=bool),
+            blue_attempted_short_matrix=np.zeros((blue.total_units, red.total_units), dtype=bool),
+            red_selected_long_matrix=np.zeros((red.total_units, blue.total_units), dtype=bool),
+            red_selected_short_matrix=np.zeros((red.total_units, blue.total_units), dtype=bool),
+            blue_selected_long_matrix=np.zeros((blue.total_units, red.total_units), dtype=bool),
+            blue_selected_short_matrix=np.zeros((blue.total_units, red.total_units), dtype=bool),
             reward_components={},
         )
 
@@ -521,6 +529,14 @@ class SkyArenaEngine:
             blue_selected_short=weapon_result.blue_selected_short,
             red_selected_target_idx=weapon_result.red_selected_target_idx,
             blue_selected_target_idx=weapon_result.blue_selected_target_idx,
+            red_attempted_long_matrix=weapon_result.red_attempted_long_matrix,
+            red_attempted_short_matrix=weapon_result.red_attempted_short_matrix,
+            blue_attempted_long_matrix=weapon_result.blue_attempted_long_matrix,
+            blue_attempted_short_matrix=weapon_result.blue_attempted_short_matrix,
+            red_selected_long_matrix=weapon_result.red_selected_long_matrix,
+            red_selected_short_matrix=weapon_result.red_selected_short_matrix,
+            blue_selected_long_matrix=weapon_result.blue_selected_long_matrix,
+            blue_selected_short_matrix=weapon_result.blue_selected_short_matrix,
             reward_components=reward_output.components,
         )
 
@@ -538,8 +554,10 @@ class SkyArenaEngine:
 
         obs = self._build_observations()
         reward = {
-            "red": float(np.sum(reward_output.red_unit_rewards)),
-            "blue": float(np.sum(reward_output.blue_unit_rewards)),
+            "red": float(reward_output.red_team_reward),
+            "blue": float(reward_output.blue_team_reward),
+            "red_unit_sum": float(np.sum(reward_output.red_unit_rewards)),
+            "blue_unit_sum": float(np.sum(reward_output.blue_unit_rewards)),
             "red_unit": reward_output.red_unit_rewards.copy(),
             "blue_unit": reward_output.blue_unit_rewards.copy(),
             "maca": reward_output.maca_reward,
@@ -577,7 +595,8 @@ class SkyArenaEngine:
 
         if self._renderer is None:
             self._renderer = PixelRenderer(self.config)
-        return self._renderer.render(self.state, mode=mode)
+        metrics = self._last_info.get("metrics") if self._last_info else None
+        return self._renderer.render(self.state, mode=mode, metrics=metrics)
 
     def close(self) -> None:
         if self._renderer is not None:

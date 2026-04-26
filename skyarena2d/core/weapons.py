@@ -36,6 +36,14 @@ class WeaponStepResult:
     blue_selected_short: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
     red_selected_target_idx: np.ndarray = field(default_factory=lambda: np.full(0, -1, dtype=np.int32))
     blue_selected_target_idx: np.ndarray = field(default_factory=lambda: np.full(0, -1, dtype=np.int32))
+    red_attempted_long_matrix: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=bool))
+    red_attempted_short_matrix: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=bool))
+    blue_attempted_long_matrix: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=bool))
+    blue_attempted_short_matrix: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=bool))
+    red_selected_long_matrix: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=bool))
+    red_selected_short_matrix: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=bool))
+    blue_selected_long_matrix: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=bool))
+    blue_selected_short_matrix: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=bool))
 
 
 def _event_dict(event: MissileEvent) -> dict[str, object]:
@@ -121,9 +129,11 @@ def _queue_and_collect_launches(
     fireable_long: np.ndarray,
     fireable_short: np.ndarray,
 ) -> tuple[list[LaunchRecord], np.ndarray, np.ndarray, list[MissileEvent], int, int,
-           np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+        np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Returns launch_records, valid, invalid, events, launched_long, launched_short,
-    attempted, selected_long, selected_short, selected_target_idx."""
+    attempted, selected_long, selected_short, selected_target_idx,
+    attempted_long_matrix, attempted_short_matrix, selected_long_matrix, selected_short_matrix."""
     launch_records: list[LaunchRecord] = []
     events: list[MissileEvent] = []
     valid = np.zeros((own.total_units,), dtype=bool)
@@ -132,6 +142,10 @@ def _queue_and_collect_launches(
     selected_long = np.zeros((own.total_units,), dtype=bool)
     selected_short = np.zeros((own.total_units,), dtype=bool)
     selected_target_idx = np.full((own.total_units,), -1, dtype=np.int32)
+    attempted_long_matrix = np.zeros((own.total_units, enemy.total_units), dtype=bool)
+    attempted_short_matrix = np.zeros((own.total_units, enemy.total_units), dtype=bool)
+    selected_long_matrix = np.zeros((own.total_units, enemy.total_units), dtype=bool)
+    selected_short_matrix = np.zeros((own.total_units, enemy.total_units), dtype=bool)
     launched_long = 0
     launched_short = 0
 
@@ -144,6 +158,10 @@ def _queue_and_collect_launches(
 
         # agent attempted to fire
         attempted[i] = True
+        if missile_type == "long":
+            attempted_long_matrix[i, target_idx] = True
+        else:
+            attempted_short_matrix[i, target_idx] = True
 
         can_fire = False
         reason = ""
@@ -177,11 +195,13 @@ def _queue_and_collect_launches(
             hit_prob = float(own.long_hit_prob[i])
             launched_long += 1
             selected_long[i] = True
+            selected_long_matrix[i, target_idx] = True
         else:
             own.short_ammo[i] -= 1
             hit_prob = float(own.short_hit_prob[i])
             launched_short += 1
             selected_short[i] = True
+            selected_short_matrix[i, target_idx] = True
 
         valid[i] = True
         selected_target_idx[i] = target_idx
@@ -211,7 +231,8 @@ def _queue_and_collect_launches(
         )
 
     return (launch_records, valid, invalid, events, launched_long, launched_short,
-            attempted, selected_long, selected_short, selected_target_idx)
+            attempted, selected_long, selected_short, selected_target_idx,
+            attempted_long_matrix, attempted_short_matrix, selected_long_matrix, selected_short_matrix)
 
 
 def _resolve_due_events(
@@ -326,6 +347,10 @@ def process_weapons(
         red_sel_long,
         red_sel_short,
         red_sel_target,
+        red_attempted_long_matrix,
+        red_attempted_short_matrix,
+        red_selected_long_matrix,
+        red_selected_short_matrix,
     ) = _queue_and_collect_launches(
         state=state,
         config=config,
@@ -347,6 +372,10 @@ def process_weapons(
         blue_sel_long,
         blue_sel_short,
         blue_sel_target,
+        blue_attempted_long_matrix,
+        blue_attempted_short_matrix,
+        blue_selected_long_matrix,
+        blue_selected_short_matrix,
     ) = _queue_and_collect_launches(
         state=state,
         config=config,
@@ -406,4 +435,12 @@ def process_weapons(
         blue_selected_short=blue_sel_short,
         red_selected_target_idx=red_sel_target,
         blue_selected_target_idx=blue_sel_target,
+        red_attempted_long_matrix=red_attempted_long_matrix,
+        red_attempted_short_matrix=red_attempted_short_matrix,
+        blue_attempted_long_matrix=blue_attempted_long_matrix,
+        blue_attempted_short_matrix=blue_attempted_short_matrix,
+        red_selected_long_matrix=red_selected_long_matrix,
+        red_selected_short_matrix=red_selected_short_matrix,
+        blue_selected_long_matrix=blue_selected_long_matrix,
+        blue_selected_short_matrix=blue_selected_short_matrix,
     )

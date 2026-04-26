@@ -44,6 +44,9 @@ class TraceRecorder:
             # Headings
             "red_heading": state.red.heading.tolist(),
             "blue_heading": state.blue.heading.tolist(),
+            # Visible matrices
+            "red_visible": _to_list(cache.red_visible),
+            "blue_visible": _to_list(cache.blue_visible),
             # Ammo
             "red_long_ammo": state.red.long_ammo.tolist(),
             "red_short_ammo": state.red.short_ammo.tolist(),
@@ -63,6 +66,15 @@ class TraceRecorder:
             "blue_selected_short": _to_list(cache.blue_selected_short),
             "red_selected_target_idx": _to_list(cache.red_selected_target_idx),
             "blue_selected_target_idx": _to_list(cache.blue_selected_target_idx),
+            # Attempted/selected allocation matrices
+            "red_attempted_long_matrix": _to_list(cache.red_attempted_long_matrix),
+            "red_attempted_short_matrix": _to_list(cache.red_attempted_short_matrix),
+            "blue_attempted_long_matrix": _to_list(cache.blue_attempted_long_matrix),
+            "blue_attempted_short_matrix": _to_list(cache.blue_attempted_short_matrix),
+            "red_selected_long_matrix": _to_list(cache.red_selected_long_matrix),
+            "red_selected_short_matrix": _to_list(cache.red_selected_short_matrix),
+            "blue_selected_long_matrix": _to_list(cache.blue_selected_long_matrix),
+            "blue_selected_short_matrix": _to_list(cache.blue_selected_short_matrix),
             # Launch and resolve records
             "launch_records": [_serialize_record(r) for r in cache.launch_records],
             "resolved_records": list(cache.resolved_records),
