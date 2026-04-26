@@ -47,4 +47,4 @@ config.resolved.json
 .DS_Store
 Thumbs.db
 .idea/
-.vscode/
+.vscode/eval_reports/

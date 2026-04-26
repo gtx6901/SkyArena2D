@@ -24,7 +24,8 @@ def main():
         cfg["train"]["device"] = args.device
 
     trainer = SkyArenaMAPPOTrainer(cfg)
-    trainer.evaluate(num_episodes=args.episodes, checkpoint_path=args.checkpoint)
+    trainer.evaluate(num_episodes=args.episodes, checkpoint_path=args.checkpoint,
+                     write_report=True, kind="eval")
 
 
 if __name__ == "__main__":

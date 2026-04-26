@@ -685,6 +685,8 @@ class SkyArenaMAPPOTrainer:
                     num_episodes=self.policy_eval_episodes,
                     deterministic=True,
                     deterministic_reset=True,
+                    write_report=True,
+                    kind="eval",
                 )
                 log_scalars(self.writer, "eval", eval_metrics, self.env_steps)
                 self.next_eval_step += self.policy_eval_interval
@@ -709,6 +711,8 @@ class SkyArenaMAPPOTrainer:
                     save_visual=save_frames,
                     render_every=self.gui_eval_render_every,
                     step_tag=self.env_steps,
+                    write_report=True,
+                    kind="gui_eval",
                 )
                 log_scalars(self.writer, "gui_eval", gui_metrics, self.env_steps)
                 if output_dir is not None:
@@ -716,6 +720,61 @@ class SkyArenaMAPPOTrainer:
                 self.next_gui_eval_step += self.gui_eval_interval
 
         print(f"[train] Done. env_steps={self.env_steps}", flush=True)
+
+    def _write_eval_report(
+        self,
+        kind: str,
+        summary: dict,
+        episodes: list,
+        checkpoint_path: str | None = None,
+    ) -> None:
+        """Write eval/gui_eval results as JSON to <exp_dir>/eval_reports/."""
+        import json
+        import time
+
+        report_dir = self.run_dirs["exp_dir"] / "eval_reports"
+        report_dir.mkdir(parents=True, exist_ok=True)
+
+        env_steps = summary.get("env_steps")
+        if env_steps is not None:
+            fname = f"{kind}_step_{int(env_steps):09d}.json"
+        else:
+            fname = f"{kind}_standalone_{int(time.time())}.json"
+
+        config_block = {
+            "experiment_name": str(self.cfg["train"].get("experiment_name", "")),
+            "blue_rule": str(self.env_cfg.get("blue_rule", "fix_rule_v2")),
+            "num_episodes": len(episodes),
+            "deterministic": summary.get("deterministic", None),
+            "checkpoint_path": str(checkpoint_path) if checkpoint_path else None,
+        }
+
+        def _safe(obj):
+            if isinstance(obj, (np.integer,)):
+                return int(obj)
+            if isinstance(obj, (np.floating,)):
+                return float(obj)
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            if isinstance(obj, torch.Tensor):
+                return obj.item()
+            if isinstance(obj, Path):
+                return str(obj)
+            return obj
+
+        report = {
+            "kind": kind,
+            "env_steps": int(env_steps) if env_steps is not None else None,
+            "update_idx": int(summary.get("update_idx")) if summary.get("update_idx") is not None else None,
+            "timestamp_unix": time.time(),
+            "config": config_block,
+            "summary": summary,
+            "episodes": episodes,
+        }
+        path = report_dir / fname
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2, default=_safe)
+        print(f"[eval_report] wrote {path}", flush=True)
 
     def evaluate(
         self,
@@ -730,6 +789,8 @@ class SkyArenaMAPPOTrainer:
         save_visual: bool = False,
         render_every: int = 1,
         step_tag: Optional[int] = None,
+        write_report: bool = False,
+        kind: str = "eval",
     ) -> Dict[str, float]:
         """Evaluate current policy."""
         if checkpoint_path is not None:
@@ -788,6 +849,16 @@ class SkyArenaMAPPOTrainer:
         diag_candidate_pairs = 0
         diag_missiles_remaining = 0
         diag_missile_record_count = 0
+        diag_missiles_long = 0
+        diag_missiles_short = 0
+        diag_missiles_hit = 0
+        diag_missiles_missed = 0
+        diag_sel_exch = 0.0
+        diag_blue_attempted = 0
+        diag_blue_selected = 0
+        diag_blue_invalid = 0
+        diag_blue_fireable = 0
+        episode_records: list = []
 
         for ep in range(num_episodes):
             if eval_prefix == "gui_eval":
@@ -944,6 +1015,34 @@ class SkyArenaMAPPOTrainer:
             ep_red_missiles = int(np.sum(eval_env.engine.state.red.long_ammo[:eval_env.red_fighter_num])
                                   + np.sum(eval_env.engine.state.red.short_ammo[:eval_env.red_fighter_num]))
 
+            episode_records.append({
+                "episode": ep,
+                "winner": winner,
+                "reason": str(info.get("reason", "")),
+                "steps": ep_steps,
+                "return": float(ep_return),
+                "red_kills": float(metrics.get("red_kills", 0)),
+                "blue_kills": float(metrics.get("blue_kills", 0)),
+                "target_nonzero_rate": float(ep_target_rate),
+                "fire_nonzero_rate": float(ep_fire_rate),
+                "red_fireable_edges_mean": float(ep_fireable_mean),
+                "red_attempted_edges": float(ep_attempted_mean),
+                "red_selected_edges": float(ep_selected_mean),
+                "red_invalid_fire_count": int(ep_invalid_fire),
+                "selected_expected_exchange": float(metrics.get("selected_expected_exchange", 0.0)),
+                "red_missiles_remaining": int(ep_red_missiles),
+            })
+
+            diag_missiles_long += int(metrics.get("missiles_launched_long", 0))
+            diag_missiles_short += int(metrics.get("missiles_launched_short", 0))
+            diag_missiles_hit += int(metrics.get("missiles_hit", 0))
+            diag_missiles_missed += int(metrics.get("missiles_missed", 0))
+            diag_sel_exch += float(metrics.get("selected_expected_exchange", 0.0))
+            diag_blue_attempted += int(metrics.get("blue_attempted_edges", 0))
+            diag_blue_selected += int(metrics.get("blue_selected_edges", 0))
+            diag_blue_invalid += int(metrics.get("blue_invalid_fire_count", 0))
+            diag_blue_fireable += int(metrics.get("blue_fireable_edges", 0))
+
             diag_target_nonzero_steps += ep_target_nonzero_steps
             diag_fire_nonzero_steps += ep_fire_nonzero_steps
             diag_total_steps_diag += ep_steps
@@ -992,6 +1091,47 @@ class SkyArenaMAPPOTrainer:
         red_long_available_rate = diag_long_available / diag_candidate_denom
         red_short_available_rate = diag_short_available / diag_candidate_denom
         red_missiles_remaining = diag_missiles_remaining / diag_missile_denom
+        blue_missiles_remaining = None  # not tracked per-episode
+
+        # --- Write eval report ---
+        if write_report:
+            n_eps = max(num_episodes, 1)
+            report_summary = {
+                "env_steps": step_value,
+                "update_idx": int(self.update_idx),
+                "deterministic": deterministic,
+                "win_rate": win_rate,
+                "avg_return": avg_return,
+                "episode_len": avg_steps,
+                "red_wins": float(red_wins),
+                "blue_wins": float(blue_wins),
+                "draws": float(draws),
+                "red_kills": avg_red_kills,
+                "blue_kills": avg_blue_kills,
+                "target_nonzero_rate": red_target_nonzero_rate,
+                "fire_nonzero_rate": red_fire_nonzero_rate,
+                "red_fireable_edges": red_fireable_edges,
+                "blue_fireable_edges": diag_blue_fireable / n_eps,
+                "red_attempted_edges": red_attempted_edges,
+                "blue_attempted_edges": diag_blue_attempted / n_eps,
+                "red_selected_edges": red_selected_edges,
+                "blue_selected_edges": diag_blue_selected / n_eps,
+                "red_invalid_fire_count": red_invalid_fire_count,
+                "blue_invalid_fire_count": diag_blue_invalid / n_eps if diag_blue_invalid > 0 else 0,
+                "selected_expected_exchange": diag_sel_exch / n_eps,
+                "missiles_launched_long": diag_missiles_long / n_eps,
+                "missiles_launched_short": diag_missiles_short / n_eps,
+                "missiles_hit": diag_missiles_hit / n_eps,
+                "missiles_missed": diag_missiles_missed / n_eps,
+                "red_missiles_remaining": red_missiles_remaining,
+                "blue_missiles_remaining": blue_missiles_remaining,
+            }
+            self._write_eval_report(
+                kind=kind,
+                summary=report_summary,
+                episodes=episode_records,
+                checkpoint_path=checkpoint_path,
+            )
 
         print(
             f"[{eval_prefix}] done step={step_value} win_rate={win_rate:.3f} "
