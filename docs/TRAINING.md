@@ -10,8 +10,10 @@
 
 训练和评估时优先看这些指标：
 
-- `win_rate`
-- `avg_steps`
+- `eval/win_rate`
+- `gui_eval/win_rate`
+- `rollout/win_rate_finished_episodes`
+- `eval/avg_steps`
 - `red_fireable_edges` / `blue_fireable_edges`
 - `expected_exchange_proxy`
 - `selected_expected_exchange`
@@ -49,9 +51,29 @@ GUI eval 的 episode 数可以较多，例如正式训练中保留 `gui_eval_epi
 - 仍会记录 TensorBoard 指标，例如 `win_rate`、`episode_len`、`red_kills`、`blue_kills`。
 - 默认 `gui_eval_save_video: false` 且 `gui_eval_save_frames: false`。
 - 不保存每一步 `frame_XXXXX.npz`，也不生成 mp4/gif。
-- 训练默认不弹出 human GUI，只有显式传入 `--gui_eval_human` 才会打开窗口。
+- 正式训练配置 `configs/mappo_skyarena_train.yaml` 默认使用 `human` GUI eval，跑到 `gui_eval_interval` 时会弹出 live 窗口，便于人工观察训练成果。
+- smoke 和通用配置默认使用 `rgb_array`，不会弹出窗口；启动日志会打印 `mode=rgb_array, no window will be opened`。
+- 如果某个配置是 `rgb_array`，也可以显式传入 `--gui_eval_human` 临时打开 live GUI。
+- `rgb_array` GUI eval 默认每 `gui_eval_render_every: 20` step 渲染一次，用于降低评估阶段的额外开销；`human` GUI eval 会逐步刷新窗口。
+- GUI eval 可能较慢，训练器会按 episode 打印开始/结束进度，避免看起来像静默卡住。
 
 如果确实需要视觉回放，再手动开启帧保存；开启前应确认磁盘空间足够。
+
+对 smoke 或通用配置临时打开 live GUI：
+
+```bash
+python scripts/train_mappo.py --config configs/mappo_skyarena_smoke.yaml --device cpu --gui_eval_human
+```
+
+## Win Rate 口径
+
+`rollout/win_rate_finished_episodes` 和 `eval/win_rate` 不是同一口径：
+
+- `rollout/win_rate_finished_episodes` 只统计训练 rollout 窗口内自然结束的 episode。很多 rollout 可能没有完整结束局，因此这个指标波动大，甚至长期为 0。
+- `eval/win_rate` 是固定评估流程下的标准红方胜率。达到 `max_steps` 仍未结束的 episode 会按 draw/truncated 处理，不会沿用上一帧 winner。
+- `gui_eval/win_rate` 与 eval 口径一致，但额外经过 renderer 路径，可用于观察策略和 GUI 是否正常。
+
+判断策略效果时优先看 `eval/win_rate`、`eval/avg_return`、`gui_eval/win_rate` 和 GUI 行为，不要把 rollout 胜率直接等同于标准评估胜率。
 
 ## 排查训练问题的推荐顺序
 

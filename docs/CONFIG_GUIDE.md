@@ -47,6 +47,8 @@
 - `rollout_steps` 更稳定。
 - `save_interval` 和 `eval_interval` 不应过短，至少应接近一个 episode 的尺度。
 - `gui_eval_episodes` 可以较多；正式训练当前保留 `gui_eval_episodes: 15`。
+- `configs/mappo_skyarena_train.yaml` 默认 `gui_eval_render_mode: human` 且 `gui_eval_human: true`，自动 GUI eval 会弹出 live 窗口用于人工观察。
+- smoke 和通用配置默认使用 `rgb_array`，适合无窗口 smoke 或远程环境；需要 live GUI 时可加 `--gui_eval_human`。
 - 默认 `gui_eval_save_video: false` 和 `gui_eval_save_frames: false`，GUI eval 只记录指标，不保存逐帧文件。
 - 不建议频繁改变 reward、环境语义和模型结构。
 

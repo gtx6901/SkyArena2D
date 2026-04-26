@@ -74,7 +74,7 @@ class SkyArenaMAPPOTrainer:
                 self.eval_cfg.get("gui_eval_save_video", False),
             )
         )
-        self.gui_eval_render_every = max(1, int(self.eval_cfg.get("gui_eval_render_every", 1)))
+        self.gui_eval_render_every = max(1, int(self.eval_cfg.get("gui_eval_render_every", 20)))
         self.gui_eval_dir = str(self.eval_cfg.get("gui_eval_dir", "gui_eval"))
         self.gui_eval_deterministic = bool(self.eval_cfg.get("gui_eval_deterministic", True))
         self.gui_eval_human = bool(self.eval_cfg.get("gui_eval_human", False))
@@ -176,6 +176,8 @@ class SkyArenaMAPPOTrainer:
         # Initialize obs and hidden states
         self.current_obs = [env.reset() for env in self.envs]
         self.search_goal_manager.reset_all()
+        self._episode_returns = np.zeros((self.num_envs,), dtype=np.float32)
+        self._episode_lengths = np.zeros((self.num_envs,), dtype=np.int32)
         hidden_dim = self.actor.lstm_hidden_dim
         self.actor_h = torch.zeros((self.num_envs, self.num_agents, hidden_dim), dtype=torch.float32, device=self.device)
         self.actor_c = torch.zeros((self.num_envs, self.num_agents, hidden_dim), dtype=torch.float32, device=self.device)
@@ -188,6 +190,42 @@ class SkyArenaMAPPOTrainer:
             if self.gui_eval_enabled and self.gui_eval_interval > 0
             else None
         )
+        if self.next_gui_eval_step is not None:
+            render_mode = "human" if self.gui_eval_human else self.gui_eval_render_mode
+            if render_mode == "rgb_array":
+                print("[gui_eval] mode=rgb_array, no window will be opened", flush=True)
+                print("[gui_eval] use --gui_eval_human to open a live window", flush=True)
+            elif render_mode == "human":
+                print("[gui_eval] mode=human, a live window will be opened during GUI eval", flush=True)
+
+    def _summarize_rollout_episodes(self, episode_stats: List[Dict[str, Any]]) -> Dict[str, float]:
+        """Summarize naturally finished episodes seen inside the latest rollout."""
+        episodes_finished = len(episode_stats)
+        red_wins = sum(1 for s in episode_stats if s.get("winner") == "red")
+        blue_wins = sum(1 for s in episode_stats if s.get("winner") == "blue")
+        draws = sum(1 for s in episode_stats if s.get("winner") not in ("red", "blue"))
+        finished_envs = {int(s.get("env_idx", -1)) for s in episode_stats if int(s.get("env_idx", -1)) >= 0}
+        ongoing_or_truncated = max(self.num_envs - len(finished_envs), 0)
+        avg_len = (
+            float(np.mean([float(s.get("episode_len", s.get("steps", 0))) for s in episode_stats]))
+            if episode_stats
+            else 0.0
+        )
+        avg_return = (
+            float(np.mean([float(s.get("episode_return", 0.0)) for s in episode_stats]))
+            if episode_stats
+            else 0.0
+        )
+        return {
+            "win_rate_finished_episodes": red_wins / max(episodes_finished, 1),
+            "episodes_finished": float(episodes_finished),
+            "red_wins_finished": float(red_wins),
+            "blue_wins_finished": float(blue_wins),
+            "draws_finished": float(draws),
+            "ongoing_or_truncated": float(ongoing_or_truncated),
+            "avg_episode_len_finished": avg_len,
+            "avg_return_finished": avg_return,
+        }
 
     def _collect_rollout(self) -> RolloutBatch:
         """Collect rollout_steps of experience from all envs."""
@@ -265,12 +303,20 @@ class SkyArenaMAPPOTrainer:
                 next_obs, reward, done, info = env.step(sky_action)
                 rollout_reward[step, env_idx] = reward
                 rollout_done[step, env_idx] = float(done)
+                self._episode_returns[env_idx] += float(reward)
+                self._episode_lengths[env_idx] += 1
 
                 if done:
                     episode_stats.append({
+                        "env_idx": env_idx,
                         "winner": info.get("winner", "unknown"),
+                        "reason": info.get("reason", ""),
                         "steps": env.engine.state.step_count,
+                        "episode_len": int(self._episode_lengths[env_idx]),
+                        "episode_return": float(self._episode_returns[env_idx]),
                     })
+                    self._episode_returns[env_idx] = 0.0
+                    self._episode_lengths[env_idx] = 0
                     next_obs = env.reset()
                     self.search_goal_manager.reset_envs([env_idx])
                     self.action_adapter.reset_ew_state(env_idx)
@@ -458,17 +504,20 @@ class SkyArenaMAPPOTrainer:
         while self.env_steps < self.total_env_steps:
             batch = self._collect_rollout()
             metrics = self._ppo_update(batch)
-
-            if batch.episode_stats:
-                wins = sum(1 for s in batch.episode_stats if s.get("winner") == "red")
-                metrics["win_rate"] = wins / len(batch.episode_stats)
-                metrics["episodes"] = len(batch.episode_stats)
+            rollout_metrics = self._summarize_rollout_episodes(batch.episode_stats)
 
             log_scalars(self.writer, "train", metrics, self.env_steps)
+            log_scalars(self.writer, "rollout", rollout_metrics, self.env_steps)
             print(
                 f"[train] steps={self.env_steps} loss={metrics['loss']:.4f} "
                 f"pg={metrics['pg_loss']:.4f} vf={metrics['vf_loss']:.4f} "
                 f"ent={metrics['entropy']:.4f}",
+                flush=True,
+            )
+            print(
+                f"[rollout] finished={int(rollout_metrics['episodes_finished'])} "
+                f"red_win_rate={rollout_metrics['win_rate_finished_episodes']:.3f} "
+                f"avg_len={rollout_metrics['avg_episode_len_finished']:.1f}",
                 flush=True,
             )
 
@@ -548,7 +597,10 @@ class SkyArenaMAPPOTrainer:
             eval_env.engine.render_mode = render_mode
 
         hidden_dim = self.actor.lstm_hidden_dim
-        wins = 0
+        red_wins = 0
+        blue_wins = 0
+        draws = 0
+        truncated_count = 0
         total_steps = 0
         total_return = 0.0
         total_red_kills = 0.0
@@ -560,8 +612,21 @@ class SkyArenaMAPPOTrainer:
         eval_prefix = "gui_eval" if render_mode is not None else "eval"
         step_value = int(self.env_steps if step_tag is None else step_tag)
         render_every = max(1, int(render_every))
+        mode_text = render_mode if render_mode is not None else "policy"
+        if eval_prefix == "gui_eval":
+            print(
+                f"[gui_eval] start step={step_value} episodes={num_episodes} mode={mode_text}",
+                flush=True,
+            )
+            if render_mode == "rgb_array":
+                print("[gui_eval] mode=rgb_array, no window will be opened", flush=True)
+                print("[gui_eval] use --gui_eval_human to open a live window", flush=True)
+        else:
+            print(f"[eval] start step={step_value}", flush=True)
 
         for ep in range(num_episodes):
+            if eval_prefix == "gui_eval":
+                print(f"[gui_eval] episode {ep + 1}/{num_episodes} start", flush=True)
             obs = eval_env.reset()
             self.action_adapter.reset_ew_state("eval")
             h = torch.zeros((1, self.num_agents, hidden_dim), dtype=torch.float32, device=self.device)
@@ -570,6 +635,7 @@ class SkyArenaMAPPOTrainer:
             ep_steps = 0
             ep_return = 0.0
             info: Dict[str, Any] = {}
+            episode_truncated = False
 
             frame_dir: Optional[Path] = None
             if save_visual and render_mode == "rgb_array" and output_dir is not None:
@@ -604,37 +670,65 @@ class SkyArenaMAPPOTrainer:
                 c = sampled["next_c"].to(self.device)
                 ep_steps += 1
 
-                if render_mode is not None and (ep_steps % render_every == 0):
+                should_render = False
+                if render_mode == "human":
+                    should_render = True
+                elif render_mode is not None:
+                    should_render = ep_steps == 1 or (ep_steps % render_every == 0)
+                if should_render:
                     frame = eval_env.engine.render(render_mode)
                     if frame is not None and save_visual:
                         if frame_dir is not None:
                             np.savez_compressed(frame_dir / f"frame_{ep_steps:05d}.npz", frame=frame)
 
             if not done and max_steps is not None:
-                done = True
+                episode_truncated = True
 
-            if info.get("winner") == "red":
-                wins += 1
+            if render_mode is not None and render_mode != "human":
+                frame = eval_env.engine.render(render_mode)
+                if frame is not None and save_visual and frame_dir is not None:
+                    np.savez_compressed(frame_dir / f"frame_{ep_steps:05d}_final.npz", frame=frame)
+
+            winner = "draw" if episode_truncated else str(info.get("winner", "draw"))
+            if winner == "red":
+                red_wins += 1
+            elif winner == "blue":
+                blue_wins += 1
+            else:
+                draws += 1
+            if episode_truncated:
+                truncated_count += 1
             total_steps += ep_steps
             total_return += ep_return
             metrics = info.get("metrics", {})
             total_red_kills += float(metrics.get("red_kills", 0.0))
             total_blue_kills += float(metrics.get("blue_kills", 0.0))
+            if eval_prefix == "gui_eval":
+                status = "truncated" if episode_truncated else winner
+                print(
+                    f"[gui_eval] episode {ep + 1}/{num_episodes} done "
+                    f"steps={ep_steps} winner={status}",
+                    flush=True,
+                )
 
         eval_env.engine.close()
 
-        win_rate = wins / max(num_episodes, 1)
+        win_rate = red_wins / max(num_episodes, 1)
         avg_steps = total_steps / max(num_episodes, 1)
         avg_return = total_return / max(num_episodes, 1)
         avg_red_kills = total_red_kills / max(num_episodes, 1)
         avg_blue_kills = total_blue_kills / max(num_episodes, 1)
         print(
-            f"[{eval_prefix}] episodes={num_episodes} win_rate={win_rate:.3f} "
+            f"[{eval_prefix}] done step={step_value} win_rate={win_rate:.3f} "
             f"avg_steps={avg_steps:.1f} avg_return={avg_return:.3f}",
             flush=True,
         )
         return {
             "win_rate": win_rate,
+            "red_wins": float(red_wins),
+            "blue_wins": float(blue_wins),
+            "draws": float(draws),
+            "truncated": float(truncated_count),
             "avg_steps": avg_steps,
             "avg_return": avg_return,
             "episode_len": avg_steps,
