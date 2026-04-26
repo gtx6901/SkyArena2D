@@ -81,6 +81,65 @@ Scoreboard 第二行新增 `attempt`、`selected`、`invalid` 计数（R/B），
 
 这些文件应放在 `train_dir/`、`logs/` 或本地临时目录中。
 
+## MAPPO 课程训练
+
+主课程顺序固定为：
+
+| Stage | 配置 | 蓝方规则 | 建议步数 |
+|---|---|---|---:|
+| 0 | `configs/mappo_skyarena_stage0_no_attack.yaml` | `no_attack_rule` | 300000 |
+| 1 | `configs/mappo_skyarena_stage1_patrol.yaml` | `patrol_rule` | 500000 |
+| 2 | `configs/mappo_skyarena_stage2_rush.yaml` | `rush_rule` | 800000 |
+| 3 | `configs/mappo_skyarena_stage3_fix_like.yaml` | `fix_rule_like` | 1200000 |
+| 4 | `configs/mappo_skyarena_stage4_fix_v2.yaml` | `fix_rule_v2` | 2000000 |
+
+对手行为简述：
+
+- `no_attack_rule`：保持航向，不主动攻击，适合验证基础机动和非战斗行为。
+- `patrol_rule`：周期巡逻，有可见目标时尝试攻击，适合作为低压搜索/接敌阶段。
+- `rush_rule`：直接推进并按距离选择长/短弹，适合强化接敌和火控启动。
+- `fix_rule_like`：先推进再搜索，有目标时攻击，接近旧规则但更简单。
+- `fix_rule_v2`：当前正式规则对手，包含首次接触、独立搜索、冷却和干扰策略。
+
+`random_rule` 不属于主课程，只用于 robustness/interface stress test，例如检查动作接口、mask 和异常输入路径。
+
+单阶段训练示例：
+
+```bash
+python scripts/train_mappo.py --config configs/mappo_skyarena_stage0_no_attack.yaml --device cuda
+```
+
+完整课程一行运行：
+
+```bash
+python scripts/train_mappo_curriculum.py --device cuda
+```
+
+dry run 检查命令和 checkpoint 接力路径：
+
+```bash
+python scripts/train_mappo_curriculum.py --device cuda --dry_run
+```
+
+课程 runner 会在每个真实 stage 完成后，用该 stage 配置和 `latest_checkpoint()` 查找最新 checkpoint，并作为下一 stage 的 `--init_checkpoint`。Stage 0 不使用 warm-start checkpoint。
+
+`resume` 和 `init_checkpoint` 的语义不同：
+
+- `resume: true`：从当前 experiment 的 latest checkpoint 继续训练，并恢复 `env_steps` / `update_idx`。
+- `init_checkpoint`：只在 `resume: false` 时作为 warm-start 载入网络和 optimizer，`env_steps` / `update_idx` 从 0 开始。
+- 如果 `resume: true` 且传入 `init_checkpoint`，训练器会打印 warning 并忽略 `init_checkpoint`。
+
+Stage 迁移时优先观察这些指标是否稳定后再进入下一阶段：
+
+- `rollout_step/target_nonzero_rate`
+- `rollout_step/fire_nonzero_rate`
+- `metrics_step/red_fireable_edges`
+- `metrics_step/red_attempted_edges`
+- `metrics_step/red_selected_edges`
+- `metrics_step/red_invalid_fire_count`
+- `metrics_step/selected_expected_exchange`
+- `eval/win_rate`
+
 ## GUI Eval 策略
 
 GUI eval 的 episode 数可以较多，例如正式训练中保留 `gui_eval_episodes: 15`。这用于获得更稳定的评估指标，不应为了省磁盘而减少评估次数。
@@ -154,6 +213,12 @@ MAPPO 正式训练：
 
 ```bash
 python scripts/train_mappo.py --config configs/mappo_skyarena_train.yaml --device cuda
+```
+
+MAPPO 课程训练：
+
+```bash
+python scripts/train_mappo_curriculum.py --device cuda
 ```
 
 禁用 GUI eval 的训练 smoke：

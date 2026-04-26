@@ -61,7 +61,61 @@
 - smoke：`configs/mappo_skyarena_smoke.yaml`
 - train：`configs/mappo_skyarena_train.yaml`
 
-## 5. 参数维护建议
+## 5. 课程训练配置
+
+课程训练配置从 `configs/mappo_skyarena_train.yaml` 派生，主课程不包含 `random_rule`：
+
+| Stage | 配置 | `train.experiment_name` | `env.blue_rule` | `train.total_env_steps` |
+|---|---|---|---|---:|
+| 0 | `configs/mappo_skyarena_stage0_no_attack.yaml` | `stage0_no_attack` | `no_attack_rule` | 300000 |
+| 1 | `configs/mappo_skyarena_stage1_patrol.yaml` | `stage1_patrol` | `patrol_rule` | 500000 |
+| 2 | `configs/mappo_skyarena_stage2_rush.yaml` | `stage2_rush` | `rush_rule` | 800000 |
+| 3 | `configs/mappo_skyarena_stage3_fix_like.yaml` | `stage3_fix_like` | `fix_rule_like` | 1200000 |
+| 4 | `configs/mappo_skyarena_stage4_fix_v2.yaml` | `stage4_fix_v2` | `fix_rule_v2` | 2000000 |
+
+各 stage 配置都包含：
+
+- `train.resume: false`
+- `train.init_checkpoint: ""`
+
+这样课程 runner 才能通过 `--init_checkpoint` 显式接力上一阶段 checkpoint，并让新阶段的 `env_steps` / `update_idx` 从 0 开始。`resume: true` 用于同一 experiment 的断点续训；如果同时传入 `init_checkpoint`，训练器会忽略 warm-start checkpoint 并打印 warning。
+
+`random_rule` 只作为 robustness/interface stress test 使用，例如验证动作空间、mask、obs adapter 和训练入口能否承受随机动作，不作为主课程 stage。
+
+单阶段运行：
+
+```bash
+python scripts/train_mappo.py --config configs/mappo_skyarena_stage1_patrol.yaml --device cuda
+```
+
+完整课程运行：
+
+```bash
+python scripts/train_mappo_curriculum.py --device cuda
+```
+
+检查计划但不训练：
+
+```bash
+python scripts/train_mappo_curriculum.py --device cuda --dry_run
+```
+
+可用 `--start_stage` / `--end_stage` 选择范围，值可以是 `0`-`4` 或 stage 名；可用 `--total_env_steps_override` 临时覆盖每个 stage 的训练步数。
+
+课程迁移时建议看以下指标，避免只按 rollout 胜率判断是否进入下一 stage：
+
+- `rollout_step/target_nonzero_rate`
+- `rollout_step/fire_nonzero_rate`
+- `metrics_step/red_fireable_edges`
+- `metrics_step/red_attempted_edges`
+- `metrics_step/red_selected_edges`
+- `metrics_step/red_invalid_fire_count`
+- `metrics_step/selected_expected_exchange`
+- `eval/win_rate`
+
+对手行为简述：`no_attack_rule` 不主动攻击；`patrol_rule` 周期巡逻并在可见时攻击；`rush_rule` 持续推进并按距离开火；`fix_rule_like` 是较简单的推进/搜索/攻击规则；`fix_rule_v2` 是当前正式规则对手。
+
+## 6. 参数维护建议
 
 - 初期不要频繁改 reward term。
 - 先让 rule-vs-rule 的指标合理，再开始调 MAPPO。
@@ -70,9 +124,10 @@
 - 对训练结果做对比时，固定 config、seed、checkpoint 和评估 episode 数。
 - 只有需要视觉回放时才开启 GUI eval 帧保存，避免 `frame_XXXXX.npz` 大量占用磁盘。
 
-## 6. 配置之间的关系
+## 7. 配置之间的关系
 
 - `env_10v10_full.yaml`：环境主语义。
 - `mappo_skyarena_smoke.yaml`：训练管线 smoke baseline。
 - `mappo_skyarena_train.yaml`：正式训练 baseline。
+- `mappo_skyarena_stage*.yaml`：MAPPO 课程训练 stages。
 - `mappo_skyarena.yaml`：通用默认配置，适合脚本默认值和快速入口。

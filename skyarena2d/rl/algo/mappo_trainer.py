@@ -172,14 +172,27 @@ class SkyArenaMAPPOTrainer:
         self.env_steps = 0
         self.update_idx = 0
 
+        init_checkpoint = str(self.train_cfg.get("init_checkpoint", "")).strip()
+
         # Resume from checkpoint if requested
         if bool(self.train_cfg.get("resume", False)):
+            if init_checkpoint:
+                print(
+                    f"[init_checkpoint] warning: resume=true, ignoring init_checkpoint {init_checkpoint}",
+                    flush=True,
+                )
             ckpt_path = latest_checkpoint(run_train_cfg)
             if ckpt_path is not None:
                 ckpt = load_checkpoint(ckpt_path, self.actor, self.critic, self.optimizer, map_location=self.device)
                 self.env_steps = int(ckpt.get("env_steps", 0))
                 self.update_idx = int(ckpt.get("update_idx", 0))
                 print(f"[resume] loaded checkpoint {ckpt_path} env_steps={self.env_steps}", flush=True)
+        elif init_checkpoint:
+            load_checkpoint(init_checkpoint, self.actor, self.critic, self.optimizer, map_location=self.device)
+            print(
+                f"[init_checkpoint] loaded warm-start checkpoint {init_checkpoint}; env_steps reset to 0",
+                flush=True,
+            )
 
         # Initialize obs and hidden states
         self.current_obs = [env.reset() for env in self.envs]
@@ -718,6 +731,24 @@ class SkyArenaMAPPOTrainer:
                 if output_dir is not None:
                     print(f"[gui_eval] frame_artifacts={output_dir}", flush=True)
                 self.next_gui_eval_step += self.gui_eval_interval
+
+        latest_path = latest_checkpoint(self.train_cfg)
+        latest_steps = -1
+        if latest_path is not None:
+            try:
+                latest_steps = int(latest_path.stem.removeprefix("step_"))
+            except ValueError:
+                latest_steps = -1
+        if latest_steps < self.env_steps:
+            path = save_checkpoint(
+                train_cfg=self.train_cfg,
+                actor=self.actor,
+                critic=self.critic,
+                optimizer=self.optimizer,
+                env_steps=self.env_steps,
+                update_idx=self.update_idx,
+            )
+            print(f"[checkpoint] saved final {path}", flush=True)
 
         print(f"[train] Done. env_steps={self.env_steps}", flush=True)
 

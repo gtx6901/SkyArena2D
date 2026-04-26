@@ -21,6 +21,7 @@ def main():
     parser.add_argument("--gui_eval_interval", type=int, default=None)
     parser.add_argument("--disable_gui_eval", action="store_true")
     parser.add_argument("--gui_eval_human", action="store_true")
+    parser.add_argument("--init_checkpoint", default="")
     args = parser.parse_args()
 
     cfg = load_mappo_config(args.config)
@@ -40,6 +41,8 @@ def main():
     if args.gui_eval_human:
         cfg.setdefault("evaluation", {})["gui_eval_human"] = True
         cfg.setdefault("evaluation", {})["gui_eval_render_mode"] = "human"
+    if args.init_checkpoint:
+        cfg["train"]["init_checkpoint"] = args.init_checkpoint
 
     trainer = SkyArenaMAPPOTrainer(cfg)
     trainer.train()

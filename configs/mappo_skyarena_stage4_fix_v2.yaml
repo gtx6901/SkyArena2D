@@ -1,11 +1,11 @@
 train:
-  experiment_name: train_v1.4
+  experiment_name: stage4_fix_v2
   train_dir: train_dir/skyarena_mappo_train
   seed: 42
   device: cuda
   num_envs: 2
   rollout_steps: 256
-  total_env_steps: 5000000
+  total_env_steps: 2000000
   learning_rate: 0.0002
   gamma: 0.99
   gae_lambda: 0.95
@@ -16,7 +16,8 @@ train:
   max_grad_norm: 0.5
   save_interval: 100000
   eval_interval: 50000
-  resume: true
+  resume: false
+  init_checkpoint: ""
 
 env:
   config_path: configs/env_10v10_full.yaml
