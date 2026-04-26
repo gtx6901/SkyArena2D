@@ -441,6 +441,7 @@ class SkyArenaMAPPOTrainer:
             target_mask = torch.as_tensor(batch.observations["target_mask"].reshape(T, E, N, -1), dtype=torch.bool, device=self.device)
             alive_mask = torch.as_tensor(batch.observations["alive_mask"].reshape(T, E, N), dtype=torch.float32, device=self.device) > 0.5
             has_contact = torch.as_tensor(batch.observations["has_active_contact"].reshape(T, E, N), dtype=torch.float32, device=self.device) > 0.5
+            entity_mask_t = torch.as_tensor(batch.observations["entity_mask"].reshape(T, E, N, -1), dtype=torch.bool, device=self.device)
             candidate_can_long = torch.as_tensor(batch.observations["candidate_can_long"].reshape(T, E, N, -1), dtype=torch.bool, device=self.device)
             candidate_can_short = torch.as_tensor(batch.observations["candidate_can_short"].reshape(T, E, N, -1), dtype=torch.bool, device=self.device)
 
@@ -471,7 +472,7 @@ class SkyArenaMAPPOTrainer:
             fire_dist = masked_categorical(fire_logits_sel.reshape(T * E * N, 3), fire_mask_t.reshape(T * E * N, 3))
             fire_lp = fire_dist.log_prob(fire_act.reshape(T * E * N)).reshape(T, E, N)
 
-            has_target_opportunity = alive_mask & has_contact & torch.any(entity_mask, dim=-1)
+            has_target_opportunity = alive_mask & has_contact & torch.any(entity_mask_t, dim=-1)
             movement_log_prob = torch.where(
                 has_contact,
                 course_lp,
