@@ -1,5 +1,5 @@
 train:
-  experiment_name: train_v1.3
+  experiment_name: train_v1.1
   train_dir: train_dir/skyarena_mappo_train
   seed: 42
   device: cuda
@@ -14,9 +14,9 @@ train:
   value_coef: 0.5
   ppo_epochs: 3
   max_grad_norm: 0.5
-  save_interval: 50000
+  save_interval: 100000
   eval_interval: 50000
-  resume: true
+  resume: false
 
 env:
   config_path: configs/env_10v10_full.yaml
