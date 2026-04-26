@@ -31,6 +31,7 @@ from .rollout import (
     RolloutBatch,
     allocate_batched_obs,
     allocate_rollout_obs,
+    build_fire_mask_from_selected_targets,
     compute_gae,
     fill_batched_obs,
     masked_categorical,
@@ -438,6 +439,10 @@ class SkyArenaMAPPOTrainer:
             course_mask = torch.as_tensor(batch.observations["course_mask"].reshape(T, E, N, -1), dtype=torch.bool, device=self.device)
             sg_mask = torch.as_tensor(batch.observations["search_goal_mask"].reshape(T, E, N, -1), dtype=torch.bool, device=self.device)
             target_mask = torch.as_tensor(batch.observations["target_mask"].reshape(T, E, N, -1), dtype=torch.bool, device=self.device)
+            alive_mask = torch.as_tensor(batch.observations["alive_mask"].reshape(T, E, N), dtype=torch.float32, device=self.device) > 0.5
+            has_contact = torch.as_tensor(batch.observations["has_active_contact"].reshape(T, E, N), dtype=torch.float32, device=self.device) > 0.5
+            candidate_can_long = torch.as_tensor(batch.observations["candidate_can_long"].reshape(T, E, N, -1), dtype=torch.bool, device=self.device)
+            candidate_can_short = torch.as_tensor(batch.observations["candidate_can_short"].reshape(T, E, N, -1), dtype=torch.bool, device=self.device)
 
             course_act = torch.as_tensor(batch.course_action.reshape(T, E, N), dtype=torch.long, device=self.device)
             sg_act = torch.as_tensor(batch.search_goal_action.reshape(T, E, N), dtype=torch.long, device=self.device)
@@ -450,20 +455,34 @@ class SkyArenaMAPPOTrainer:
 
             course_lp = course_dist.log_prob(course_act.reshape(T * E * N)).reshape(T, E, N)
             sg_lp = sg_dist.log_prob(sg_act.reshape(T * E * N)).reshape(T, E, N)
+            target_lp = target_dist.log_prob(target_act.reshape(T * E * N)).reshape(T, E, N)
 
             # Fire log prob: select fire logits for chosen target
             target_act_clamped = torch.clamp(target_act, min=0, max=fire_logits_all.shape[3] - 1)
             fire_logits_sel = fire_logits_all.gather(
                 3, target_act_clamped.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, -1, 3)
             ).squeeze(3)
-            fire_mask_t = torch.ones((T, E, N, 3), dtype=torch.bool, device=self.device)
-            fire_mask_t[..., 0] = True
+            fire_mask_t = build_fire_mask_from_selected_targets(
+                target_action=target_act.reshape(T * E * N),
+                alive_mask=alive_mask.reshape(T * E * N),
+                candidate_can_long=candidate_can_long.reshape(T * E * N, -1),
+                candidate_can_short=candidate_can_short.reshape(T * E * N, -1),
+            ).reshape(T, E, N, 3)
             fire_dist = masked_categorical(fire_logits_sel.reshape(T * E * N, 3), fire_mask_t.reshape(T * E * N, 3))
             fire_lp = fire_dist.log_prob(fire_act.reshape(T * E * N)).reshape(T, E, N)
 
-            has_contact = torch.as_tensor(batch.observations["has_active_contact"].reshape(T, E, N), dtype=torch.float32, device=self.device) > 0.5
-            has_target = target_act > 0
-            new_log_prob = torch.where(has_contact, course_lp, sg_lp) + torch.where(has_target, fire_lp, torch.zeros_like(fire_lp))
+            has_target_opportunity = alive_mask & has_contact & torch.any(entity_mask, dim=-1)
+            movement_log_prob = torch.where(
+                has_contact,
+                course_lp,
+                torch.where(alive_mask & (~has_contact), sg_lp, torch.zeros_like(course_lp)),
+            )
+            attack_log_prob = target_lp + fire_lp
+            new_log_prob = movement_log_prob + torch.where(
+                has_target_opportunity,
+                attack_log_prob,
+                torch.zeros_like(attack_log_prob),
+            )
 
             old_log_prob = torch.as_tensor(batch.log_prob.reshape(T, E, N), dtype=torch.float32, device=self.device)
             adv_t = torch.as_tensor(advantages.reshape(T, E), dtype=torch.float32, device=self.device).unsqueeze(-1).expand(-1, -1, N)
