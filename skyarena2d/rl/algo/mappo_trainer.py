@@ -319,8 +319,8 @@ class SkyArenaMAPPOTrainer:
             "red_attempted_edges", "red_selected_edges", "red_invalid_fire_count",
             "contact_to_fire_gap",
         ]:
-            values = [float(s["final_metrics"][key]) for s in episode_stats
-                      if s.get("final_metrics") and key in s["final_metrics"]]
+            values = [float(v) for s in episode_stats
+                      if s.get("final_metrics") and (v := s["final_metrics"].get(key)) is not None]
             if values:
                 result[key] = float(np.mean(values))
         return result
