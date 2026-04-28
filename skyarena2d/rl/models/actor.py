@@ -38,7 +38,7 @@ class SkyArenaActor(nn.Module):
         self.search_goal_bins = int(search_goal_bins)
         self.candidate_slots = int(candidate_slots)
         self.num_agents = int(num_agents)
-        self.reference_bins = 8
+        self.movement_mode_bins = 9
         self.fire_action_dim = 3
         self.lstm_hidden_dim = int(lstm_hidden_dim)
 
@@ -59,7 +59,7 @@ class SkyArenaActor(nn.Module):
         self.fusion_trunk = mlp(fusion_input_dim, [trunk_dim], lstm_hidden_dim)
         self.lstm = nn.LSTMCell(lstm_hidden_dim, lstm_hidden_dim)
 
-        self.reference_head = nn.Linear(lstm_hidden_dim, self.reference_bins)
+        self.movement_mode_head = nn.Linear(lstm_hidden_dim, self.movement_mode_bins)
         self.course_head = nn.Linear(lstm_hidden_dim, self.course_bins)
         self.null_target_embedding = nn.Parameter(torch.zeros(entity_embed_dim))
         self.target_scorer = nn.Sequential(
@@ -131,7 +131,7 @@ class SkyArenaActor(nn.Module):
         )
 
         h, c = hidden_state
-        reference_logits, course_logits, search_goal_logits, target_logits, fire_logits = [], [], [], [], []
+        movement_mode_logits, course_logits, search_goal_logits, target_logits, fire_logits = [], [], [], [], []
         for step_idx in range(seq_len):
             if episode_starts is not None:
                 start_mask = episode_starts[step_idx].float().unsqueeze(-1)
@@ -139,13 +139,13 @@ class SkyArenaActor(nn.Module):
                 c = c * (1.0 - start_mask)
             h, c = self.lstm(fused[step_idx], (h, c))
             out = self._project_heads(h, slot_embed[step_idx], region_features[step_idx])
-            reference_logits.append(out["reference_logits"])
+            movement_mode_logits.append(out["movement_mode_logits"])
             course_logits.append(out["course_logits"])
             search_goal_logits.append(out["search_goal_logits"])
             target_logits.append(out["target_logits"])
             fire_logits.append(out["fire_logits"])
         return {
-            "reference_logits": torch.stack(reference_logits, dim=0),
+            "movement_mode_logits": torch.stack(movement_mode_logits, dim=0),
             "course_logits": torch.stack(course_logits, dim=0),
             "search_goal_logits": torch.stack(search_goal_logits, dim=0),
             "target_logits": torch.stack(target_logits, dim=0),
@@ -171,7 +171,7 @@ class SkyArenaActor(nn.Module):
         repeated_hidden = hidden.unsqueeze(1).expand(-1, target_slots.shape[1], -1)
         joint = torch.cat([repeated_hidden, target_slots], dim=-1)
         return {
-            "reference_logits": self.reference_head(hidden),
+            "movement_mode_logits": self.movement_mode_head(hidden),
             "course_logits": self.course_head(hidden),
             "search_goal_logits": search_goal_logits,
             "target_logits": self.target_scorer(joint).squeeze(-1),

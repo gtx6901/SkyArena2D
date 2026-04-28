@@ -15,22 +15,22 @@ class SkyArenaActionAdapter:
     """Converts discrete actor outputs to SkyArena-native actions.
 
     Actor outputs:
-    - reference_action: (N,) int — movement reference frame
-    - course_action: (N,) int — index into course_bins (relative offset from current heading)
+    - movement_mode_action: (N,) int — Movement V3 mode
+    - course_action: (N,) int — absolute heading bin or residual offset bin
     - search_goal_action: (N,) int — index into search_goal_grid (region ID)
     - target_action: (N,) int — 0=no target, 1..slots=slot index
     - fire_action: (N,) int — 0=no fire, 1=long, 2=short
 
     Decoding logic:
-    - Decode reference_action to a tactical reference bearing
-    - Use course_action as an offset from that reference bearing
+    - FREE_COURSE decodes course_action as an absolute heading bin
+    - Other modes decode course_action as a residual offset from a reference bearing
     - Fire only if target_action > 0 and candidate_can_long/short allows
     """
 
     def __init__(
         self,
         candidate_slots: int = 6,
-        course_bins: int = 16,
+        course_bins: int = 32,
         search_goal_grid_size: int = 8,
         map_width: float = 3000.0,
         map_height: float = 4000.0,
@@ -99,7 +99,7 @@ class SkyArenaActionAdapter:
         candidate_can_short: np.ndarray,
         has_active_contact: np.ndarray,
         current_heading: np.ndarray,
-        reference_action: np.ndarray | None = None,
+        movement_mode_action: np.ndarray | None = None,
         enemy: TeamState | None = None,
         entity_features: np.ndarray | None = None,
         ew_state_key: object = "default",
@@ -118,7 +118,7 @@ class SkyArenaActionAdapter:
             candidate_can_short: (N, slots) bool
             has_active_contact: (N,) bool — True if any visible enemy
             current_heading: (N,) float32 — current heading degrees
-            reference_action: optional (N,) int — movement reference selector
+            movement_mode_action: optional (N,) int — Movement V3 mode
 
         Returns:
             SkyArenaSideAction with decoded actions.
@@ -132,10 +132,11 @@ class SkyArenaActionAdapter:
         fire_action = np.asarray(fire_action, dtype=np.int32)
         has_active_contact = np.asarray(has_active_contact, dtype=bool)
         current_heading = np.asarray(current_heading, dtype=np.float32)
-        if reference_action is None:
-            reference_action = np.where(has_active_contact, 0, 1).astype(np.int32, copy=False)
+        if movement_mode_action is None:
+            has_entity = np.any(np.asarray(candidate_ids) >= 0, axis=1)
+            movement_mode_action = np.where(has_entity, 2, 1).astype(np.int32, copy=False)
         else:
-            reference_action = np.asarray(reference_action, dtype=np.int32)
+            movement_mode_action = np.asarray(movement_mode_action, dtype=np.int32)
 
         # Initialize output arrays
         course = np.zeros(N, dtype=np.float32)
@@ -149,23 +150,26 @@ class SkyArenaActionAdapter:
                 continue
 
             # --- Course ---
-            reference = self._reference_bearing(
-                agent_idx=i,
-                reference_action=int(reference_action[i]),
-                search_goal_action=int(search_goal_action[i]),
-                target_action=int(target_action[i]),
-                own=own,
-                enemy=enemy,
-                candidate_ids=candidate_ids,
-                candidate_can_long=candidate_can_long,
-                candidate_can_short=candidate_can_short,
-                has_active_contact=has_active_contact,
-                current_heading=current_heading,
-                entity_features=entity_features,
-            )
-            offset_idx = int(course_action[i]) % self.course_bins
-            offset = self._course_offsets[offset_idx]
-            course[i] = (reference + offset) % 360.0
+            mode = int(movement_mode_action[i]) % 9
+            if mode == 0:
+                course[i] = _absolute_heading_from_bin(int(course_action[i]), self.course_bins)
+            else:
+                reference = self._movement_reference_bearing(
+                    agent_idx=i,
+                    movement_mode_action=mode,
+                    search_goal_action=int(search_goal_action[i]),
+                    target_action=int(target_action[i]),
+                    own=own,
+                    enemy=enemy,
+                    candidate_ids=candidate_ids,
+                    candidate_can_long=candidate_can_long,
+                    candidate_can_short=candidate_can_short,
+                    has_active_contact=has_active_contact,
+                    entity_features=entity_features,
+                )
+                offset_idx = int(course_action[i]) % self.course_bins
+                offset = self._course_offsets[offset_idx]
+                course[i] = (reference + offset) % 360.0
 
             # --- Target and Fire ---
             tgt_act = int(target_action[i])
@@ -225,11 +229,11 @@ class SkyArenaActionAdapter:
         if self.ew_strategy is not None:
             self.ew_strategy.reset(ew_state_key)
 
-    def _reference_bearing(
+    def _movement_reference_bearing(
         self,
         *,
         agent_idx: int,
-        reference_action: int,
+        movement_mode_action: int,
         search_goal_action: int,
         target_action: int,
         own: TeamState,
@@ -238,33 +242,40 @@ class SkyArenaActionAdapter:
         candidate_can_long: np.ndarray,
         candidate_can_short: np.ndarray,
         has_active_contact: np.ndarray,
-        current_heading: np.ndarray,
         entity_features: np.ndarray | None,
     ) -> float:
         i = int(agent_idx)
-        ref = int(reference_action) % 8
-        if ref == 0:
-            return float(current_heading[i] % 360.0)
-        if ref == 1:
+        mode = int(movement_mode_action) % 9
+        if mode == 1:
             return self._search_goal_bearing(i, search_goal_action, own)
-        if ref == 2:
+        if mode == 2:
+            bearing = self._nearest_entity_bearing(i, candidate_ids, entity_features)
+            return bearing if bearing is not None else self._search_goal_bearing(i, search_goal_action, own)
+        if mode == 3:
             bearing = self._selected_target_bearing(i, target_action, candidate_ids, entity_features)
+            if bearing is None:
+                bearing = self._nearest_entity_bearing(i, candidate_ids, entity_features)
             return bearing if bearing is not None else self._search_goal_bearing(i, search_goal_action, own)
-        if ref == 3:
+        if mode == 4:
             bearing = self._selected_intercept_bearing(i, target_action, own, enemy, candidate_ids, entity_features)
+            if bearing is None:
+                bearing = self._nearest_entity_bearing(i, candidate_ids, entity_features)
             return bearing if bearing is not None else self._search_goal_bearing(i, search_goal_action, own)
-        if ref == 4:
-            bearing = self._nearest_fireable_bearing(
-                i, candidate_ids, candidate_can_long, candidate_can_short, entity_features
-            )
-            return bearing if bearing is not None else self._search_goal_bearing(i, search_goal_action, own)
-        if ref == 5:
+        if mode in (5, 6):
+            bearing = self._selected_target_bearing(i, target_action, candidate_ids, entity_features)
+            if bearing is None:
+                bearing = self._nearest_entity_bearing(i, candidate_ids, entity_features)
+            if bearing is None:
+                return self._search_goal_bearing(i, search_goal_action, own)
+            delta = -90.0 if mode == 5 else 90.0
+            return float((bearing + delta) % 360.0)
+        if mode == 7:
             bearing = self._ally_contact_support_bearing(i, own, has_active_contact)
             return bearing if bearing is not None else self._search_goal_bearing(i, search_goal_action, own)
-        if ref == 6:
+        if mode == 8:
             bearing = self._separation_bearing(i, own, candidate_ids, entity_features)
-            return bearing if bearing is not None else float(current_heading[i] % 360.0)
-        return self._map_center_bearing(i, own)
+            return bearing if bearing is not None else self._search_goal_bearing(i, search_goal_action, own)
+        return self._search_goal_bearing(i, search_goal_action, own)
 
     def _search_goal_bearing(self, agent_idx: int, search_goal_action: int, own: TeamState) -> float:
         region_idx = int(search_goal_action) % len(self._region_centers)
@@ -284,6 +295,22 @@ class SkyArenaActionAdapter:
             return None
         if int(candidate_ids[agent_idx, slot]) < 0 or entity_features is None:
             return None
+        return float(entity_features[agent_idx, slot, 3] * 360.0) % 360.0
+
+    def _nearest_entity_bearing(
+        self,
+        agent_idx: int,
+        candidate_ids: np.ndarray,
+        entity_features: np.ndarray | None,
+    ) -> float | None:
+        if entity_features is None:
+            return None
+        valid = candidate_ids[agent_idx] >= 0
+        slots = np.nonzero(valid)[0]
+        if slots.size == 0:
+            return None
+        dist = entity_features[agent_idx, slots, 2]
+        slot = int(slots[int(np.argmin(dist))])
         return float(entity_features[agent_idx, slot, 3] * 360.0) % 360.0
 
     def _selected_intercept_bearing(
@@ -427,3 +454,7 @@ def _build_region_centers(
 
 def _bearing_from_delta(dx: float, dy: float) -> float:
     return float(np.degrees(np.arctan2(dy, dx)) % 360.0)
+
+
+def _absolute_heading_from_bin(action: int, n_bins: int) -> float:
+    return float((int(action) % max(int(n_bins), 1)) * (360.0 / max(int(n_bins), 1)))

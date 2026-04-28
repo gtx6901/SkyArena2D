@@ -44,7 +44,7 @@ def _make_team(n: int, side: str, pos_x_start: float = 0.0) -> TeamState:
 def _make_adapter(n_slots: int = 6) -> SkyArenaActionAdapter:
     return SkyArenaActionAdapter(
         candidate_slots=n_slots,
-        course_bins=16,
+        course_bins=32,
         search_goal_grid_size=8,
         map_width=3000.0,
         map_height=4000.0,
@@ -83,8 +83,8 @@ def test_decode_output_shapes():
     assert action.target_idx.shape == (N,), f"target_idx shape: {action.target_idx.shape}"
 
 
-def test_course_action_with_contact():
-    """With has_active_contact=True, course should use course_action offset."""
+def test_free_course_uses_absolute_heading():
+    """Movement V3: FREE_COURSE interprets course_action as absolute global heading."""
     N = 1
     own = _make_team(N, "red")
     adapter = _make_adapter()
@@ -93,9 +93,10 @@ def test_course_action_with_contact():
     candidate_can_long = np.zeros((N, 6), dtype=bool)
     candidate_can_short = np.zeros((N, 6), dtype=bool)
 
-    # course_action=1 -> offset = +22.5 degrees (bin 1 of 16-bin LUT)
+    # course_action=8 in 32 bins -> 90 degrees absolute heading
     action = adapter.decode(
-        course_action=np.array([1], dtype=np.int32),
+        movement_mode_action=np.array([0], dtype=np.int32),
+        course_action=np.array([8], dtype=np.int32),
         search_goal_action=np.zeros(N, dtype=np.int32),
         target_action=np.zeros(N, dtype=np.int32),
         fire_action=np.zeros(N, dtype=np.int32),
@@ -107,15 +108,11 @@ def test_course_action_with_contact():
         current_heading=np.array([90.0], dtype=np.float32),
     )
 
-    # Expected: 90 + 22.5 = 112.5
-    expected = (90.0 + 22.5) % 360.0
-    assert abs(action.course[0] - expected) < 1e-3, (
-        f"Expected course {expected}, got {action.course[0]}"
-    )
+    assert abs(action.course[0] - 90.0) < 1e-3
 
 
-def test_reference_action_selected_target_bearing():
-    """Movement V2: selected-target reference uses target bearing plus course offset."""
+def test_selected_target_movement_uses_residual_offset():
+    """Movement V3: selected-target mode uses target bearing plus residual offset."""
     N = 1
     own = _make_team(N, "red")
     adapter = _make_adapter()
@@ -127,8 +124,8 @@ def test_reference_action_selected_target_bearing():
     entity_features[0, 0, 3] = 0.0  # bearing 0 degrees
 
     action = adapter.decode(
-        reference_action=np.array([2], dtype=np.int32),
-        course_action=np.array([1], dtype=np.int32),
+        movement_mode_action=np.array([3], dtype=np.int32),
+        course_action=np.array([2], dtype=np.int32),
         search_goal_action=np.zeros(N, dtype=np.int32),
         target_action=np.array([1], dtype=np.int32),
         fire_action=np.zeros(N, dtype=np.int32),
@@ -157,6 +154,7 @@ def test_search_goal_action_without_contact():
     # Agent at (0, 500), search_goal_action=0 -> region 0 center
     # Region 0 center: col=0, row=0 -> cx = 0.5 * (3000/8) = 187.5, cy = 0.5 * (4000/8) = 250
     action = adapter.decode(
+        movement_mode_action=np.array([1], dtype=np.int32),
         course_action=np.zeros(N, dtype=np.int32),
         search_goal_action=np.array([0], dtype=np.int32),
         target_action=np.zeros(N, dtype=np.int32),

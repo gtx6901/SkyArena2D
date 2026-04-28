@@ -111,10 +111,9 @@ class TeamSearchPlanner:
         self.support_mode[env_idx] = False
         self.contact_region_id[env_idx] = -1
 
-    def clear_contact_goals(self, obs_batch: Dict[str, np.ndarray]) -> None:
+    def clear_inactive_goals(self, obs_batch: Dict[str, np.ndarray]) -> None:
         alive = np.asarray(obs_batch["alive_mask"], dtype=np.float32) > 0.5
-        has_contact = np.asarray(obs_batch["has_active_contact"], dtype=np.float32) > 0.5
-        clear_mask = (~alive) | has_contact
+        clear_mask = ~alive
         self.current_goal_id[clear_mask] = -1
         self.goal_age[clear_mask] = 0
         self.goal_world[clear_mask] = 0.0
@@ -123,27 +122,10 @@ class TeamSearchPlanner:
         active = self.current_goal_id >= 0
         return np.where(active, self.current_goal_id + 1, 0).astype(np.int64)
 
-    def apply(
-        self,
-        *,
-        region_logits: np.ndarray,
-        obs_batch: Dict[str, np.ndarray],
-        raw_goal_action: Optional[np.ndarray] = None,
-    ) -> Dict[str, np.ndarray]:
-        del raw_goal_action
-        logits = np.asarray(region_logits, dtype=np.float32)
-        if logits.shape[:2] != (self.num_envs, self.num_agents):
-            raise ValueError(
-                f"region_logits shape must start with {(self.num_envs, self.num_agents)}, got {logits.shape}"
-            )
-
-        self.clear_contact_goals(obs_batch)
-
+    def compute_refresh_mask(self, obs_batch: Dict[str, np.ndarray]) -> np.ndarray:
+        self.clear_inactive_goals(obs_batch)
         self_features = np.asarray(obs_batch["self_features"], dtype=np.float32)
         alive = np.asarray(obs_batch["alive_mask"], dtype=np.float32) > 0.5
-        has_contact = np.asarray(obs_batch["has_active_contact"], dtype=np.float32) > 0.5
-        search_active = alive & (~has_contact)
-
         pos_x = self_features[..., 0] * self.map_size_x
         pos_y = self_features[..., 1] * self.map_size_y
         active_goal = self.current_goal_id >= 0
@@ -151,49 +133,68 @@ class TeamSearchPlanner:
         goal_dy = self.goal_world[..., 1] - pos_y
         goal_reached = active_goal & ((goal_dx * goal_dx + goal_dy * goal_dy) <= self.goal_reach_radius_sq)
         goal_expired = active_goal & (self.goal_age >= self.goal_hold_steps)
-        refresh_mask = search_active & ((~active_goal) | goal_reached | goal_expired)
+        return (alive & ((~active_goal) | goal_reached | goal_expired)).astype(np.bool_, copy=False)
 
+    def build_goal_mask(self, obs_batch: Dict[str, np.ndarray]) -> np.ndarray:
+        alive = np.asarray(obs_batch["alive_mask"], dtype=np.float32) > 0.5
+        mask = np.ones((self.num_envs, self.num_agents, self.search_goal_bins), dtype=np.bool_)
+        mask[~alive] = False
+        mask[~alive, 0] = True
+        return mask
+
+    def build_planner_bias(self, obs_batch: Dict[str, np.ndarray]) -> np.ndarray:
+        bias = np.zeros((self.num_envs, self.num_agents, self.search_goal_bins), dtype=np.float32)
         raw_region_features = obs_batch.get("region_features")
         region_features = None if raw_region_features is None else np.asarray(raw_region_features, dtype=np.float32)
+        has_contact = np.asarray(obs_batch["has_active_contact"], dtype=np.float32) > 0.5
         self._update_contact_modes(has_contact, region_features)
-
+        alive = np.asarray(obs_batch["alive_mask"], dtype=np.float32) > 0.5
         for env_idx in range(self.num_envs):
-            agents = np.nonzero(refresh_mask[env_idx])[0]
-            if agents.size == 0:
-                continue
-            held_mask = search_active[env_idx] & (~refresh_mask[env_idx]) & (self.current_goal_id[env_idx] >= 0)
-            used_regions = set(int(r) for r in self.current_goal_id[env_idx, held_mask] if int(r) >= 0)
-            neighborhood_occupancy = self._build_neighborhood_occupancy(used_regions)
-            scores = logits[env_idx, agents].copy()
-            self._apply_recent_cooldown(scores, env_idx, agents)
-            order = np.argsort(-np.max(scores, axis=1))
-            for local_idx in order:
-                agent_idx = int(agents[local_idx])
-                agent_scores = scores[local_idx].copy()
-                assigned = self._best_region_with_capacity(
-                    agent_scores, used_regions, neighborhood_occupancy,
-                    local_capacity=self.local_region_capacity,
-                )
-                used_regions.add(assigned)
-                neighborhood_occupancy += self._adjacent_region_mask[assigned].astype(np.int16, copy=False)
-                self.current_goal_id[env_idx, agent_idx] = assigned
-                self.goal_world[env_idx, agent_idx] = self._region_centers[assigned]
-                self.goal_age[env_idx, agent_idx] = 0
-                self._push_recent_goal(env_idx, agent_idx, assigned)
+            used_regions = set(int(r) for r in self.current_goal_id[env_idx, alive[env_idx]] if int(r) >= 0)
+            occupancy = self._build_neighborhood_occupancy(used_regions)
+            if np.any(occupancy > 0):
+                bias[env_idx, :, occupancy > 0] -= self.adjacent_goal_penalty
+            self._apply_recent_cooldown(bias[env_idx], env_idx, np.arange(self.num_agents, dtype=np.int64))
+        return bias
 
-        hold_mask = search_active & (~refresh_mask) & (self.current_goal_id >= 0)
+    def apply(
+        self,
+        *,
+        raw_goal_action: np.ndarray,
+        refresh_mask: np.ndarray,
+        obs_batch: Dict[str, np.ndarray],
+    ) -> Dict[str, np.ndarray]:
+        raw = np.asarray(raw_goal_action, dtype=np.int64)
+        refresh = np.asarray(refresh_mask, dtype=np.bool_)
+        if raw.shape != (self.num_envs, self.num_agents):
+            raise ValueError(f"raw_goal_action shape must be {(self.num_envs, self.num_agents)}, got {raw.shape}")
+        if refresh.shape != (self.num_envs, self.num_agents):
+            raise ValueError(f"refresh_mask shape must be {(self.num_envs, self.num_agents)}, got {refresh.shape}")
+
+        self.clear_inactive_goals(obs_batch)
+        alive = np.asarray(obs_batch["alive_mask"], dtype=np.float32) > 0.5
+        update_mask = alive & refresh
+        clipped = np.clip(raw, 0, self.search_goal_bins - 1)
+        self.current_goal_id[update_mask] = clipped[update_mask]
+        self.goal_world[update_mask] = self._region_centers[self.current_goal_id[update_mask]]
+        self.goal_age[update_mask] = 0
+        for env_idx, agent_idx in np.argwhere(update_mask):
+            self._push_recent_goal(int(env_idx), int(agent_idx), int(self.current_goal_id[env_idx, agent_idx]))
+
+        hold_mask = alive & (~refresh) & (self.current_goal_id >= 0)
         self.goal_age[hold_mask] += 1
-        self.current_goal_id[~search_active] = -1
-        self.goal_age[~search_active] = 0
-        self.goal_world[~search_active] = 0.0
+        self.current_goal_id[~alive] = -1
+        self.goal_age[~alive] = 0
+        self.goal_world[~alive] = 0.0
 
-        executed_goal_action = np.where(search_active & (self.current_goal_id >= 0), self.current_goal_id, 0).astype(np.int64)
-        executed_goal_world = np.where(search_active[..., None], self.goal_world, 0.0).astype(np.float32)
+        active = alive & (self.current_goal_id >= 0)
+        executed_goal_action = np.where(active, self.current_goal_id, 0).astype(np.int64)
+        executed_goal_world = np.where(active[..., None], self.goal_world, 0.0).astype(np.float32)
         return {
             "executed_search_goal_action": executed_goal_action,
             "executed_search_goal_world": executed_goal_world,
             "current_search_goal_id": self.current_goal_observation(),
-            "search_goal_refresh_mask": refresh_mask.astype(np.bool_, copy=False),
+            "search_goal_refresh_mask": refresh.astype(np.bool_, copy=False),
         }
 
     def _update_contact_modes(self, has_contact: np.ndarray, region_features: Optional[np.ndarray]) -> None:

@@ -121,8 +121,8 @@ class SkyArenaTrainingObsBuilder:
         # --- has_active_contact (N,) ---
         has_active_contact = np.any(visible_matrix[:N, :], axis=1).astype(np.float32)
 
-        # --- course_mask (N, 16) ---
-        course_mask = np.zeros((N, 16), dtype=bool)
+        # --- course_mask (N, 32) ---
+        course_mask = np.zeros((N, 32), dtype=bool)
         for i in range(N):
             if own.alive[i]:
                 course_mask[i, :] = True
@@ -133,12 +133,13 @@ class SkyArenaTrainingObsBuilder:
         search_goal_mask = np.ones((N, G * G), dtype=bool)
 
         # --- target_mask (N, S+1) ---
-        # Only fireable candidates are valid targets (can_long or can_short).
+        # Movement V3 uses target_action as engagement/attention target. Any
+        # visible or tracked entity can be selected; fire masking stays stricter.
         target_mask = np.zeros((N, S + 1), dtype=bool)
         target_mask[:, 0] = True  # always can choose "no target"
         for i in range(N):
             for s in range(S):
-                if entity_mask[i, s] and (candidate_can_long[i, s] or candidate_can_short[i, s]):
+                if entity_mask[i, s]:
                     target_mask[i, s + 1] = True
 
         # --- agent_id (N,) ---

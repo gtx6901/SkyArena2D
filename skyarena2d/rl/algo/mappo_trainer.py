@@ -30,6 +30,8 @@ from .rollout import (
     RolloutBatch,
     allocate_batched_obs,
     allocate_rollout_obs,
+    build_batched_movement_mode_mask,
+    build_course_mask_for_movement_mode,
     build_fire_mask_from_selected_targets,
     compute_gae,
     fill_batched_obs,
@@ -117,7 +119,7 @@ class SkyArenaMAPPOTrainer:
             map_channels=obs_shapes["semantic_map"][1],
             candidate_slots=self.candidate_slots,
             num_agents=self.num_agents,
-            course_bins=16,
+            course_bins=32,
             search_goal_bins=self.search_goal_bins,
             region_feature_dim=obs_shapes["region_features"][2],
             trunk_dim=int(self.model_cfg.get("trunk_dim", 192)),
@@ -143,7 +145,7 @@ class SkyArenaMAPPOTrainer:
         # Build action adapter
         self.action_adapter = SkyArenaActionAdapter(
             candidate_slots=self.candidate_slots,
-            course_bins=16,
+            course_bins=32,
             search_goal_grid_size=self.search_goal_grid_size,
             map_width=engine_cfg.map.width,
             map_height=engine_cfg.map.height,
@@ -261,6 +263,20 @@ class SkyArenaMAPPOTrainer:
         tri = np.triu_indices(pos.shape[0], k=1)
         return float(np.mean(dist[tri]))
 
+    @staticmethod
+    def _reset_recurrent_hidden_after_done(
+        h: torch.Tensor,
+        c: torch.Tensor,
+        prev_done: np.ndarray,
+        num_agents: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not np.any(prev_done):
+            return h, c
+        device = h.device
+        reset_env = torch.as_tensor(prev_done.reshape(-1, 1), dtype=h.dtype, device=device)
+        reset_mask = reset_env.repeat_interleave(int(num_agents), dim=0)
+        return h * (1.0 - reset_mask), c * (1.0 - reset_mask)
+
     def _collect_rollout_step_diagnostics(self, batch: RolloutBatch) -> dict:
         """Compute per-step rollout diagnostics from actions / masks / obs."""
         T, E = batch.reward.shape
@@ -272,6 +288,8 @@ class SkyArenaMAPPOTrainer:
         candidate_ids = batch.observations["candidate_ids"].reshape(T, E, N, -1)
         can_long = batch.observations["candidate_can_long"].reshape(T, E, N, -1).astype(np.float32)
         can_short = batch.observations["candidate_can_short"].reshape(T, E, N, -1).astype(np.float32)
+        movement_mode_action = batch.movement_mode_action[:, :, :N]
+        course_action = batch.course_action[:, :, :N]
         target_action = batch.target_action[:, :, :N]
         fire_action = batch.fire_action[:, :, :N]
 
@@ -304,6 +322,35 @@ class SkyArenaMAPPOTrainer:
         has_valid = np.any(candidate_ids >= 0, axis=-1)
         target_available = np.where(alive_mask > 0, has_valid, 0.0).sum(axis=-1) / np.maximum(alive_count, 1)
 
+        any_entity = np.any(entity_mask > 0.5, axis=-1)
+        target_nonzero_when_entity_available = float(
+            np.count_nonzero((target_action > 0) & (alive_mask > 0.5) & any_entity)
+            / max(np.count_nonzero((alive_mask > 0.5) & any_entity), 1)
+        )
+        fireable_agent = np.any((can_long > 0.5) | (can_short > 0.5), axis=-1)
+        fire_nonzero_when_fireable = float(
+            np.count_nonzero((fire_action > 0) & (alive_mask > 0.5) & fireable_agent)
+            / max(np.count_nonzero((alive_mask > 0.5) & fireable_agent), 1)
+        )
+        valid_fire_rate_when_fireable = float(
+            np.count_nonzero((fire_action > 0) & (alive_mask > 0.5) & fireable_agent)
+            / max(np.count_nonzero((fire_action > 0) & (alive_mask > 0.5)), 1)
+        )
+        visible_but_not_fireable = any_entity & (~fireable_agent)
+        visible_but_not_fireable_rate = float(
+            np.count_nonzero((alive_mask > 0.5) & visible_but_not_fireable)
+            / max(np.count_nonzero(alive_mask > 0.5), 1)
+        )
+
+        heading = (np.degrees(np.arctan2(
+            batch.observations["self_features"][:, :, :N, 3],
+            batch.observations["self_features"][:, :, :N, 2],
+        )) % 360.0).astype(np.float32)
+        delta = np.abs(((batch.decoded_course[:, :, :N] - heading + 540.0) % 360.0) - 180.0)
+        alive_delta = delta[alive_mask > 0.5]
+        heading_delta_abs_mean = float(np.mean(alive_delta)) if alive_delta.size else 0.0
+        spin_rate = float(np.mean(alive_delta > 60.0)) if alive_delta.size else 0.0
+
         # Long / short available rates among valid candidates
         valid = candidate_ids >= 0
         n_valid = valid.sum()
@@ -321,6 +368,17 @@ class SkyArenaMAPPOTrainer:
             "target_available_rate": float(target_available.mean()),
             "long_available_rate": float(long_count / max(n_valid, 1)),
             "short_available_rate": float(short_count / max(n_valid, 1)),
+            "movement_mode_hist": np.bincount(movement_mode_action[alive_mask > 0.5].astype(np.int64), minlength=9).tolist(),
+            "course_hist": np.bincount(course_action[alive_mask > 0.5].astype(np.int64), minlength=32).tolist(),
+            "target_action_hist": np.bincount(target_action[alive_mask > 0.5].astype(np.int64), minlength=self.candidate_slots + 1).tolist(),
+            "fire_action_hist": np.bincount(fire_action[alive_mask > 0.5].astype(np.int64), minlength=3).tolist(),
+            "search_goal_refresh_rate": float(np.mean(batch.search_goal_refresh_mask[alive_mask > 0.5])) if np.any(alive_mask > 0.5) else 0.0,
+            "heading_delta_abs_mean": heading_delta_abs_mean,
+            "spin_rate": spin_rate,
+            "target_nonzero_when_entity_available": target_nonzero_when_entity_available,
+            "fire_nonzero_when_fireable": fire_nonzero_when_fireable,
+            "valid_fire_rate_when_fireable": valid_fire_rate_when_fireable,
+            "visible_but_not_fireable_rate": visible_but_not_fireable_rate,
         }
 
     def _summarize_rollout_episodes(self, episode_stats: List[Dict[str, Any]]) -> Dict[str, float]:
@@ -368,10 +426,15 @@ class SkyArenaMAPPOTrainer:
         """Collect rollout_steps of experience from all envs."""
         example_obs = self.current_obs[0]
         rollout_obs = allocate_rollout_obs(example_obs, self.rollout_steps, self.num_envs)
-        rollout_reference = np.zeros((self.rollout_steps, self.num_envs, self.num_agents), dtype=np.int64)
+        rollout_movement_mode = np.zeros((self.rollout_steps, self.num_envs, self.num_agents), dtype=np.int64)
         rollout_course = np.zeros((self.rollout_steps, self.num_envs, self.num_agents), dtype=np.int64)
+        rollout_decoded_course = np.zeros((self.rollout_steps, self.num_envs, self.num_agents), dtype=np.float32)
         rollout_search_goal = np.zeros((self.rollout_steps, self.num_envs, self.num_agents), dtype=np.int64)
         rollout_search_goal_refresh = np.zeros((self.rollout_steps, self.num_envs, self.num_agents), dtype=np.bool_)
+        rollout_search_goal_planner_bias = np.zeros(
+            (self.rollout_steps, self.num_envs, self.num_agents, self.search_goal_bins),
+            dtype=np.float32,
+        )
         rollout_target = np.zeros((self.rollout_steps, self.num_envs, self.num_agents), dtype=np.int64)
         rollout_fire = np.zeros((self.rollout_steps, self.num_envs, self.num_agents), dtype=np.int64)
         rollout_log_prob = np.zeros((self.rollout_steps, self.num_envs, self.num_agents), dtype=np.float32)
@@ -403,10 +466,11 @@ class SkyArenaMAPPOTrainer:
             # Store obs
             for key in rollout_obs:
                 rollout_obs[key][step] = batched_obs[key]
-            rollout_reference[step] = sampled["reference"]
+            rollout_movement_mode[step] = sampled["movement_mode"]
             rollout_course[step] = sampled["course"]
             rollout_search_goal[step] = sampled["search_goal"]
             rollout_search_goal_refresh[step] = sampled["search_goal_refresh_mask"]
+            rollout_search_goal_planner_bias[step] = sampled["search_goal_planner_bias"]
             rollout_target[step] = sampled["target"]
             rollout_fire[step] = sampled["fire"]
             rollout_log_prob[step] = sampled["log_prob"]
@@ -420,13 +484,13 @@ class SkyArenaMAPPOTrainer:
             new_obs_list = []
             for env_idx, env in enumerate(self.envs):
                 course_i = sampled["course"][env_idx]
-                reference_i = sampled["reference"][env_idx]
+                movement_mode_i = sampled["movement_mode"][env_idx]
                 search_goal_i = sampled["search_goal"][env_idx]
                 target_i = sampled["target"][env_idx]
                 fire_i = sampled["fire"][env_idx]
 
                 sky_action = self.action_adapter.decode(
-                    reference_action=reference_i,
+                    movement_mode_action=movement_mode_i,
                     course_action=course_i,
                     search_goal_action=search_goal_i,
                     target_action=target_i,
@@ -442,8 +506,9 @@ class SkyArenaMAPPOTrainer:
                     ew_state_key=env_idx,
                     step_count=env.engine.state.step_count,
                 )
+                rollout_decoded_course[step, env_idx] = sky_action.course[:self.num_agents]
 
-                env.set_current_search_goal_id(search_goal_i)
+                env.set_current_search_goal_id(sampled["current_search_goal_id"][env_idx])
                 next_obs, reward, done, info = env.step(sky_action)
                 rollout_reward[step, env_idx] = reward
                 rollout_done[step, env_idx] = float(done)
@@ -487,10 +552,12 @@ class SkyArenaMAPPOTrainer:
             observations=rollout_obs,
             initial_h=initial_h,
             initial_c=initial_c,
-            reference_action=rollout_reference,
+            movement_mode_action=rollout_movement_mode,
             course_action=rollout_course,
+            decoded_course=rollout_decoded_course,
             search_goal_action=rollout_search_goal,
             search_goal_refresh_mask=rollout_search_goal_refresh,
+            search_goal_planner_bias=rollout_search_goal_planner_bias,
             target_action=rollout_target,
             fire_action=rollout_fire,
             log_prob=rollout_log_prob,
@@ -559,22 +626,24 @@ class SkyArenaMAPPOTrainer:
 
             # Forward pass through actor (step-by-step for LSTM)
             all_course_logits = []
-            all_reference_logits = []
+            all_movement_mode_logits = []
             all_sg_logits = []
             all_target_logits = []
             all_fire_logits = []
             h, c = h0, c0
             for t in range(T):
+                if t > 0:
+                    h, c = self._reset_recurrent_hidden_after_done(h, c, batch.done[t - 1], N)
                 step_batch = {k: v[t * E * N:(t + 1) * E * N] for k, v in flat_actor_batch.items()}
                 out = self.actor.step(step_batch, (h, c))
-                all_reference_logits.append(out["reference_logits"])
+                all_movement_mode_logits.append(out["movement_mode_logits"])
                 all_course_logits.append(out["course_logits"])
                 all_sg_logits.append(out["search_goal_logits"])
                 all_target_logits.append(out["target_logits"])
                 all_fire_logits.append(out["fire_logits"])
                 h, c = out["next_h"], out["next_c"]
 
-            reference_logits = torch.stack(all_reference_logits, dim=0).reshape(T, E, N, -1)
+            movement_mode_logits = torch.stack(all_movement_mode_logits, dim=0).reshape(T, E, N, -1)
             course_logits = torch.stack(all_course_logits, dim=0).reshape(T, E, N, -1)
             sg_logits = torch.stack(all_sg_logits, dim=0).reshape(T, E, N, -1)
             target_logits = torch.stack(all_target_logits, dim=0).reshape(T, E, N, -1)
@@ -583,6 +652,7 @@ class SkyArenaMAPPOTrainer:
             # Compute log probs
             course_mask = torch.as_tensor(batch.observations["course_mask"].reshape(T, E, N, -1), dtype=torch.bool, device=self.device)
             sg_mask = torch.as_tensor(batch.observations["search_goal_mask"].reshape(T, E, N, -1), dtype=torch.bool, device=self.device)
+            sg_bias = torch.as_tensor(batch.search_goal_planner_bias.reshape(T, E, N, -1), dtype=sg_logits.dtype, device=self.device)
             target_mask = torch.as_tensor(batch.observations["target_mask"].reshape(T, E, N, -1), dtype=torch.bool, device=self.device)
             alive_mask = torch.as_tensor(batch.observations["alive_mask"].reshape(T, E, N), dtype=torch.float32, device=self.device) > 0.5
             has_contact = torch.as_tensor(batch.observations["has_active_contact"].reshape(T, E, N), dtype=torch.float32, device=self.device) > 0.5
@@ -590,21 +660,36 @@ class SkyArenaMAPPOTrainer:
             candidate_can_long = torch.as_tensor(batch.observations["candidate_can_long"].reshape(T, E, N, -1), dtype=torch.bool, device=self.device)
             candidate_can_short = torch.as_tensor(batch.observations["candidate_can_short"].reshape(T, E, N, -1), dtype=torch.bool, device=self.device)
 
-            reference_act = torch.as_tensor(batch.reference_action.reshape(T, E, N), dtype=torch.long, device=self.device)
+            movement_mode_act = torch.as_tensor(batch.movement_mode_action.reshape(T, E, N), dtype=torch.long, device=self.device)
             course_act = torch.as_tensor(batch.course_action.reshape(T, E, N), dtype=torch.long, device=self.device)
             sg_act = torch.as_tensor(batch.search_goal_action.reshape(T, E, N), dtype=torch.long, device=self.device)
             target_act = torch.as_tensor(batch.target_action.reshape(T, E, N), dtype=torch.long, device=self.device)
             fire_act = torch.as_tensor(batch.fire_action.reshape(T, E, N), dtype=torch.long, device=self.device)
 
-            reference_mask = torch.ones_like(reference_logits, dtype=torch.bool, device=self.device)
-            reference_dist = masked_categorical(reference_logits.reshape(T * E * N, -1), reference_mask.reshape(T * E * N, -1))
-            course_dist = masked_categorical(course_logits.reshape(T * E * N, -1), course_mask.reshape(T * E * N, -1))
-            sg_dist = masked_categorical(sg_logits.reshape(T * E * N, -1), sg_mask.reshape(T * E * N, -1))
+            movement_mode_mask = build_batched_movement_mode_mask(
+                target_action=target_act,
+                alive_mask=alive_mask,
+                entity_mask=entity_mask_t,
+                has_active_contact=has_contact,
+            )
+            movement_mode_dist = masked_categorical(
+                movement_mode_logits.reshape(T * E * N, -1),
+                movement_mode_mask.reshape(T * E * N, -1),
+            )
+            dynamic_course_mask = build_course_mask_for_movement_mode(
+                movement_mode=movement_mode_act,
+                alive_mask=alive_mask,
+                course_bins=course_logits.shape[-1],
+            ) & course_mask
+            course_dist = masked_categorical(course_logits.reshape(T * E * N, -1), dynamic_course_mask.reshape(T * E * N, -1))
+            sg_dist = masked_categorical((sg_logits + sg_bias).reshape(T * E * N, -1), sg_mask.reshape(T * E * N, -1))
             target_dist = masked_categorical(target_logits.reshape(T * E * N, -1), target_mask.reshape(T * E * N, -1))
 
-            reference_lp = reference_dist.log_prob(reference_act.reshape(T * E * N)).reshape(T, E, N)
+            movement_mode_lp = movement_mode_dist.log_prob(movement_mode_act.reshape(T * E * N)).reshape(T, E, N)
             course_lp = course_dist.log_prob(course_act.reshape(T * E * N)).reshape(T, E, N)
-            sg_lp = sg_dist.log_prob(sg_act.reshape(T * E * N)).reshape(T, E, N)
+            sg_lp_raw = sg_dist.log_prob(sg_act.reshape(T * E * N)).reshape(T, E, N)
+            refresh_mask = torch.as_tensor(batch.search_goal_refresh_mask.reshape(T, E, N), dtype=torch.bool, device=self.device)
+            sg_lp = torch.where(refresh_mask, sg_lp_raw, torch.zeros_like(sg_lp_raw))
             target_lp = target_dist.log_prob(target_act.reshape(T * E * N)).reshape(T, E, N)
 
             # Fire log prob: select fire logits for chosen target
@@ -621,12 +706,9 @@ class SkyArenaMAPPOTrainer:
             fire_dist = masked_categorical(fire_logits_sel.reshape(T * E * N, 3), fire_mask_t.reshape(T * E * N, 3))
             fire_lp = fire_dist.log_prob(fire_act.reshape(T * E * N)).reshape(T, E, N)
 
-            has_target_opportunity = alive_mask & has_contact & torch.any(entity_mask_t, dim=-1)
-            movement_base_log_prob = reference_lp + course_lp
+            has_target_opportunity = alive_mask & torch.any(entity_mask_t, dim=-1)
+            movement_base_log_prob = movement_mode_lp + course_lp + sg_lp
             movement_log_prob = torch.where(alive_mask, movement_base_log_prob, torch.zeros_like(movement_base_log_prob))
-            movement_log_prob = movement_log_prob + torch.where(
-                alive_mask & (~has_contact), sg_lp, torch.zeros_like(sg_lp),
-            )
             attack_log_prob = target_lp + fire_lp
             new_log_prob = movement_log_prob + torch.where(
                 has_target_opportunity,
@@ -649,7 +731,7 @@ class SkyArenaMAPPOTrainer:
             vf_loss = F.mse_loss(new_value, returns_t)
 
             # Entropy
-            ent = (reference_dist.entropy() + course_dist.entropy() + sg_dist.entropy()).mean()
+            ent = (movement_mode_dist.entropy() + course_dist.entropy() + sg_dist.entropy()).mean()
 
             loss = pg_loss + self.vf_coef * vf_loss - self.ent_coef * ent
             self.optimizer.zero_grad()
@@ -959,10 +1041,13 @@ class SkyArenaMAPPOTrainer:
         diag_tgt_fireable_sum = 0.0
         diag_heading_change_sum = 0.0
         diag_heading_change_count = 0
+        diag_spin_count = 0
         diag_heading_flip_count = 0
         diag_heading_flip_denom = 0
-        diag_reference_hist = np.zeros(8, dtype=np.int64)
-        diag_course_hist = np.zeros(16, dtype=np.int64)
+        diag_reference_hist = np.zeros(9, dtype=np.int64)
+        diag_course_hist = np.zeros(32, dtype=np.int64)
+        diag_target_hist = np.zeros(self.candidate_slots + 1, dtype=np.int64)
+        diag_fire_hist = np.zeros(3, dtype=np.int64)
         diag_contact_agents_sum = 0.0
         diag_late_contact_sum = 0.0
         diag_late_contact_count = 0
@@ -1027,12 +1112,15 @@ class SkyArenaMAPPOTrainer:
             # Movement/search diagnostics per episode.
             ep_heading_change_sum = 0.0
             ep_heading_change_count = 0
+            ep_spin_count = 0
             ep_heading_flip_count = 0
             ep_heading_flip_denom = 0
             ep_prev_turn_delta = np.zeros(self.num_agents, dtype=np.float32)
             ep_prev_turn_valid = np.zeros(self.num_agents, dtype=bool)
-            ep_reference_hist = np.zeros(8, dtype=np.int64)
-            ep_course_hist = np.zeros(16, dtype=np.int64)
+            ep_reference_hist = np.zeros(9, dtype=np.int64)
+            ep_course_hist = np.zeros(32, dtype=np.int64)
+            ep_target_hist = np.zeros(self.candidate_slots + 1, dtype=np.int64)
+            ep_fire_hist = np.zeros(3, dtype=np.int64)
             ep_contact_agents_sum = 0.0
             ep_late_contact_sum = 0.0
             ep_late_contact_count = 0
@@ -1068,7 +1156,7 @@ class SkyArenaMAPPOTrainer:
                     candidate_can_short=obs_batch["candidate_can_short"][0],
                     has_active_contact=obs_batch["has_active_contact"][0] > 0.5,
                     current_heading=eval_env.engine.state.red.heading[:eval_env.red_fighter_num],
-                    reference_action=sampled["reference"][0],
+                    movement_mode_action=sampled["movement_mode"][0],
                     enemy=eval_env.engine.state.blue,
                     entity_features=obs_batch["entity_features"][0],
                     ew_state_key="eval",
@@ -1105,19 +1193,27 @@ class SkyArenaMAPPOTrainer:
                 if np.any(alive):
                     ep_heading_change_sum += float(np.sum(np.abs(turn_delta[alive])))
                     ep_heading_change_count += int(np.count_nonzero(alive))
+                    ep_spin_count += int(np.count_nonzero(np.abs(turn_delta[alive]) > 60.0))
                     ep_contact_agents_sum += float(np.count_nonzero(alive_contact))
                     ep_reference_hist += np.bincount(
-                        np.asarray(sampled["reference"][0][alive], dtype=np.int64),
-                        minlength=8,
-                    )[:8]
+                        np.asarray(sampled["movement_mode"][0][alive], dtype=np.int64),
+                        minlength=9,
+                    )[:9]
                     ep_course_hist += np.bincount(
                         np.asarray(sampled["course"][0][alive], dtype=np.int64),
-                        minlength=16,
-                    )[:16]
+                        minlength=32,
+                    )[:32]
+                    ep_target_hist += np.bincount(
+                        np.asarray(sampled["target"][0][alive], dtype=np.int64),
+                        minlength=self.candidate_slots + 1,
+                    )[: self.candidate_slots + 1]
+                    ep_fire_hist += np.bincount(
+                        np.asarray(sampled["fire"][0][alive], dtype=np.int64),
+                        minlength=3,
+                    )[:3]
                     refresh_mask = np.asarray(sampled["search_goal_refresh_mask"][0], dtype=bool)
-                    search_active = alive & (~(obs_batch["has_active_contact"][0] > 0.5))
-                    ep_search_goal_refresh_sum += int(np.count_nonzero(refresh_mask & search_active))
-                    ep_search_goal_refresh_denom += int(np.count_nonzero(search_active))
+                    ep_search_goal_refresh_sum += int(np.count_nonzero(refresh_mask & alive))
+                    ep_search_goal_refresh_denom += int(np.count_nonzero(alive))
 
                     turn_active = alive_contact
                     valid_flip = turn_active & ep_prev_turn_valid
@@ -1150,7 +1246,7 @@ class SkyArenaMAPPOTrainer:
                     ep_red_team_spread_sum += team_spread
                     ep_red_team_spread_count += 1
 
-                eval_env.set_current_search_goal_id(sampled["search_goal"][0])
+                eval_env.set_current_search_goal_id(sampled["current_search_goal_id"][0])
                 obs, reward, done, info = eval_env.step(sky_action)
                 ep_return += float(reward)
                 h = sampled["next_h"].to(self.device)
@@ -1325,6 +1421,7 @@ class SkyArenaMAPPOTrainer:
             ep_tgt_can_short_rate = ep_tgt_can_short_sum / ep_tgt_fireable_steps
             ep_tgt_fireable_rate = ep_tgt_fireable_sum / ep_tgt_fireable_steps
             ep_heading_change_mean = ep_heading_change_sum / max(ep_heading_change_count, 1)
+            ep_spin_rate = ep_spin_count / max(ep_heading_change_count, 1)
             ep_heading_flip_rate = ep_heading_flip_count / max(ep_heading_flip_denom, 1)
             ep_contact_agents_mean = ep_contact_agents_sum / nz_steps
             ep_late_contact_rate = ep_late_contact_sum / max(ep_late_contact_count, 1)
@@ -1380,9 +1477,14 @@ class SkyArenaMAPPOTrainer:
                 "selected_target_can_long_rate": float(ep_tgt_can_long_rate),
                 "selected_target_can_short_rate": float(ep_tgt_can_short_rate),
                 "heading_change_mean": float(ep_heading_change_mean),
+                "heading_delta_abs_mean": float(ep_heading_change_mean),
                 "heading_flip_rate": float(ep_heading_flip_rate),
-                "reference_action_histogram": ep_reference_hist.astype(int).tolist(),
+                "spin_rate": float(ep_spin_rate),
+                "movement_mode_hist": ep_reference_hist.astype(int).tolist(),
+                "course_hist": ep_course_hist.astype(int).tolist(),
                 "course_action_histogram": ep_course_hist.astype(int).tolist(),
+                "target_action_hist": ep_target_hist.astype(int).tolist(),
+                "fire_action_hist": ep_fire_hist.astype(int).tolist(),
                 "contact_agents_mean": float(ep_contact_agents_mean),
                 "late_contact_rate": float(ep_late_contact_rate),
                 "nearest_blue_distance_mean": float(ep_nearest_blue_distance_mean),
@@ -1421,10 +1523,13 @@ class SkyArenaMAPPOTrainer:
             diag_tgt_fireable_sum += ep_tgt_fireable_sum
             diag_heading_change_sum += ep_heading_change_sum
             diag_heading_change_count += ep_heading_change_count
+            diag_spin_count += ep_spin_count
             diag_heading_flip_count += ep_heading_flip_count
             diag_heading_flip_denom += ep_heading_flip_denom
             diag_reference_hist += ep_reference_hist
             diag_course_hist += ep_course_hist
+            diag_target_hist += ep_target_hist
+            diag_fire_hist += ep_fire_hist
             diag_contact_agents_sum += ep_contact_agents_sum
             diag_late_contact_sum += ep_late_contact_sum
             diag_late_contact_count += ep_late_contact_count
@@ -1517,9 +1622,12 @@ class SkyArenaMAPPOTrainer:
         selected_target_can_long_rate = diag_tgt_can_long_sum / tgt_fireable_denom
         selected_target_can_short_rate = diag_tgt_can_short_sum / tgt_fireable_denom
         heading_change_mean = diag_heading_change_sum / max(diag_heading_change_count, 1)
+        spin_rate = diag_spin_count / max(diag_heading_change_count, 1)
         heading_flip_rate = diag_heading_flip_count / max(diag_heading_flip_denom, 1)
-        reference_action_histogram = diag_reference_hist.astype(int).tolist()
+        movement_mode_hist = diag_reference_hist.astype(int).tolist()
         course_action_histogram = diag_course_hist.astype(int).tolist()
+        target_action_hist = diag_target_hist.astype(int).tolist()
+        fire_action_hist = diag_fire_hist.astype(int).tolist()
         contact_agents_mean = diag_contact_agents_sum / diag_denom
         late_contact_rate = diag_late_contact_sum / max(diag_late_contact_count, 1)
         nearest_blue_distance_mean = diag_nearest_blue_distance_sum / max(diag_nearest_blue_distance_count, 1)
@@ -1581,9 +1689,14 @@ class SkyArenaMAPPOTrainer:
                 "selected_target_can_short_rate": selected_target_can_short_rate,
                 # Movement/search diagnostics
                 "heading_change_mean": heading_change_mean,
+                "heading_delta_abs_mean": heading_change_mean,
                 "heading_flip_rate": heading_flip_rate,
-                "reference_action_histogram": reference_action_histogram,
+                "spin_rate": spin_rate,
+                "movement_mode_hist": movement_mode_hist,
+                "course_hist": course_action_histogram,
                 "course_action_histogram": course_action_histogram,
+                "target_action_hist": target_action_hist,
+                "fire_action_hist": fire_action_hist,
                 "contact_agents_mean": contact_agents_mean,
                 "late_contact_rate": late_contact_rate,
                 "nearest_blue_distance_mean": nearest_blue_distance_mean,
@@ -1647,9 +1760,14 @@ class SkyArenaMAPPOTrainer:
             "selected_target_can_short_rate": selected_target_can_short_rate,
             # Movement/search diagnostics
             "heading_change_mean": heading_change_mean,
+            "heading_delta_abs_mean": heading_change_mean,
             "heading_flip_rate": heading_flip_rate,
-            "reference_action_histogram": reference_action_histogram,
+            "spin_rate": spin_rate,
+            "movement_mode_hist": movement_mode_hist,
+            "course_hist": course_action_histogram,
             "course_action_histogram": course_action_histogram,
+            "target_action_hist": target_action_hist,
+            "fire_action_hist": fire_action_hist,
             "contact_agents_mean": contact_agents_mean,
             "late_contact_rate": late_contact_rate,
             "nearest_blue_distance_mean": nearest_blue_distance_mean,

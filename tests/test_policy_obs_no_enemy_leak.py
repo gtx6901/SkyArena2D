@@ -239,7 +239,7 @@ def test_obs_shapes_10v10():
     assert obs["region_features"].shape == (N, 64, 10)
     assert obs["alive_mask"].shape == (N,)
     assert obs["has_active_contact"].shape == (N,)
-    assert obs["course_mask"].shape == (N, 16)
+    assert obs["course_mask"].shape == (N, 32)
     assert obs["search_goal_mask"].shape == (N, 64)
     assert obs["target_mask"].shape == (N, 7)
 

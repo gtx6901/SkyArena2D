@@ -8,7 +8,7 @@ fi
 
 CHECKPOINT="${1:-}"
 if [ -z "$CHECKPOINT" ]; then
-  CHECKPOINT="$(ls -1t train_dir/skyarena_mappo_train/stage0_no_attack_movement_v2/checkpoints/step_*.pt | head -n 1)"
+  CHECKPOINT="$(ls -1t train_dir/skyarena_mappo_train/stage0_no_attack_movement_v3/checkpoints/step_*.pt | head -n 1)"
 fi
 
 "$PYTHON_BIN" scripts/evaluate_mappo.py \

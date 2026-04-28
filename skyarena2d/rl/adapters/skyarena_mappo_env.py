@@ -66,7 +66,7 @@ class SkyArenaMAPPOEnv:
         # Create action adapter
         self.action_adapter = SkyArenaActionAdapter(
             candidate_slots=env_cfg.get("candidate_slots", 6),
-            course_bins=16,
+            course_bins=32,
             search_goal_grid_size=env_cfg.get("search_goal_grid_size", 8),
             map_width=self.engine_config.map.width,
             map_height=self.engine_config.map.height,
@@ -150,7 +150,8 @@ class SkyArenaMAPPOEnv:
     def set_current_search_goal_id(self, goal_id: np.ndarray) -> None:
         """Set current search goal ids for the next policy obs build.
 
-        goal_id: (red_fighter_num,) int64 array of goal bin indices
+        goal_id: (red_fighter_num,) int64 array where 0 means no active goal and
+        1..G*G means goal_id + 1.
         """
         goal_id = np.asarray(goal_id, dtype=np.int64)
         if goal_id.shape != (self.red_fighter_num,):
@@ -158,7 +159,7 @@ class SkyArenaMAPPOEnv:
                 f"goal_id shape must be ({self.red_fighter_num},), got {goal_id.shape}"
             )
         max_goal = self.obs_builder.search_goal_grid_size ** 2
-        self._current_search_goal_id = np.clip(goal_id, 0, max_goal - 1).astype(np.int64, copy=True)
+        self._current_search_goal_id = np.clip(goal_id, 0, max_goal).astype(np.int64, copy=True)
 
     def _build_policy_obs(self, obs: dict, info: dict) -> dict:
         """Build policy observation for red side."""

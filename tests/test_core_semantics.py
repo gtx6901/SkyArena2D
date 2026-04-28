@@ -46,11 +46,11 @@ def _base_config_2v2() -> EnvConfig:
 
 
 # ---------------------------------------------------------------------------
-# 1. target_mask only allows fireable candidates
+# 1. target_mask allows visible/tracked attention candidates
 # ---------------------------------------------------------------------------
 
-def test_target_mask_only_allows_fireable_candidates() -> None:
-    """target_mask[s+1] is True only when candidate_can_long OR candidate_can_short."""
+def test_target_mask_allows_nonfireable_entity_candidates() -> None:
+    """Movement V3 target_action is attention/engagement target, not fire permission."""
     cfg = _base_config_2v2()
     env = SkyArenaEngine(cfg)
     env.reset(seed=0)
@@ -88,19 +88,19 @@ def test_target_mask_only_allows_fireable_candidates() -> None:
         # slot 0 (no target) must always be allowed
         assert target_mask[i, 0], f"Agent {i}: slot 0 must be allowed"
         for s in range(min(2, candidate_can_long.shape[1])):
-            fireable = candidate_can_long[i, s] or candidate_can_short[i, s]
-            assert target_mask[i, s + 1] == fireable, (
+            valid_entity = policy_obs["entity_mask"][i, s]
+            assert target_mask[i, s + 1] == valid_entity, (
                 f"Agent {i} slot {s + 1}: mask={target_mask[i, s + 1]}, "
-                f"fireable={fireable}"
+                f"entity_mask={valid_entity}"
             )
 
 
 # ---------------------------------------------------------------------------
-# 2. target_action > 0 implies selected target is fireable
+# 2. target_action > 0 can select nonfireable entities; fire_mask remains strict
 # ---------------------------------------------------------------------------
 
-def test_selected_target_is_fireable() -> None:
-    """When policy outputs target_action > 0, the selected slot must be fireable."""
+def test_selected_target_can_be_nonfireable_attention_target() -> None:
+    """A visible/tracked slot can be selected even when not fireable."""
     cfg = _base_config_2v2()
     env = SkyArenaEngine(cfg)
     env.reset(seed=0)
@@ -132,11 +132,9 @@ def test_selected_target_is_fireable() -> None:
     can_short = policy_obs["candidate_can_short"]
     for i in range(2):
         for s in range(can_long.shape[1]):
-            # Only test slots that are fireable AND have a valid candidate
-            if (can_long[i, s] or can_short[i, s]) and policy_obs["candidate_ids"][i, s] >= 0:
-                # target_action = s+1 should be valid (mask allows it)
+            if policy_obs["candidate_ids"][i, s] >= 0:
                 assert policy_obs["target_mask"][i, s + 1], (
-                    f"Agent {i} slot {s+1}: fireable but mask disallows"
+                    f"Agent {i} slot {s+1}: valid entity but mask disallows"
                 )
 
 

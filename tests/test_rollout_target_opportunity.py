@@ -3,7 +3,13 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from skyarena2d.rl.algo.rollout import sample_policy_actions
+from skyarena2d.rl.algo.rollout import (
+    INTERCEPT_TARGET,
+    NEAREST_VISIBLE,
+    SELECTED_TARGET,
+    build_batched_movement_mode_mask,
+    sample_policy_actions,
+)
 
 
 class _DummyActor:
@@ -11,8 +17,8 @@ class _DummyActor:
         bsz = batch["self_features"].shape[0]
         device = batch["self_features"].device
 
-        reference_logits = torch.zeros((bsz, 8), dtype=torch.float32, device=device)
-        course_logits = torch.zeros((bsz, 16), dtype=torch.float32, device=device)
+        movement_mode_logits = torch.zeros((bsz, 9), dtype=torch.float32, device=device)
+        course_logits = torch.zeros((bsz, 32), dtype=torch.float32, device=device)
         search_goal_logits = torch.zeros((bsz, 64), dtype=torch.float32, device=device)
         target_logits = torch.full((bsz, 7), -10.0, dtype=torch.float32, device=device)
         target_logits[:, 1] = 10.0
@@ -23,7 +29,7 @@ class _DummyActor:
 
         h, c = hidden_state
         return {
-            "reference_logits": reference_logits,
+            "movement_mode_logits": movement_mode_logits,
             "course_logits": course_logits,
             "search_goal_logits": search_goal_logits,
             "target_logits": target_logits,
@@ -42,7 +48,7 @@ def _build_obs(entity_mask_value: bool) -> dict[str, np.ndarray]:
         "current_search_goal_id": np.zeros((1, 1), dtype=np.int64),
         "agent_id": np.zeros((1, 1), dtype=np.int64),
         "region_features": np.zeros((1, 1, 64, 10), dtype=np.float32),
-        "course_mask": np.ones((1, 1, 16), dtype=bool),
+        "course_mask": np.ones((1, 1, 32), dtype=bool),
         "search_goal_mask": np.ones((1, 1, 64), dtype=bool),
         "target_mask": np.zeros((1, 1, 7), dtype=bool),
         "alive_mask": np.ones((1, 1), dtype=np.float32),
@@ -92,3 +98,38 @@ def test_target_opportunity_uses_entity_mask() -> None:
 
     assert int(out["target"][0, 0]) == 0
     assert int(out["fire"][0, 0]) == 0
+
+
+def test_movement_mode_mask_requires_target_for_selected_modes() -> None:
+    target = torch.tensor([[0, 1]])
+    alive = torch.tensor([[True, True]])
+    entity = torch.tensor([[[True, False], [True, False]]])
+    contact = torch.tensor([[True, True]])
+
+    mask = build_batched_movement_mode_mask(
+        target_action=target,
+        alive_mask=alive,
+        entity_mask=entity,
+        has_active_contact=contact,
+    )
+
+    assert mask[0, 0, NEAREST_VISIBLE]
+    assert not mask[0, 0, SELECTED_TARGET]
+    assert not mask[0, 0, INTERCEPT_TARGET]
+    assert mask[0, 1, SELECTED_TARGET]
+
+
+def test_movement_mode_mask_blocks_nearest_without_entity() -> None:
+    target = torch.tensor([[0]])
+    alive = torch.tensor([[True]])
+    entity = torch.zeros((1, 1, 2), dtype=torch.bool)
+    contact = torch.tensor([[False]])
+
+    mask = build_batched_movement_mode_mask(
+        target_action=target,
+        alive_mask=alive,
+        entity_mask=entity,
+        has_active_contact=contact,
+    )
+
+    assert not mask[0, 0, NEAREST_VISIBLE]
