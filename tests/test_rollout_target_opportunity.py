@@ -11,6 +11,7 @@ class _DummyActor:
         bsz = batch["self_features"].shape[0]
         device = batch["self_features"].device
 
+        reference_logits = torch.zeros((bsz, 8), dtype=torch.float32, device=device)
         course_logits = torch.zeros((bsz, 16), dtype=torch.float32, device=device)
         search_goal_logits = torch.zeros((bsz, 64), dtype=torch.float32, device=device)
         target_logits = torch.full((bsz, 7), -10.0, dtype=torch.float32, device=device)
@@ -22,6 +23,7 @@ class _DummyActor:
 
         h, c = hidden_state
         return {
+            "reference_logits": reference_logits,
             "course_logits": course_logits,
             "search_goal_logits": search_goal_logits,
             "target_logits": target_logits,

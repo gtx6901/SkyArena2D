@@ -1,7 +1,8 @@
 """TensorBoard utilities for SkyArena MAPPO training."""
 from __future__ import annotations
 
-from typing import Dict, Optional
+from numbers import Number
+from typing import Any, Dict, Optional
 
 from .checkpoint import tensorboard_dir
 
@@ -29,9 +30,11 @@ def build_writer(train_cfg: dict, purge_step: Optional[int] = None):
     return SummaryWriter(log_dir=str(tb_dir))
 
 
-def log_scalars(writer, prefix: str, values: Dict[str, float], step: int) -> None:
+def log_scalars(writer, prefix: str, values: Dict[str, Any], step: int) -> None:
     if writer is None:
         return
     for key, value in values.items():
+        if not isinstance(value, Number):
+            continue
         writer.add_scalar(f"{prefix}/{key}", float(value), step)
     writer.flush()

@@ -60,6 +60,12 @@ eval report 中指标按口径分为两类：
 - `*_mean` 后缀：step-mean 口径，在 episode 内每步平均
 - 无 `_mean` 后缀的累计指标（如 `red_kills`、`missiles_launched_long`）：episode-final 口径
 
+### Action / Fire 时序
+
+MAPPO policy 基于当前 obs 选择动作。`engine.step()` 会先按当前观测状态结算 weapon fire，再应用本 step 的 heading / radar / jammer 和运动，运动后的状态用于生成下一帧 obs。
+
+这意味着 target/fire mask 应与当前 obs 中的 fireable 语义对齐；运动造成的距离或可见性变化不应让本 step 已选择的合法 fire 在 engine 内变成 invalid fire。
+
 ### GUI 渲染说明
 
 在 GUI debug overlay 中，两种线的含义不同：

@@ -25,6 +25,53 @@ SkyArena2D 的目标是训练出能够击败 `fix_rule_v2` 的红方 RL Agent。
 
 除 EW 外，不要继续往红方行为里塞新的手写战术规则。红方主要决策应尽量由 RL policy 学习。
 
+## 项目结构
+
+```
+skyarena2d/
+  core/           稳定环境内核（不依赖 RL）：engine, state, config, sensors,
+                  jamming, passive_detection, weapons, reward, metrics,
+                  termination, dynamics, spawn
+  adapters/       obs/action 编码与兼容层：modern_obs_builder, action_decoder,
+                  maca_compat, action_types
+  envs/           环境封装：SkyArenaParallelEnv (PettingZoo), gym_wrapper
+  opponents/      规则对手：fix_rule_v2 (当前主线), fix_rule_like, rush_rule,
+                  patrol_rule, random_rule, no_attack_rule
+  training/       策略接口层：obs_builder, action_adapter, ew_strategy
+  rl/             实验性 MAPPO 层：actor, critic, encoder, rollout, trainer,
+                  search_goal_manager, checkpoint, TensorBoard tools
+  render/         像素渲染与 GUI：pixel_renderer, sprites, palette
+  telemetry/      事件日志、fireability 诊断、replay
+  logging/        JSONL trace, episode_summary
+configs/          环境 YAML 与 MAPPO 训练 YAML
+scripts/          入口脚本：train_mappo.py, eval_rule_vs_rule.py,
+                  play_gui.py, smoke_test_env.py, evaluate_mappo.py
+tests/            23 个测试文件，覆盖 weapons, reward, termination, spawn,
+                  visibility, jamming, sensors, obs shapes, EW, trace
+docs/             ARCHITECTURE.md, CODE_MAP.md, CONFIG_GUIDE.md,
+                  ENTRYPOINTS.md, TRAINING.md
+```
+
+## 运行测试
+
+```bash
+# 快速导入验证
+.venv/bin/python -c "from skyarena2d.core.engine import SkyArenaEngine; print('OK')"
+
+# 运行全部测试
+.venv/bin/python -m pytest tests/ -v
+
+# 运行与环境内核相关的测试（不涉及 RL）
+.venv/bin/python -m pytest tests/ -v --ignore=tests/test_mappo_adapter_shapes.py \
+    --ignore=tests/test_action_adapter_shapes.py \
+    --ignore=tests/test_policy_obs_no_enemy_leak.py
+
+# smoke test
+.venv/bin/python scripts/smoke_test_env.py --config configs/env_10v10_full.yaml --steps 100
+```
+
+测试使用标准 `assert`，无需特殊 fixture。环境测试通常直接构造 `EnvConfig`、创建 `SkyArenaEngine`、手动设置 state、调用 `step()` 然后检查结果。
+
 ## 工程原则
 
 维护者偏好简洁、清晰、可维护的代码。

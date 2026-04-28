@@ -114,6 +114,36 @@ def test_course_action_with_contact():
     )
 
 
+def test_reference_action_selected_target_bearing():
+    """Movement V2: selected-target reference uses target bearing plus course offset."""
+    N = 1
+    own = _make_team(N, "red")
+    adapter = _make_adapter()
+
+    candidate_ids = np.array([[0, -1, -1, -1, -1, -1]], dtype=np.int64)
+    candidate_can_long = np.array([[True, False, False, False, False, False]], dtype=bool)
+    candidate_can_short = np.zeros((N, 6), dtype=bool)
+    entity_features = np.zeros((N, 6, 10), dtype=np.float32)
+    entity_features[0, 0, 3] = 0.0  # bearing 0 degrees
+
+    action = adapter.decode(
+        reference_action=np.array([2], dtype=np.int32),
+        course_action=np.array([1], dtype=np.int32),
+        search_goal_action=np.zeros(N, dtype=np.int32),
+        target_action=np.array([1], dtype=np.int32),
+        fire_action=np.zeros(N, dtype=np.int32),
+        own=own,
+        candidate_ids=candidate_ids,
+        candidate_can_long=candidate_can_long,
+        candidate_can_short=candidate_can_short,
+        has_active_contact=np.array([True], dtype=bool),
+        current_heading=np.array([90.0], dtype=np.float32),
+        entity_features=entity_features,
+    )
+
+    assert abs(action.course[0] - 22.5) < 1e-3
+
+
 def test_search_goal_action_without_contact():
     """Without contact, course should point toward search_goal region center."""
     N = 1
@@ -314,7 +344,7 @@ def test_rule_based_jammer_opens_on_contact_without_actor_head():
     )
 
     assert action.jammer_freq[0] == 0
-    assert action.jammer_freq[1] == 1
+    assert action.jammer_freq[1] == 8
 
 
 def test_rule_based_jammer_memory_holds_then_expires():
@@ -387,5 +417,5 @@ def test_rule_based_jammer_memory_holds_then_expires():
         step_count=13,
     )
 
-    assert held.jammer_freq[0] == 2
+    assert held.jammer_freq[0] == 3
     assert expired.jammer_freq[0] == 0

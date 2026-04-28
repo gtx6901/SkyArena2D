@@ -47,14 +47,37 @@ def test_fire_out_of_range_invalid() -> None:
     state.red.pos[0] = np.array([100.0, 100.0], dtype=np.float32)
     state.blue.pos[0] = np.array([300.0, 100.0], dtype=np.float32)
     before = int(state.red.long_ammo[0])
-    _, reward, _, _, _ = env.step(
+    _, _, _, _, info = env.step(
         {
             "red": {"fighter_action": np.array([[0, 1, 0, 1]], dtype=np.float32), "detector_action": np.zeros((0, 2), dtype=np.float32)},
             "blue": {"fighter_action": np.array([[180, 1, 0, 0]], dtype=np.float32), "detector_action": np.zeros((0, 2), dtype=np.float32)},
         }
     )
     assert int(state.red.long_ammo[0]) == before
-    assert reward["red"] < 0.0
+    assert info["reward_components"]["invalid_fire"]["red"] < 0.0
+
+
+def test_fire_resolves_before_motion_range_change() -> None:
+    cfg = _base_config()
+    cfg.weapon.long_range = 60.0
+    cfg.dynamics.default_fighter_speed = 100.0
+    env = SkyArenaEngine(cfg)
+    env.reset(seed=0)
+    state = env.get_state()
+    state.red.pos[0] = np.array([100.0, 100.0], dtype=np.float32)
+    state.blue.pos[0] = np.array([150.0, 100.0], dtype=np.float32)
+
+    before = int(state.red.long_ammo[0])
+    _, _, _, _, info = env.step(
+        {
+            "red": {"fighter_action": np.array([[180, 1, 0, 1]], dtype=np.float32), "detector_action": np.zeros((0, 2), dtype=np.float32)},
+            "blue": {"fighter_action": np.array([[0, 1, 0, 0]], dtype=np.float32), "detector_action": np.zeros((0, 2), dtype=np.float32)},
+        }
+    )
+
+    assert int(state.red.long_ammo[0]) == before - 1
+    assert info["metrics"]["red_selected_edges"] == 1
+    assert info["metrics"]["red_invalid_fire_count"] == 0
 
 
 def test_no_ammo_invalid() -> None:

@@ -19,7 +19,7 @@ from .sensors import compute_visible_matrix
 from .spawn import generate_spawn_positions
 from .state import UNIT_DETECTOR, UNIT_FIGHTER, EnvState, LaunchRecord, StepCache, TeamState
 from .termination import check_termination
-from .weapons import WeaponStepResult, process_weapons
+from .weapons import WeaponStepResult, compute_fireable_matrix, process_weapons
 
 
 def _profile_value(profile: FighterProfile | None, key: str, fallback: float | int) -> float | int:
@@ -357,12 +357,26 @@ class SkyArenaEngine:
         self._blue_sensor = compute_visible_matrix(blue, red, blue_jam.jammed_matrix)
         red_passive, _ = compute_passive_detection(red, blue, self.config.passive_detection)
         blue_passive, _ = compute_passive_detection(blue, red, self.config.passive_detection)
+        red_fireable_long, red_fireable_short = compute_fireable_matrix(
+            red,
+            blue,
+            self._red_sensor.visible_matrix,
+            self.config.weapon.allow_passive_fire,
+            red_passive,
+        )
+        blue_fireable_long, blue_fireable_short = compute_fireable_matrix(
+            blue,
+            red,
+            self._blue_sensor.visible_matrix,
+            self.config.weapon.allow_passive_fire,
+            blue_passive,
+        )
 
         empty_weapons = WeaponStepResult(
-            red_fireable_long=np.zeros((red.total_units, blue.total_units), dtype=bool),
-            red_fireable_short=np.zeros((red.total_units, blue.total_units), dtype=bool),
-            blue_fireable_long=np.zeros((blue.total_units, red.total_units), dtype=bool),
-            blue_fireable_short=np.zeros((blue.total_units, red.total_units), dtype=bool),
+            red_fireable_long=red_fireable_long,
+            red_fireable_short=red_fireable_short,
+            blue_fireable_long=blue_fireable_long,
+            blue_fireable_short=blue_fireable_short,
             launch_records=[],
             resolved_records=[],
             red_valid_fire=np.zeros((red.total_units,), dtype=bool),
@@ -440,6 +454,73 @@ class SkyArenaEngine:
         self.state.step_count += 1
         red_decoded, blue_decoded = self._decode_actions(actions)
 
+        # Resolve fire against the current observed state before applying this
+        # step's movement. This matches policy semantics: actions are sampled
+        # from the current obs/cache, then movement produces the next obs.
+        current_red_jam = compute_jammed_matrix(
+            self.state.red,
+            self.state.blue,
+            self.config.radar,
+            self.config.jamming,
+            self.state.rng,
+        )
+        current_blue_jam = compute_jammed_matrix(
+            self.state.blue,
+            self.state.red,
+            self.config.radar,
+            self.config.jamming,
+            self.state.rng,
+        )
+
+        current_red_sensor = compute_visible_matrix(
+            self.state.red,
+            self.state.blue,
+            current_red_jam.jammed_matrix,
+        )
+        current_blue_sensor = compute_visible_matrix(
+            self.state.blue,
+            self.state.red,
+            current_blue_jam.jammed_matrix,
+        )
+
+        current_red_passive, passive_count_red = compute_passive_detection(
+            self.state.red,
+            self.state.blue,
+            self.config.passive_detection,
+        )
+        current_blue_passive, passive_count_blue = compute_passive_detection(
+            self.state.blue,
+            self.state.red,
+            self.config.passive_detection,
+        )
+
+        weapon_result = process_weapons(
+            state=self.state,
+            config=self.config,
+            red_hit_targets=red_decoded.hit_target,
+            blue_hit_targets=blue_decoded.hit_target,
+            red_visible=current_red_sensor.visible_matrix,
+            blue_visible=current_blue_sensor.visible_matrix,
+            red_passive=current_red_passive,
+            blue_passive=current_blue_passive,
+        )
+
+        self.state.red.kills += len(weapon_result.killed_blue)
+        self.state.blue.losses += len(weapon_result.killed_blue)
+        self.state.blue.kills += len(weapon_result.killed_red)
+        self.state.red.losses += len(weapon_result.killed_red)
+
+        update_tracker(
+            state=self.state,
+            weapon_result=weapon_result,
+            red_visible=current_red_sensor.visible_matrix,
+            blue_visible=current_blue_sensor.visible_matrix,
+            red_jammed_count=current_red_jam.jammed_detection_count,
+            blue_jammed_count=current_blue_jam.jammed_detection_count,
+            passive_count_red=passive_count_red,
+            passive_count_blue=passive_count_blue,
+        )
+
         self._apply_side_action(self.state.red, red_decoded)
         self._apply_side_action(self.state.blue, blue_decoded)
 
@@ -476,42 +557,29 @@ class SkyArenaEngine:
         self._red_sensor = compute_visible_matrix(self.state.red, self.state.blue, red_jam.jammed_matrix)
         self._blue_sensor = compute_visible_matrix(self.state.blue, self.state.red, blue_jam.jammed_matrix)
 
-        red_passive, passive_count_red = compute_passive_detection(
+        red_passive, _ = compute_passive_detection(
             self.state.red,
             self.state.blue,
             self.config.passive_detection,
         )
-        blue_passive, passive_count_blue = compute_passive_detection(
+        blue_passive, _ = compute_passive_detection(
             self.state.blue,
             self.state.red,
             self.config.passive_detection,
         )
-
-        weapon_result = process_weapons(
-            state=self.state,
-            config=self.config,
-            red_hit_targets=red_decoded.hit_target,
-            blue_hit_targets=blue_decoded.hit_target,
-            red_visible=self._red_sensor.visible_matrix,
-            blue_visible=self._blue_sensor.visible_matrix,
-            red_passive=red_passive,
-            blue_passive=blue_passive,
+        next_red_fireable_long, next_red_fireable_short = compute_fireable_matrix(
+            self.state.red,
+            self.state.blue,
+            self._red_sensor.visible_matrix,
+            self.config.weapon.allow_passive_fire,
+            red_passive,
         )
-
-        self.state.red.kills += len(weapon_result.killed_blue)
-        self.state.blue.losses += len(weapon_result.killed_blue)
-        self.state.blue.kills += len(weapon_result.killed_red)
-        self.state.red.losses += len(weapon_result.killed_red)
-
-        update_tracker(
-            state=self.state,
-            weapon_result=weapon_result,
-            red_visible=self._red_sensor.visible_matrix,
-            blue_visible=self._blue_sensor.visible_matrix,
-            red_jammed_count=red_jam.jammed_detection_count,
-            blue_jammed_count=blue_jam.jammed_detection_count,
-            passive_count_red=passive_count_red,
-            passive_count_blue=passive_count_blue,
+        next_blue_fireable_long, next_blue_fireable_short = compute_fireable_matrix(
+            self.state.blue,
+            self.state.red,
+            self._blue_sensor.visible_matrix,
+            self.config.weapon.allow_passive_fire,
+            blue_passive,
         )
 
         termination_result = check_termination(self.state, self.config)
@@ -534,10 +602,10 @@ class SkyArenaEngine:
             blue_visible=self._blue_sensor.visible_matrix,
             red_jammed=red_jam.jammed_matrix,
             blue_jammed=blue_jam.jammed_matrix,
-            red_fireable_long=weapon_result.red_fireable_long,
-            red_fireable_short=weapon_result.red_fireable_short,
-            blue_fireable_long=weapon_result.blue_fireable_long,
-            blue_fireable_short=weapon_result.blue_fireable_short,
+            red_fireable_long=next_red_fireable_long,
+            red_fireable_short=next_red_fireable_short,
+            blue_fireable_long=next_blue_fireable_long,
+            blue_fireable_short=next_blue_fireable_short,
             red_passive=red_passive,
             blue_passive=blue_passive,
             launch_records=weapon_result.launch_records,

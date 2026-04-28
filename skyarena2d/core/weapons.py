@@ -400,6 +400,16 @@ def process_weapons(
         fireable_short=blue_fireable_short,
     )
 
+    # After ammo deduction, update fireable matrices to reflect actual remaining ammo.
+    # Without this, fireable can be stale when the last missile is fired (1→0),
+    # because compute_fireable_matrix ran before _queue_and_collect_launches deducted ammo.
+    if state.red.total_units > 0:
+        red_fireable_long = red_fireable_long & (state.red.long_ammo[:, None] > 0)
+        red_fireable_short = red_fireable_short & (state.red.short_ammo[:, None] > 0)
+    if state.blue.total_units > 0:
+        blue_fireable_long = blue_fireable_long & (state.blue.long_ammo[:, None] > 0)
+        blue_fireable_short = blue_fireable_short & (state.blue.short_ammo[:, None] > 0)
+
     launched_events = red_events + blue_events
     delay = config.weapon.attack_effect_delay
     due_events: list[MissileEvent] = []

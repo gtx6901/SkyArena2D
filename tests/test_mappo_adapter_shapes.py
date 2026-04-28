@@ -123,6 +123,7 @@ def test_actor_forward_shapes():
         out = actor.step(flat_batch, (h, c))
 
     assert out["course_logits"].shape == (batch_size * N, 16), f"Got {out['course_logits'].shape}"
+    assert out["reference_logits"].shape == (batch_size * N, 8), f"Got {out['reference_logits'].shape}"
     assert out["search_goal_logits"].shape == (batch_size * N, 64), f"Got {out['search_goal_logits'].shape}"
     assert out["target_logits"].shape == (batch_size * N, 7), f"Got {out['target_logits'].shape}"
     assert out["fire_logits"].shape == (batch_size * N, 7, 3), f"Got {out['fire_logits'].shape}"

@@ -119,14 +119,22 @@ def sample_policy_actions(
     has_active_contact = obs_t["has_active_contact"].reshape(num_envs * num_agents) > 0.5
 
     course_dist = masked_categorical(out["course_logits"], course_mask)
+    reference_mask = torch.ones(
+        out["reference_logits"].shape,
+        dtype=torch.bool,
+        device=out["reference_logits"].device,
+    )
+    reference_dist = masked_categorical(out["reference_logits"], reference_mask)
     search_goal_dist = masked_categorical(out["search_goal_logits"], search_goal_mask)
     target_dist = masked_categorical(out["target_logits"], target_mask)
 
     if deterministic:
+        reference_action = torch.argmax(out["reference_logits"], dim=-1)
         course_action = torch.argmax(out["course_logits"].masked_fill(~course_mask, torch.finfo(out["course_logits"].dtype).min), dim=-1)
         raw_search_goal_action = torch.argmax(out["search_goal_logits"].masked_fill(~search_goal_mask, torch.finfo(out["search_goal_logits"].dtype).min), dim=-1)
         target_action = torch.argmax(out["target_logits"].masked_fill(~target_mask, torch.finfo(out["target_logits"].dtype).min), dim=-1)
     else:
+        reference_action = reference_dist.sample()
         course_action = course_dist.sample()
         raw_search_goal_action = search_goal_dist.sample()
         target_action = target_dist.sample()
@@ -171,11 +179,13 @@ def sample_policy_actions(
     has_fire_opportunity_t = has_target_opportunity_t & torch.any(candidate_can_long_t | candidate_can_short_t, dim=1)
     fire_action = torch.where(has_fire_opportunity_t, fire_action, torch.zeros_like(fire_action))
 
+    reference_log_prob = reference_dist.log_prob(reference_action)
     course_log_prob = course_dist.log_prob(course_action)
     search_goal_log_prob = search_goal_dist.log_prob(executed_search_goal_action)
-    movement_log_prob = torch.where(
-        has_active_contact, course_log_prob,
-        torch.where(alive_mask_t & (~has_active_contact), search_goal_log_prob, torch.zeros_like(course_log_prob)),
+    movement_base_log_prob = reference_log_prob + course_log_prob
+    movement_log_prob = torch.where(alive_mask_t, movement_base_log_prob, torch.zeros_like(movement_base_log_prob))
+    movement_log_prob = movement_log_prob + torch.where(
+        alive_mask_t & (~has_active_contact), search_goal_log_prob, torch.zeros_like(search_goal_log_prob),
     )
     attack_log_prob = target_dist.log_prob(target_action) + fire_dist.log_prob(fire_action)
     total_log_prob = movement_log_prob + torch.where(
@@ -183,6 +193,7 @@ def sample_policy_actions(
     )
 
     result = {
+        "reference": reference_action.reshape(num_envs, num_agents).cpu().numpy(),
         "course": course_action.reshape(num_envs, num_agents).cpu().numpy(),
         "search_goal": executed_search_goal_np.astype(np.int64, copy=False),
         "search_goal_refresh_mask": search_goal_refresh_mask_np,
@@ -204,6 +215,7 @@ class RolloutBatch:
     observations: Dict[str, np.ndarray]
     initial_h: np.ndarray
     initial_c: np.ndarray
+    reference_action: np.ndarray
     course_action: np.ndarray
     search_goal_action: np.ndarray
     search_goal_refresh_mask: np.ndarray

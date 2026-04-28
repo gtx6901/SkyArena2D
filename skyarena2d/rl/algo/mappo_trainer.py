@@ -233,6 +233,34 @@ class SkyArenaMAPPOTrainer:
                 result[key] = float(np.mean(values))
         return result
 
+    @staticmethod
+    def _signed_angle_delta_deg(to_heading: np.ndarray, from_heading: np.ndarray) -> np.ndarray:
+        """Return signed shortest angle delta in degrees in [-180, 180)."""
+        return ((np.asarray(to_heading) - np.asarray(from_heading) + 540.0) % 360.0) - 180.0
+
+    @staticmethod
+    def _nearest_distance_between_alive(own, enemy, own_count: int, enemy_count: int) -> float | None:
+        own_alive = own.alive[:own_count]
+        enemy_alive = enemy.alive[:enemy_count]
+        if not np.any(own_alive) or not np.any(enemy_alive):
+            return None
+        own_pos = own.pos[:own_count][own_alive]
+        enemy_pos = enemy.pos[:enemy_count][enemy_alive]
+        diff = own_pos[:, None, :] - enemy_pos[None, :, :]
+        dist = np.sqrt(np.sum(diff * diff, axis=-1))
+        return float(np.min(dist))
+
+    @staticmethod
+    def _team_spread(own, own_count: int) -> float | None:
+        alive = own.alive[:own_count]
+        if int(np.count_nonzero(alive)) < 2:
+            return None
+        pos = own.pos[:own_count][alive]
+        diff = pos[:, None, :] - pos[None, :, :]
+        dist = np.sqrt(np.sum(diff * diff, axis=-1))
+        tri = np.triu_indices(pos.shape[0], k=1)
+        return float(np.mean(dist[tri]))
+
     def _collect_rollout_step_diagnostics(self, batch: RolloutBatch) -> dict:
         """Compute per-step rollout diagnostics from actions / masks / obs."""
         T, E = batch.reward.shape
@@ -340,6 +368,7 @@ class SkyArenaMAPPOTrainer:
         """Collect rollout_steps of experience from all envs."""
         example_obs = self.current_obs[0]
         rollout_obs = allocate_rollout_obs(example_obs, self.rollout_steps, self.num_envs)
+        rollout_reference = np.zeros((self.rollout_steps, self.num_envs, self.num_agents), dtype=np.int64)
         rollout_course = np.zeros((self.rollout_steps, self.num_envs, self.num_agents), dtype=np.int64)
         rollout_search_goal = np.zeros((self.rollout_steps, self.num_envs, self.num_agents), dtype=np.int64)
         rollout_search_goal_refresh = np.zeros((self.rollout_steps, self.num_envs, self.num_agents), dtype=np.bool_)
@@ -374,6 +403,7 @@ class SkyArenaMAPPOTrainer:
             # Store obs
             for key in rollout_obs:
                 rollout_obs[key][step] = batched_obs[key]
+            rollout_reference[step] = sampled["reference"]
             rollout_course[step] = sampled["course"]
             rollout_search_goal[step] = sampled["search_goal"]
             rollout_search_goal_refresh[step] = sampled["search_goal_refresh_mask"]
@@ -390,11 +420,13 @@ class SkyArenaMAPPOTrainer:
             new_obs_list = []
             for env_idx, env in enumerate(self.envs):
                 course_i = sampled["course"][env_idx]
+                reference_i = sampled["reference"][env_idx]
                 search_goal_i = sampled["search_goal"][env_idx]
                 target_i = sampled["target"][env_idx]
                 fire_i = sampled["fire"][env_idx]
 
                 sky_action = self.action_adapter.decode(
+                    reference_action=reference_i,
                     course_action=course_i,
                     search_goal_action=search_goal_i,
                     target_action=target_i,
@@ -405,6 +437,7 @@ class SkyArenaMAPPOTrainer:
                     candidate_can_short=batched_obs["candidate_can_short"][env_idx],
                     has_active_contact=batched_obs["has_active_contact"][env_idx] > 0.5,
                     current_heading=env.engine.state.red.heading[:env.red_fighter_num],
+                    enemy=env.engine.state.blue,
                     entity_features=batched_obs["entity_features"][env_idx],
                     ew_state_key=env_idx,
                     step_count=env.engine.state.step_count,
@@ -454,6 +487,7 @@ class SkyArenaMAPPOTrainer:
             observations=rollout_obs,
             initial_h=initial_h,
             initial_c=initial_c,
+            reference_action=rollout_reference,
             course_action=rollout_course,
             search_goal_action=rollout_search_goal,
             search_goal_refresh_mask=rollout_search_goal_refresh,
@@ -525,6 +559,7 @@ class SkyArenaMAPPOTrainer:
 
             # Forward pass through actor (step-by-step for LSTM)
             all_course_logits = []
+            all_reference_logits = []
             all_sg_logits = []
             all_target_logits = []
             all_fire_logits = []
@@ -532,12 +567,14 @@ class SkyArenaMAPPOTrainer:
             for t in range(T):
                 step_batch = {k: v[t * E * N:(t + 1) * E * N] for k, v in flat_actor_batch.items()}
                 out = self.actor.step(step_batch, (h, c))
+                all_reference_logits.append(out["reference_logits"])
                 all_course_logits.append(out["course_logits"])
                 all_sg_logits.append(out["search_goal_logits"])
                 all_target_logits.append(out["target_logits"])
                 all_fire_logits.append(out["fire_logits"])
                 h, c = out["next_h"], out["next_c"]
 
+            reference_logits = torch.stack(all_reference_logits, dim=0).reshape(T, E, N, -1)
             course_logits = torch.stack(all_course_logits, dim=0).reshape(T, E, N, -1)
             sg_logits = torch.stack(all_sg_logits, dim=0).reshape(T, E, N, -1)
             target_logits = torch.stack(all_target_logits, dim=0).reshape(T, E, N, -1)
@@ -553,15 +590,19 @@ class SkyArenaMAPPOTrainer:
             candidate_can_long = torch.as_tensor(batch.observations["candidate_can_long"].reshape(T, E, N, -1), dtype=torch.bool, device=self.device)
             candidate_can_short = torch.as_tensor(batch.observations["candidate_can_short"].reshape(T, E, N, -1), dtype=torch.bool, device=self.device)
 
+            reference_act = torch.as_tensor(batch.reference_action.reshape(T, E, N), dtype=torch.long, device=self.device)
             course_act = torch.as_tensor(batch.course_action.reshape(T, E, N), dtype=torch.long, device=self.device)
             sg_act = torch.as_tensor(batch.search_goal_action.reshape(T, E, N), dtype=torch.long, device=self.device)
             target_act = torch.as_tensor(batch.target_action.reshape(T, E, N), dtype=torch.long, device=self.device)
             fire_act = torch.as_tensor(batch.fire_action.reshape(T, E, N), dtype=torch.long, device=self.device)
 
+            reference_mask = torch.ones_like(reference_logits, dtype=torch.bool, device=self.device)
+            reference_dist = masked_categorical(reference_logits.reshape(T * E * N, -1), reference_mask.reshape(T * E * N, -1))
             course_dist = masked_categorical(course_logits.reshape(T * E * N, -1), course_mask.reshape(T * E * N, -1))
             sg_dist = masked_categorical(sg_logits.reshape(T * E * N, -1), sg_mask.reshape(T * E * N, -1))
             target_dist = masked_categorical(target_logits.reshape(T * E * N, -1), target_mask.reshape(T * E * N, -1))
 
+            reference_lp = reference_dist.log_prob(reference_act.reshape(T * E * N)).reshape(T, E, N)
             course_lp = course_dist.log_prob(course_act.reshape(T * E * N)).reshape(T, E, N)
             sg_lp = sg_dist.log_prob(sg_act.reshape(T * E * N)).reshape(T, E, N)
             target_lp = target_dist.log_prob(target_act.reshape(T * E * N)).reshape(T, E, N)
@@ -581,10 +622,10 @@ class SkyArenaMAPPOTrainer:
             fire_lp = fire_dist.log_prob(fire_act.reshape(T * E * N)).reshape(T, E, N)
 
             has_target_opportunity = alive_mask & has_contact & torch.any(entity_mask_t, dim=-1)
-            movement_log_prob = torch.where(
-                has_contact,
-                course_lp,
-                torch.where(alive_mask & (~has_contact), sg_lp, torch.zeros_like(course_lp)),
+            movement_base_log_prob = reference_lp + course_lp
+            movement_log_prob = torch.where(alive_mask, movement_base_log_prob, torch.zeros_like(movement_base_log_prob))
+            movement_log_prob = movement_log_prob + torch.where(
+                alive_mask & (~has_contact), sg_lp, torch.zeros_like(sg_lp),
             )
             attack_log_prob = target_lp + fire_lp
             new_log_prob = movement_log_prob + torch.where(
@@ -608,7 +649,7 @@ class SkyArenaMAPPOTrainer:
             vf_loss = F.mse_loss(new_value, returns_t)
 
             # Entropy
-            ent = (course_dist.entropy() + sg_dist.entropy()).mean()
+            ent = (reference_dist.entropy() + course_dist.entropy() + sg_dist.entropy()).mean()
 
             loss = pg_loss + self.vf_coef * vf_loss - self.ent_coef * ent
             self.optimizer.zero_grad()
@@ -830,6 +871,17 @@ class SkyArenaMAPPOTrainer:
             seed_offset=9999,
             deterministic_reset=deterministic_reset,
         )
+        eval_search_goal_manager = TeamSearchPlanner(
+            TeamSearchPlannerConfig(
+                num_envs=1,
+                num_agents=self.num_agents,
+                map_size_x=eval_env.engine_config.map.width,
+                map_size_y=eval_env.engine_config.map.height,
+                search_goal_grid_size=self.search_goal_grid_size,
+                goal_hold_steps=int(self.env_cfg.get("goal_hold_steps", 10)),
+                goal_reach_radius=float(self.env_cfg.get("goal_reach_radius", 90.0)),
+            )
+        )
         if render_mode is not None:
             eval_env.engine.render_mode = render_mode
 
@@ -905,12 +957,31 @@ class SkyArenaMAPPOTrainer:
         diag_tgt_can_long_sum = 0.0
         diag_tgt_can_short_sum = 0.0
         diag_tgt_fireable_sum = 0.0
+        diag_heading_change_sum = 0.0
+        diag_heading_change_count = 0
+        diag_heading_flip_count = 0
+        diag_heading_flip_denom = 0
+        diag_reference_hist = np.zeros(8, dtype=np.int64)
+        diag_course_hist = np.zeros(16, dtype=np.int64)
+        diag_contact_agents_sum = 0.0
+        diag_late_contact_sum = 0.0
+        diag_late_contact_count = 0
+        diag_nearest_blue_distance_sum = 0.0
+        diag_nearest_blue_distance_count = 0
+        diag_nearest_blue_distance_final_sum = 0.0
+        diag_nearest_blue_distance_final_count = 0
+        diag_search_goal_refresh_sum = 0
+        diag_search_goal_refresh_denom = 0
+        diag_red_team_spread_sum = 0.0
+        diag_red_team_spread_count = 0
+        diag_blue_alive_final_sum = 0.0
         episode_records: list = []
 
         for ep in range(num_episodes):
             if eval_prefix == "gui_eval":
                 print(f"[gui_eval] episode {ep + 1}/{num_episodes} start", flush=True)
             obs = eval_env.reset()
+            eval_search_goal_manager.reset_all()
             self.action_adapter.reset_ew_state("eval")
             h = torch.zeros((1, self.num_agents, hidden_dim), dtype=torch.float32, device=self.device)
             c = torch.zeros((1, self.num_agents, hidden_dim), dtype=torch.float32, device=self.device)
@@ -953,6 +1024,24 @@ class SkyArenaMAPPOTrainer:
             ep_tgt_can_long_sum = 0.0
             ep_tgt_can_short_sum = 0.0
             ep_tgt_fireable_sum = 0.0
+            # Movement/search diagnostics per episode.
+            ep_heading_change_sum = 0.0
+            ep_heading_change_count = 0
+            ep_heading_flip_count = 0
+            ep_heading_flip_denom = 0
+            ep_prev_turn_delta = np.zeros(self.num_agents, dtype=np.float32)
+            ep_prev_turn_valid = np.zeros(self.num_agents, dtype=bool)
+            ep_reference_hist = np.zeros(8, dtype=np.int64)
+            ep_course_hist = np.zeros(16, dtype=np.int64)
+            ep_contact_agents_sum = 0.0
+            ep_late_contact_sum = 0.0
+            ep_late_contact_count = 0
+            ep_nearest_blue_distance_sum = 0.0
+            ep_nearest_blue_distance_count = 0
+            ep_search_goal_refresh_sum = 0
+            ep_search_goal_refresh_denom = 0
+            ep_red_team_spread_sum = 0.0
+            ep_red_team_spread_count = 0
 
             frame_dir: Optional[Path] = None
             if save_visual and render_mode == "rgb_array" and output_dir is not None:
@@ -965,6 +1054,7 @@ class SkyArenaMAPPOTrainer:
                 with torch.no_grad():
                     sampled = sample_policy_actions(
                         self.actor, obs_batch, (h, c), self.device, deterministic=deterministic,
+                        search_goal_manager=eval_search_goal_manager,
                         return_diagnostics=True,
                     )
                 sky_action = self.action_adapter.decode(
@@ -978,6 +1068,8 @@ class SkyArenaMAPPOTrainer:
                     candidate_can_short=obs_batch["candidate_can_short"][0],
                     has_active_contact=obs_batch["has_active_contact"][0] > 0.5,
                     current_heading=eval_env.engine.state.red.heading[:eval_env.red_fighter_num],
+                    reference_action=sampled["reference"][0],
+                    enemy=eval_env.engine.state.blue,
                     entity_features=obs_batch["entity_features"][0],
                     ew_state_key="eval",
                     step_count=eval_env.engine.state.step_count,
@@ -1006,6 +1098,58 @@ class SkyArenaMAPPOTrainer:
                     ep_tgt_can_long_sum += float(np.sum(tgt_long))
                     ep_tgt_can_short_sum += float(np.sum(tgt_short))
                     ep_tgt_fireable_sum += float(np.sum(tgt_fireable))
+
+                current_heading = eval_env.engine.state.red.heading[:eval_env.red_fighter_num].copy()
+                turn_delta = self._signed_angle_delta_deg(sky_action.course, current_heading)
+                alive_contact = alive & (obs_batch["has_active_contact"][0] > 0.5)
+                if np.any(alive):
+                    ep_heading_change_sum += float(np.sum(np.abs(turn_delta[alive])))
+                    ep_heading_change_count += int(np.count_nonzero(alive))
+                    ep_contact_agents_sum += float(np.count_nonzero(alive_contact))
+                    ep_reference_hist += np.bincount(
+                        np.asarray(sampled["reference"][0][alive], dtype=np.int64),
+                        minlength=8,
+                    )[:8]
+                    ep_course_hist += np.bincount(
+                        np.asarray(sampled["course"][0][alive], dtype=np.int64),
+                        minlength=16,
+                    )[:16]
+                    refresh_mask = np.asarray(sampled["search_goal_refresh_mask"][0], dtype=bool)
+                    search_active = alive & (~(obs_batch["has_active_contact"][0] > 0.5))
+                    ep_search_goal_refresh_sum += int(np.count_nonzero(refresh_mask & search_active))
+                    ep_search_goal_refresh_denom += int(np.count_nonzero(search_active))
+
+                    turn_active = alive_contact
+                    valid_flip = turn_active & ep_prev_turn_valid
+                    if np.any(valid_flip):
+                        prev = ep_prev_turn_delta[valid_flip]
+                        cur = turn_delta[valid_flip]
+                        strong = (np.abs(prev) >= 11.25) & (np.abs(cur) >= 11.25)
+                        ep_heading_flip_count += int(np.count_nonzero(strong & (np.sign(prev) != np.sign(cur))))
+                        ep_heading_flip_denom += int(np.count_nonzero(strong))
+                    ep_prev_turn_delta[turn_active] = turn_delta[turn_active]
+                    ep_prev_turn_valid[turn_active] = True
+                    ep_prev_turn_valid[~turn_active] = False
+
+                    max_steps_ref = max_steps if max_steps is not None else eval_env.engine_config.max_steps
+                    if eval_env.engine.state.step_count >= int(0.75 * max(max_steps_ref, 1)):
+                        ep_late_contact_sum += 1.0 if np.any(alive_contact) else 0.0
+                        ep_late_contact_count += 1
+
+                nearest_dist = self._nearest_distance_between_alive(
+                    eval_env.engine.state.red,
+                    eval_env.engine.state.blue,
+                    eval_env.red_fighter_num,
+                    eval_env.blue_fighter_num,
+                )
+                if nearest_dist is not None:
+                    ep_nearest_blue_distance_sum += nearest_dist
+                    ep_nearest_blue_distance_count += 1
+                team_spread = self._team_spread(eval_env.engine.state.red, eval_env.red_fighter_num)
+                if team_spread is not None:
+                    ep_red_team_spread_sum += team_spread
+                    ep_red_team_spread_count += 1
+
                 eval_env.set_current_search_goal_id(sampled["search_goal"][0])
                 obs, reward, done, info = eval_env.step(sky_action)
                 ep_return += float(reward)
@@ -1180,6 +1324,20 @@ class SkyArenaMAPPOTrainer:
             ep_tgt_can_long_rate = ep_tgt_can_long_sum / ep_tgt_fireable_steps
             ep_tgt_can_short_rate = ep_tgt_can_short_sum / ep_tgt_fireable_steps
             ep_tgt_fireable_rate = ep_tgt_fireable_sum / ep_tgt_fireable_steps
+            ep_heading_change_mean = ep_heading_change_sum / max(ep_heading_change_count, 1)
+            ep_heading_flip_rate = ep_heading_flip_count / max(ep_heading_flip_denom, 1)
+            ep_contact_agents_mean = ep_contact_agents_sum / nz_steps
+            ep_late_contact_rate = ep_late_contact_sum / max(ep_late_contact_count, 1)
+            ep_nearest_blue_distance_mean = ep_nearest_blue_distance_sum / max(ep_nearest_blue_distance_count, 1)
+            ep_nearest_blue_distance_final = self._nearest_distance_between_alive(
+                eval_env.engine.state.red,
+                eval_env.engine.state.blue,
+                eval_env.red_fighter_num,
+                eval_env.blue_fighter_num,
+            )
+            ep_search_goal_refresh_rate = ep_search_goal_refresh_sum / max(ep_search_goal_refresh_denom, 1)
+            ep_red_team_spread = ep_red_team_spread_sum / max(ep_red_team_spread_count, 1)
+            ep_blue_alive_final = int(metrics.get("blue_alive", eval_env.engine.state.blue.fighter_alive_count))
 
             episode_records.append({
                 "episode": ep,
@@ -1221,6 +1379,19 @@ class SkyArenaMAPPOTrainer:
                 "target_selected_nonfireable_rate": 1.0 - float(ep_tgt_fireable_rate),
                 "selected_target_can_long_rate": float(ep_tgt_can_long_rate),
                 "selected_target_can_short_rate": float(ep_tgt_can_short_rate),
+                "heading_change_mean": float(ep_heading_change_mean),
+                "heading_flip_rate": float(ep_heading_flip_rate),
+                "reference_action_histogram": ep_reference_hist.astype(int).tolist(),
+                "course_action_histogram": ep_course_hist.astype(int).tolist(),
+                "contact_agents_mean": float(ep_contact_agents_mean),
+                "late_contact_rate": float(ep_late_contact_rate),
+                "nearest_blue_distance_mean": float(ep_nearest_blue_distance_mean),
+                "nearest_blue_distance_final": (
+                    None if ep_nearest_blue_distance_final is None else float(ep_nearest_blue_distance_final)
+                ),
+                "search_goal_refresh_rate": float(ep_search_goal_refresh_rate),
+                "red_team_spread": float(ep_red_team_spread),
+                "blue_alive_final": int(ep_blue_alive_final),
             })
 
             diag_missiles_long += int(metrics.get("missiles_launched_long", 0))
@@ -1248,6 +1419,25 @@ class SkyArenaMAPPOTrainer:
             diag_tgt_can_long_sum += ep_tgt_can_long_sum
             diag_tgt_can_short_sum += ep_tgt_can_short_sum
             diag_tgt_fireable_sum += ep_tgt_fireable_sum
+            diag_heading_change_sum += ep_heading_change_sum
+            diag_heading_change_count += ep_heading_change_count
+            diag_heading_flip_count += ep_heading_flip_count
+            diag_heading_flip_denom += ep_heading_flip_denom
+            diag_reference_hist += ep_reference_hist
+            diag_course_hist += ep_course_hist
+            diag_contact_agents_sum += ep_contact_agents_sum
+            diag_late_contact_sum += ep_late_contact_sum
+            diag_late_contact_count += ep_late_contact_count
+            diag_nearest_blue_distance_sum += ep_nearest_blue_distance_sum
+            diag_nearest_blue_distance_count += ep_nearest_blue_distance_count
+            if ep_nearest_blue_distance_final is not None:
+                diag_nearest_blue_distance_final_sum += float(ep_nearest_blue_distance_final)
+                diag_nearest_blue_distance_final_count += 1
+            diag_search_goal_refresh_sum += ep_search_goal_refresh_sum
+            diag_search_goal_refresh_denom += ep_search_goal_refresh_denom
+            diag_red_team_spread_sum += ep_red_team_spread_sum
+            diag_red_team_spread_count += ep_red_team_spread_count
+            diag_blue_alive_final_sum += float(ep_blue_alive_final)
 
             diag_fire_argmax_nonzero += ep_fire_argmax_nonzero
             diag_blue_fireable += int(metrics.get("blue_fireable_edges", 0))
@@ -1293,7 +1483,8 @@ class SkyArenaMAPPOTrainer:
         red_fire_nonzero_rate = diag_fire_nonzero_steps / diag_denom
         red_attempted_edges = diag_attempted_edges / diag_denom
         red_selected_edges = diag_selected_edges / diag_denom
-        red_invalid_fire_count = float(diag_invalid_fire)
+        red_invalid_fire_count_total = float(diag_invalid_fire)
+        red_invalid_fire_count_per_episode = red_invalid_fire_count_total / max(num_episodes, 1)
         red_fireable_edges = diag_fireable_edges / diag_fireable_denom
         red_fireable_agents = diag_fireable_agents / diag_fireable_denom
         red_candidate_valid_count = diag_valid_candidates / diag_denom
@@ -1305,7 +1496,8 @@ class SkyArenaMAPPOTrainer:
         blue_attempted_edges = diag_blue_attempted / diag_denom
         blue_selected_edges = diag_blue_selected / diag_denom
         blue_fireable_edges = diag_blue_fireable / max(diag_blue_fireable_count, 1)
-        blue_invalid_fire_count = float(diag_blue_invalid)
+        blue_invalid_fire_count_total = float(diag_blue_invalid)
+        blue_invalid_fire_count_per_episode = blue_invalid_fire_count_total / max(num_episodes, 1)
         sel_exch_mean = diag_sel_exch / max(diag_sel_exch_steps, 1)
 
         # Fire head diagnostics
@@ -1324,6 +1516,19 @@ class SkyArenaMAPPOTrainer:
         target_selected_fireable_rate = diag_tgt_fireable_sum / tgt_fireable_denom
         selected_target_can_long_rate = diag_tgt_can_long_sum / tgt_fireable_denom
         selected_target_can_short_rate = diag_tgt_can_short_sum / tgt_fireable_denom
+        heading_change_mean = diag_heading_change_sum / max(diag_heading_change_count, 1)
+        heading_flip_rate = diag_heading_flip_count / max(diag_heading_flip_denom, 1)
+        reference_action_histogram = diag_reference_hist.astype(int).tolist()
+        course_action_histogram = diag_course_hist.astype(int).tolist()
+        contact_agents_mean = diag_contact_agents_sum / diag_denom
+        late_contact_rate = diag_late_contact_sum / max(diag_late_contact_count, 1)
+        nearest_blue_distance_mean = diag_nearest_blue_distance_sum / max(diag_nearest_blue_distance_count, 1)
+        nearest_blue_distance_final = (
+            diag_nearest_blue_distance_final_sum / max(diag_nearest_blue_distance_final_count, 1)
+        )
+        search_goal_refresh_rate = diag_search_goal_refresh_sum / max(diag_search_goal_refresh_denom, 1)
+        red_team_spread = diag_red_team_spread_sum / max(diag_red_team_spread_count, 1)
+        blue_alive_final = diag_blue_alive_final_sum / max(num_episodes, 1)
 
         # --- Write eval report ---
         if write_report:
@@ -1349,8 +1554,10 @@ class SkyArenaMAPPOTrainer:
                 "blue_attempted_edges_mean": blue_attempted_edges,
                 "red_selected_edges_mean": red_selected_edges,
                 "blue_selected_edges_mean": blue_selected_edges,
-                "red_invalid_fire_count_mean": red_invalid_fire_count,
-                "blue_invalid_fire_count_mean": blue_invalid_fire_count,
+                "red_invalid_fire_count_mean": red_invalid_fire_count_per_episode,
+                "blue_invalid_fire_count_mean": blue_invalid_fire_count_per_episode,
+                "red_invalid_fire_count_total": red_invalid_fire_count_total,
+                "blue_invalid_fire_count_total": blue_invalid_fire_count_total,
                 "selected_expected_exchange_mean": sel_exch_mean,
                 # Episode-final cumulative metrics
                 "missiles_launched_long": diag_missiles_long / n_eps,
@@ -1372,13 +1579,25 @@ class SkyArenaMAPPOTrainer:
                 "target_selected_nonfireable_rate": 1.0 - target_selected_fireable_rate,
                 "selected_target_can_long_rate": selected_target_can_long_rate,
                 "selected_target_can_short_rate": selected_target_can_short_rate,
+                # Movement/search diagnostics
+                "heading_change_mean": heading_change_mean,
+                "heading_flip_rate": heading_flip_rate,
+                "reference_action_histogram": reference_action_histogram,
+                "course_action_histogram": course_action_histogram,
+                "contact_agents_mean": contact_agents_mean,
+                "late_contact_rate": late_contact_rate,
+                "nearest_blue_distance_mean": nearest_blue_distance_mean,
+                "nearest_blue_distance_final": nearest_blue_distance_final,
+                "search_goal_refresh_rate": search_goal_refresh_rate,
+                "red_team_spread": red_team_spread,
+                "blue_alive_final": blue_alive_final,
                 # Backward-compat aliases
                 "target_nonzero_rate": red_target_nonzero_rate,
                 "fire_nonzero_rate": red_fire_nonzero_rate,
                 "red_fireable_edges": red_fireable_edges,
                 "red_attempted_edges": red_attempted_edges,
                 "red_selected_edges": red_selected_edges,
-                "red_invalid_fire_count": red_invalid_fire_count,
+                "red_invalid_fire_count": red_invalid_fire_count_per_episode,
             }
             self._write_eval_report(
                 kind=kind,
@@ -1410,7 +1629,8 @@ class SkyArenaMAPPOTrainer:
             "fire_action_nonzero_rate": red_fire_nonzero_rate,
             "red_attempted_edges": red_attempted_edges,
             "red_selected_edges": red_selected_edges,
-            "red_invalid_fire_count": red_invalid_fire_count,
+            "red_invalid_fire_count": red_invalid_fire_count_per_episode,
+            "red_invalid_fire_count_total": red_invalid_fire_count_total,
             # Fire head diagnostics
             "fire_argmax_nonzero_rate": fire_argmax_nonzero_rate,
             "fire_noop_prob_mean": fire_noop_prob_mean,
@@ -1425,12 +1645,25 @@ class SkyArenaMAPPOTrainer:
             "target_selected_nonfireable_rate": 1.0 - target_selected_fireable_rate,
             "selected_target_can_long_rate": selected_target_can_long_rate,
             "selected_target_can_short_rate": selected_target_can_short_rate,
+            # Movement/search diagnostics
+            "heading_change_mean": heading_change_mean,
+            "heading_flip_rate": heading_flip_rate,
+            "reference_action_histogram": reference_action_histogram,
+            "course_action_histogram": course_action_histogram,
+            "contact_agents_mean": contact_agents_mean,
+            "late_contact_rate": late_contact_rate,
+            "nearest_blue_distance_mean": nearest_blue_distance_mean,
+            "nearest_blue_distance_final": nearest_blue_distance_final,
+            "search_goal_refresh_rate": search_goal_refresh_rate,
+            "red_team_spread": red_team_spread,
+            "blue_alive_final": blue_alive_final,
             # Diagnostics — prefixed for backward compat
             "diagnostics_red_target_nonzero_rate": red_target_nonzero_rate,
             "diagnostics_red_fire_nonzero_rate": red_fire_nonzero_rate,
             "diagnostics_red_attempted_edges": red_attempted_edges,
             "diagnostics_red_selected_edges": red_selected_edges,
-            "diagnostics_red_invalid_fire_count": red_invalid_fire_count,
+            "diagnostics_red_invalid_fire_count": red_invalid_fire_count_per_episode,
+            "diagnostics_red_invalid_fire_count_total": red_invalid_fire_count_total,
             "diagnostics_red_fireable_edges": red_fireable_edges,
             "diagnostics_red_fireable_agents": red_fireable_agents,
             "diagnostics_red_candidate_valid_count": red_candidate_valid_count,

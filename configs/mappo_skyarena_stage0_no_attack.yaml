@@ -1,5 +1,5 @@
 train:
-  experiment_name: stage0_no_attack
+  experiment_name: stage0_no_attack_movement_v2
   train_dir: train_dir/skyarena_mappo_train
   seed: 42
   device: cuda
@@ -24,7 +24,7 @@ env:
   blue_rule: no_attack_rule
   candidate_slots: 6
   search_goal_grid_size: 8
-  goal_hold_steps: 10
+  goal_hold_steps: 50
   goal_reach_radius: 90.0
   track_memory_steps: 10
   use_jammer_strategy: true
