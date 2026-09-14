@@ -67,6 +67,7 @@ logging:
 evaluation:
   policy_eval_interval: 50000
   policy_eval_episodes: 10
+  policy_eval_workers: 10
   gui_eval_enabled: false
   gui_eval_interval: 0
   gui_eval_episodes: 1

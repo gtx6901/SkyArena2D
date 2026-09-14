@@ -58,6 +58,38 @@ def test_subprocess_runner_matches_serial_seeded_trajectory() -> None:
         parallel.close()
 
 
+def test_parallel_eval_offsets_match_serial_seed_sequence() -> None:
+    cfg = load_mappo_config("configs/mappo_skyarena_baseline_v2_smoke.yaml")
+    cfg["env"]["opponent_pool"] = []
+    serial = SerialEnvRunner(
+        cfg,
+        num_envs=1,
+        seed_offsets=[9999],
+        deterministic_reset=True,
+    )
+    parallel = SubprocessEnvRunner(
+        cfg,
+        num_envs=3,
+        num_workers=3,
+        seed_offsets=[9999, 10000, 10001],
+        deterministic_reset=True,
+    )
+    try:
+        serial_observations = [serial.reset_all()[0]]
+        serial_observations.extend(serial.reset_at(0) for _ in range(2))
+        parallel_observations = parallel.reset_all()
+
+        assert serial.last_reset_seeds[0] == 10043
+        assert parallel.last_reset_seeds == [10041, 10042, 10043]
+        for left, right in zip(
+            serial_observations, parallel_observations, strict=True
+        ):
+            _assert_observations_equal(left, right)
+    finally:
+        serial.close()
+        parallel.close()
+
+
 def test_subprocess_pool_results_are_recorded_centrally() -> None:
     parallel = object.__new__(SubprocessEnvRunner)
     parallel.num_envs = 2

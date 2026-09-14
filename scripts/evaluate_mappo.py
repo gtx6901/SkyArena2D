@@ -16,6 +16,9 @@ def main():
     parser.add_argument("--config", default="configs/mappo_skyarena_baseline_v2.yaml")
     parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument("--device", default=None)
+    parser.add_argument("--train_dir", default=None)
+    parser.add_argument("--experiment_name", default=None)
+    parser.add_argument("--eval_workers", type=int, default=None)
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--render_mode", choices=["human", "rgb_array"], default=None)
@@ -26,6 +29,12 @@ def main():
     cfg = load_mappo_config(args.config)
     if args.device:
         cfg["train"]["device"] = args.device
+    if args.train_dir:
+        cfg["train"]["train_dir"] = args.train_dir
+    if args.experiment_name:
+        cfg["train"]["experiment_name"] = args.experiment_name
+    if args.eval_workers:
+        cfg.setdefault("evaluation", {})["policy_eval_workers"] = args.eval_workers
 
     trainer = SkyArenaMAPPOTrainer(cfg)
     render_mode = "human" if args.gui_eval_human else args.render_mode

@@ -764,6 +764,193 @@ class SkyArenaMAPPOTrainer:
         print(f"[eval_report] wrote {path}", flush=True)
         return path
 
+    def _build_eval_adapter(self, engine_cfg, candidate_slots: int) -> SkyArenaActionAdapter:
+        return SkyArenaActionAdapter(
+            candidate_slots=candidate_slots,
+            course_bins=9,
+            map_width=engine_cfg.map.width,
+            map_height=engine_cfg.map.height,
+            radar_freq_count=self.env_cfg.get(
+                "radar_freq_count", engine_cfg.radar.freq_count
+            ),
+            use_jammer_strategy=self.env_cfg.get("use_jammer_strategy", True),
+            jammer_range=self.env_cfg.get("jammer_range", engine_cfg.jamming.range),
+            max_jammers_per_side=self.env_cfg.get("max_jammers_per_side", 3),
+        )
+
+    @staticmethod
+    def _parallel_eval_actions(
+        adapter,
+        eval_runner,
+        observations,
+        active,
+        sampled,
+        target_nonzero,
+        fire_nonzero,
+    ) -> list:
+        actions = []
+        for local_index, episode in enumerate(active):
+            obs = observations[episode]
+            context = eval_runner.action_contexts[episode]
+            actions.append(adapter.decode(
+                course_action=sampled["course"][local_index],
+                target_action=sampled["target"][local_index],
+                fire_action=sampled["fire"][local_index],
+                own=context,
+                candidate_ids=obs["candidate_ids"],
+                candidate_can_long=obs["candidate_can_long"],
+                candidate_can_short=obs["candidate_can_short"],
+                has_active_contact=obs["has_active_contact"] > 0.5,
+                current_heading=context.current_heading,
+                entity_features=obs["entity_features"],
+                ew_state_key=episode,
+                step_count=context.step_count,
+            ))
+            alive = obs["alive_mask"] > 0.5
+            target_nonzero[episode] += np.count_nonzero(
+                (sampled["target"][local_index] > 0) & alive
+            )
+            fire_nonzero[episode] += np.count_nonzero(
+                (sampled["fire"][local_index] > 0) & alive
+            )
+        return actions
+
+    @staticmethod
+    def _finalize_parallel_eval_records(
+        eval_runner,
+        episode_returns,
+        steps,
+        target_nonzero,
+        fire_nonzero,
+        metric_totals,
+        final_info,
+    ) -> list[dict]:
+        records = []
+        for episode, info in enumerate(final_info):
+            final_metrics = (
+                dict(info.get("metrics", {}))
+                if isinstance(info.get("metrics"), dict)
+                else {}
+            )
+            final_metrics.update(metric_totals[episode])
+            records.append({
+                "episode": episode,
+                "seed": eval_runner.last_reset_seeds[episode],
+                "winner": str(info.get("winner", "draw")),
+                "episode_return": float(episode_returns[episode]),
+                "episode_len": int(steps[episode]),
+                "target_action_nonzero_count": int(target_nonzero[episode]),
+                "fire_action_nonzero_count": int(fire_nonzero[episode]),
+                **final_metrics,
+            })
+        return records
+
+    def _parallel_eval_records(
+        self,
+        eval_cfg: dict,
+        num_episodes: int,
+        *,
+        deterministic: bool,
+        deterministic_reset: bool,
+        max_steps: int | None,
+    ) -> list[dict]:
+        eval_workers = min(
+            num_episodes,
+            int(self.eval_cfg.get("policy_eval_workers", num_episodes)),
+        )
+        runner_cfg = {
+            **eval_cfg,
+            "train": {
+                **self.train_cfg,
+                "env_backend": "subprocess",
+                "env_workers": eval_workers,
+            },
+        }
+        eval_runner = build_env_runner(
+            runner_cfg,
+            num_episodes,
+            seed_offsets=[9999 + episode for episode in range(num_episodes)],
+            deterministic_reset=deterministic_reset,
+        )
+        adapter = self._build_eval_adapter(
+            eval_runner.engine_config,
+            eval_runner.obs_shapes["entity_features"][1],
+        )
+        observations = eval_runner.reset_all()
+        h = torch.zeros(
+            num_episodes,
+            self.num_agents,
+            self.actor.lstm_hidden_dim,
+            device=self.device,
+        )
+        c = torch.zeros_like(h)
+        episode_returns = np.zeros(num_episodes, dtype=np.float64)
+        steps = np.zeros(num_episodes, dtype=np.int32)
+        target_nonzero = np.zeros(num_episodes, dtype=np.int64)
+        fire_nonzero = np.zeros(num_episodes, dtype=np.int64)
+        metric_totals = [{} for _ in range(num_episodes)]
+        final_info: list[dict[str, Any]] = [{} for _ in range(num_episodes)]
+        active = list(range(num_episodes))
+        try:
+            while active:
+                if max_steps is not None:
+                    reached_limit = [index for index in active if steps[index] >= max_steps]
+                    for index in reached_limit:
+                        active.remove(index)
+                    if not active:
+                        break
+                obs_batch = {
+                    key: np.stack([observations[index][key] for index in active])
+                    for key in observations[active[0]]
+                }
+                sampled = sample_policy_actions(
+                    self.actor,
+                    obs_batch,
+                    (h[active], c[active]),
+                    self.device,
+                    deterministic,
+                )
+                actions = self._parallel_eval_actions(
+                    adapter,
+                    eval_runner,
+                    observations,
+                    active,
+                    sampled,
+                    target_nonzero,
+                    fire_nonzero,
+                )
+                results = eval_runner.step_many(active, actions)
+                next_active = []
+                for local_index, episode in enumerate(active):
+                    obs, team_reward, done, info = results[episode]
+                    observations[episode] = obs
+                    episode_returns[episode] += float(team_reward)
+                    steps[episode] += 1
+                    h[episode].copy_(sampled["next_h"][local_index])
+                    c[episode].copy_(sampled["next_c"][local_index])
+                    step_metrics = info.get("metrics", {})
+                    if isinstance(step_metrics, Mapping):
+                        _accumulate_eval_step_metrics(
+                            metric_totals[episode], step_metrics
+                        )
+                    final_info[episode] = info
+                    hit_limit = max_steps is not None and steps[episode] >= max_steps
+                    if not done and not hit_limit:
+                        next_active.append(episode)
+                active = next_active
+        finally:
+            eval_runner.close()
+
+        return self._finalize_parallel_eval_records(
+            eval_runner,
+            episode_returns,
+            steps,
+            target_nonzero,
+            fire_nonzero,
+            metric_totals,
+            final_info,
+        )
+
     def evaluate(
         self,
         num_episodes: int = 10,
@@ -787,29 +974,34 @@ class SkyArenaMAPPOTrainer:
                 checkpoint_path, self.actor, self.critic, map_location=self.device
             )
         eval_cfg = {**self.cfg, "env": {**self.env_cfg, "opponent_pool": []}}
+        evaluation_start = time.perf_counter()
+        if render_mode is None and deterministic_reset and int(num_episodes) > 1:
+            was_training = self.actor.training
+            self.actor.eval()
+            try:
+                records = self._parallel_eval_records(
+                    eval_cfg,
+                    int(num_episodes),
+                    deterministic=deterministic,
+                    deterministic_reset=deterministic_reset,
+                    max_steps=max_steps,
+                )
+            finally:
+                self.actor.train(was_training)
+        else:
+            records = []
         eval_env = SkyArenaMAPPOEnv(
             eval_cfg, seed_offset=9999, deterministic_reset=deterministic_reset
         )
-        adapter = SkyArenaActionAdapter(
-            candidate_slots=eval_env.obs_builder.entity_slots,
-            course_bins=9,
-            map_width=eval_env.engine_config.map.width,
-            map_height=eval_env.engine_config.map.height,
-            radar_freq_count=self.env_cfg.get(
-                "radar_freq_count", eval_env.engine_config.radar.freq_count
-            ),
-            use_jammer_strategy=self.env_cfg.get("use_jammer_strategy", True),
-            jammer_range=self.env_cfg.get(
-                "jammer_range", eval_env.engine_config.jamming.range
-            ),
-            max_jammers_per_side=self.env_cfg.get("max_jammers_per_side", 3),
+        adapter = self._build_eval_adapter(
+            eval_env.engine_config,
+            eval_env.obs_builder.entity_slots,
         )
-        records: list[dict] = []
         render_every = max(int(render_every), 1)
         was_training = self.actor.training
         self.actor.eval()
         try:
-            for episode in range(int(num_episodes)):
+            for episode in range(0 if records else int(num_episodes)):
                 obs = eval_env.reset()
                 h = torch.zeros(
                     1, self.num_agents, self.actor.lstm_hidden_dim, device=self.device
@@ -893,7 +1085,12 @@ class SkyArenaMAPPOTrainer:
             "avg_episode_len": float(np.mean([
                 record["episode_len"] for record in records
             ])) if records else 0.0,
+            "evaluation_seconds": time.perf_counter() - evaluation_start,
         }
+        summary["steps_per_second"] = float(
+            sum(record["episode_len"] for record in records)
+            / max(summary["evaluation_seconds"], 1e-9)
+        )
         final_metrics = self._numeric_means(records)
         for key in (
             "red_fireable_edges",
@@ -909,7 +1106,8 @@ class SkyArenaMAPPOTrainer:
             self._write_eval_report(kind, summary, records)
         print(
             f"[eval] episodes={len(records)} win_rate={summary['win_rate']:.3f} "
-            f"avg_len={summary['avg_episode_len']:.1f}",
+            f"avg_len={summary['avg_episode_len']:.1f} "
+            f"eval_sps={summary['steps_per_second']:.1f}",
             flush=True,
         )
         return summary

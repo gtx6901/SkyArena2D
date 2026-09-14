@@ -55,6 +55,8 @@
   worker 数。当前 16 环境配置在 i9-13900H 上实测以 16 workers 最快。
 - Linux CUDA 训练推荐 `env_start_method: forkserver`，避免从已初始化 CUDA 的
   主进程直接 `fork`。
+- 无渲染、deterministic reset 的固定评估按 `policy_eval_workers` 并行 episode；
+  GUI/render eval 和非确定 reset 继续使用串行路径。
 - `rollout_steps` 更稳定。
 - `save_interval` 和 `eval_interval` 不应过短，至少应接近一个 episode 的尺度。
 - `gui_eval_episodes` 可以较多；正式训练当前保留 `gui_eval_episodes: 15`。
