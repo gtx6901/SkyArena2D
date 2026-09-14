@@ -68,6 +68,9 @@
   GUI/render eval 和非确定 reset 继续使用串行路径。
 - `rollout_steps` 更稳定。
 - `save_interval` 和 `eval_interval` 不应过短，至少应接近一个 episode 的尺度。
+- Baseline V2 默认每 100k steps 做 10 局并行固定评估；这足以发现中期趋势，且
+  避免 50k 间隔让评估暂停吞掉约五分之一的端到端训练时间。训练结束后仍需独立
+  做 50--100 局候选 checkpoint 评估，不能用中间 10 局结果代替。
 - `gui_eval_episodes` 可以较多；正式训练当前保留 `gui_eval_episodes: 15`。
 - `configs/mappo_skyarena_train.yaml` 默认 `gui_eval_render_mode: human` 且 `gui_eval_human: true`，自动 GUI eval 会弹出 live 窗口用于人工观察。
 - smoke 和通用配置默认使用 `rgb_array`，适合无窗口 smoke 或远程环境；需要 live GUI 时可加 `--gui_eval_human`。

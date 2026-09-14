@@ -34,7 +34,7 @@ train:
   team_reward_end: 1.0
   reward_mix_steps: 1000000
   save_interval: 100000
-  eval_interval: 50000
+  eval_interval: 100000
   resume: false
   init_checkpoint: ""
 
@@ -71,7 +71,7 @@ logging:
   tensorboard: true
 
 evaluation:
-  policy_eval_interval: 50000
+  policy_eval_interval: 100000
   policy_eval_episodes: 10
   policy_eval_workers: 10
   gui_eval_enabled: false
