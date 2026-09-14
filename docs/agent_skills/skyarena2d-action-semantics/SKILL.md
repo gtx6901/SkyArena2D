@@ -17,15 +17,19 @@ Read these first:
 
 ## Rules
 
-- Do not modify PPO, reward, actor, critic, env core, opponents, or action space dimensions.
-- Treat `target_action` as `fire_target_action`.
+- Treat current action semantics as Baseline V2; Movement V3 is historical.
+- Confirm the actor exposes only course, target, and fire heads.
+- Treat `target_action` as engagement / attention target.
 - `target_action == 0` means no target.
-- `target_action > 0` may select only a fireable candidate.
-- `fireable = candidate_can_long || candidate_can_short`.
-- Visible/tracked non-fireable candidates may appear in entity features but must not be selectable by target action.
+- `target_action > 0` may select any valid visible/tracked candidate where `entity_mask` is true.
+- `fireable = candidate_can_long || candidate_can_short` gates only `fire_action`.
+- `fire_action > 0` must apply only to the selected target and only when the selected target is fireable for the requested weapon.
+- `course_action` decodes one of nine relative heading deltas.
+- Visible/tracked non-fireable candidates may appear in entity features and may be selected by target action.
+- Friendly tokens and padding must not be targetable.
 
 ## Expected Output
 
 - State whether rollout, PPO inputs, eval, and metrics share one action semantic.
-- Report `adapter_zeroed_fire_rate` and `target_selected_nonfireable_rate` when available.
+- Report `fire_nonzero_when_fireable` and accepted launch metrics when available.
 - Include tests or smoke commands run.

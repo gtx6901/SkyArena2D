@@ -25,7 +25,8 @@
 | 看 MAPPO 模型 | `skyarena2d/rl/models/` | actor / critic / encoder |
 | 看 MAPPO 训练 | `skyarena2d/rl/algo/mappo_trainer.py` | 训练主循环，仍是实验层 |
 | 看 rollout 工具 | `skyarena2d/rl/algo/rollout.py` | 采样、log_prob、GAE |
-| 看 search goal | `skyarena2d/rl/algo/search_goal_manager.py` | 搜索区域持久分配 |
+| 看实体观测 | `skyarena2d/training/obs_builder.py` | 自机中心实体 token、mask 与集中式状态 |
+| 看 PPO 序列切片 | `skyarena2d/rl/algo/ppo_utils.py` | episode-safe recurrent chunk、归一化与裁剪 |
 | 看 GUI | `skyarena2d/render/pixel_renderer.py` | 地图渲染、debug overlay、scoreboard |
 | 看颜色 | `skyarena2d/render/palette.py` | GUI 调色板 |
 | 看 trace | `skyarena2d/logging/trace_recorder.py` | step-level JSONL |

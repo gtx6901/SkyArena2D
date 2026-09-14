@@ -1,17 +1,20 @@
-"""SkyArena MAPPO trainer.
+"""Recurrent entity-MAPPO trainer for the SkyArena2D baseline.
 
-Ported from MaCA-master/algo/mappo_trainer.py.
-
-Status: experimental but runnable for smoke/integration checks.
+The trainer owns orchestration only. Observation construction, action
+distributions, recurrent chunking, credit assignment, and opponent sampling
+live in dedicated modules.
 """
 from __future__ import annotations
 
+import json
+import math
+import time
+from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from skyarena2d.training.action_adapter import SkyArenaActionAdapter
 
@@ -26,30 +29,31 @@ from ..utils.checkpoint import (
     save_run_config,
 )
 from ..utils.tb import build_writer, log_scalars
+from .ppo_utils import (
+    chunk_initial_states,
+    clipped_value_loss,
+    gather_recurrent_chunks,
+    iter_recurrent_minibatches,
+    linear_lr,
+    make_recurrent_chunks,
+    normalize_advantages,
+    set_optimizer_lr,
+)
 from .rollout import (
     RolloutBatch,
     allocate_batched_obs,
     allocate_rollout_obs,
-    build_batched_movement_mode_mask,
-    build_course_mask_for_movement_mode,
-    build_fire_mask_from_selected_targets,
     compute_gae,
+    evaluate_policy_heads,
     fill_batched_obs,
-    masked_categorical,
     sample_policy_actions,
-    stack_env_obs,
 )
-from .search_goal_manager import TeamSearchPlanner, TeamSearchPlannerConfig
 
 
 class SkyArenaMAPPOTrainer:
-    """Minimal recurrent MAPPO trainer for SkyArena2D.
+    """CTDE MAPPO with an entity-set recurrent actor and per-agent critic."""
 
-    This trainer is intentionally kept close to current behavior and is treated
-    as experimental for convergence-sensitive workloads.
-    """
-
-    def __init__(self, cfg: Dict[str, Any]):
+    def __init__(self, cfg: dict[str, Any]):
         self.cfg = cfg
         self.train_cfg = cfg["train"]
         self.env_cfg = cfg["env"]
@@ -57,96 +61,78 @@ class SkyArenaMAPPOTrainer:
         self.logging_cfg = cfg.get("logging", {})
         self.eval_cfg = cfg.get("evaluation", {})
 
-        self.num_envs = int(self.train_cfg.get("num_envs", 2))
-        self.rollout_steps = int(self.train_cfg.get("rollout_steps", 64))
-        self.total_env_steps = int(self.train_cfg.get("total_env_steps", 100000))
-        self.save_interval = int(self.train_cfg.get("save_interval", 10000))
-        self.eval_interval = int(self.train_cfg.get("eval_interval", 10000))
-        self.policy_eval_interval = int(self.eval_cfg.get("policy_eval_interval", self.eval_interval))
-        self.policy_eval_episodes = int(self.eval_cfg.get("policy_eval_episodes", 3))
-        self.gui_eval_enabled = bool(self.eval_cfg.get("gui_eval_enabled", True))
-        self.gui_eval_interval = int(self.eval_cfg.get("gui_eval_interval", 0))
-        self.gui_eval_episodes = int(self.eval_cfg.get("gui_eval_episodes", 1))
-        self.gui_eval_max_steps = int(self.eval_cfg.get("gui_eval_max_steps", 2000))
-        self.gui_eval_render_mode = str(self.eval_cfg.get("gui_eval_render_mode", "rgb_array"))
-        self.gui_eval_save_frames = bool(
-            self.eval_cfg.get(
-                "gui_eval_save_frames",
-                self.eval_cfg.get("gui_eval_save_video", False),
-            )
-        )
-        self.gui_eval_render_every = max(1, int(self.eval_cfg.get("gui_eval_render_every", 20)))
-        self.gui_eval_dir = str(self.eval_cfg.get("gui_eval_dir", "gui_eval"))
-        self.gui_eval_deterministic = bool(self.eval_cfg.get("gui_eval_deterministic", True))
-        self.gui_eval_human = bool(self.eval_cfg.get("gui_eval_human", False))
-        self.ppo_epochs = int(self.train_cfg.get("ppo_epochs", 3))
+        self.num_envs = int(self.train_cfg.get("num_envs", 16))
+        self.rollout_steps = int(self.train_cfg.get("rollout_steps", 128))
+        self.total_env_steps = int(self.train_cfg.get("total_env_steps", 5_000_000))
+        self.ppo_epochs = int(self.train_cfg.get("ppo_epochs", 4))
         self.gamma = float(self.train_cfg.get("gamma", 0.99))
         self.gae_lambda = float(self.train_cfg.get("gae_lambda", 0.95))
         self.clip_coef = float(self.train_cfg.get("clip_coef", 0.2))
-        self.ent_coef = float(self.train_cfg.get("entropy_coef", 0.01))
-        self.vf_coef = float(self.train_cfg.get("value_coef", 0.5))
+        self.value_clip_coef = float(self.train_cfg.get("value_clip_coef", self.clip_coef))
+        self.entropy_coef = float(self.train_cfg.get("entropy_coef", 0.01))
+        self.value_coef = float(self.train_cfg.get("value_coef", 0.5))
         self.max_grad_norm = float(self.train_cfg.get("max_grad_norm", 0.5))
-        self.search_goal_grid_size = int(self.env_cfg.get("search_goal_grid_size", 8))
-        self.search_goal_bins = self.search_goal_grid_size ** 2
-        self.candidate_slots = int(self.env_cfg.get("candidate_slots", 6))
-
-        device_str = str(self.train_cfg.get("device", "cpu"))
-        self.device = torch.device(device_str)
-
-        # Build environments
-        self.envs = [SkyArenaMAPPOEnv(cfg, seed_offset=i) for i in range(self.num_envs)]
-        self.num_agents = self.envs[0].red_fighter_num
-        obs_shapes = self.envs[0].obs_shapes()
-
-        # Build search goal manager
-        engine_cfg = self.envs[0].engine_config
-        self.search_goal_manager = TeamSearchPlanner(
-            TeamSearchPlannerConfig(
-                num_envs=self.num_envs,
-                num_agents=self.num_agents,
-                map_size_x=engine_cfg.map.width,
-                map_size_y=engine_cfg.map.height,
-                search_goal_grid_size=self.search_goal_grid_size,
-                goal_hold_steps=int(self.env_cfg.get("goal_hold_steps", 10)),
-                goal_reach_radius=float(self.env_cfg.get("goal_reach_radius", 90.0)),
-            )
+        self.recurrent_chunk_length = int(self.train_cfg.get("recurrent_chunk_length", 32))
+        self.num_minibatches = int(self.train_cfg.get("num_minibatches", 8))
+        self.target_kl = float(self.train_cfg.get("target_kl", 0.0))
+        self.initial_lr = float(self.train_cfg.get("learning_rate", 3e-4))
+        self.min_lr = float(self.train_cfg.get("min_learning_rate", 0.0))
+        self.use_lr_decay = str(self.train_cfg.get("lr_decay", "linear")).lower() == "linear"
+        self.use_popart = bool(self.train_cfg.get("popart", True))
+        self.team_reward_start = float(self.train_cfg.get("team_reward_start", 0.5))
+        self.team_reward_end = float(self.train_cfg.get("team_reward_end", 1.0))
+        self.reward_mix_steps = int(self.train_cfg.get("reward_mix_steps", 1_000_000))
+        self.save_interval = int(self.train_cfg.get("save_interval", 100_000))
+        self.eval_interval = int(
+            self.eval_cfg.get("policy_eval_interval", self.train_cfg.get("eval_interval", 50_000))
         )
+        self.eval_episodes = int(self.eval_cfg.get("policy_eval_episodes", 10))
 
-        # Build actor and critic
+        requested_device = str(self.train_cfg.get("device", "cpu"))
+        if requested_device.startswith("cuda") and not torch.cuda.is_available():
+            print("[device] CUDA unavailable; falling back to CPU", flush=True)
+            requested_device = "cpu"
+        self.device = torch.device(requested_device)
+
+        first_env = SkyArenaMAPPOEnv(cfg, seed_offset=0)
+        shared_pool = first_env.opponent_pool
+        self.envs = [first_env] + [
+            SkyArenaMAPPOEnv(cfg, seed_offset=index, opponent_pool=shared_pool)
+            for index in range(1, self.num_envs)
+        ]
+        self.opponent_pool = shared_pool
+        self.num_agents = first_env.red_fighter_num
+        obs_shapes = first_env.obs_shapes()
+        self.entity_slots = obs_shapes["entity_features"][1]
+
         self.actor = SkyArenaActor(
-            self_dim=obs_shapes["self_features"][1],
-            entity_dim=obs_shapes["entity_features"][2],
-            map_channels=obs_shapes["semantic_map"][1],
-            candidate_slots=self.candidate_slots,
+            self_dim=obs_shapes["self_features"][-1],
+            entity_dim=obs_shapes["entity_features"][-1],
+            candidate_slots=self.entity_slots,
             num_agents=self.num_agents,
-            course_bins=32,
-            search_goal_bins=self.search_goal_bins,
-            region_feature_dim=obs_shapes["region_features"][2],
             trunk_dim=int(self.model_cfg.get("trunk_dim", 192)),
             lstm_hidden_dim=int(self.model_cfg.get("lstm_hidden_dim", 192)),
-            entity_embed_dim=int(self.model_cfg.get("entity_embed_dim", 96)),
-            map_embed_dim=int(self.model_cfg.get("map_embed_dim", 96)),
-            semantic_map_size=int(self.model_cfg.get("semantic_map_size", 100)),
-            current_goal_embed_dim=int(self.model_cfg.get("current_goal_embed_dim", 32)),
+            entity_embed_dim=int(self.model_cfg.get("entity_embed_dim", 128)),
+            course_bins=9,
             agent_id_embed_dim=int(self.model_cfg.get("agent_id_embed_dim", 16)),
-            region_embed_dim=int(self.model_cfg.get("region_embed_dim", 64)),
+            attention_heads=int(self.model_cfg.get("attention_heads", 4)),
+            attention_layers=int(self.model_cfg.get("attention_layers", 2)),
         ).to(self.device)
-
         self.critic = SkyArenaCritic(
             global_state_dim=obs_shapes["global_state"][0],
             hidden_dim=int(self.model_cfg.get("critic_hidden_dim", 256)),
+            num_agents=self.num_agents,
+            agent_id_embed_dim=int(self.model_cfg.get("agent_id_embed_dim", 16)),
+            use_popart=self.use_popart,
         ).to(self.device)
-
         self.optimizer = torch.optim.Adam(
-            list(self.actor.parameters()) + list(self.critic.parameters()),
-            lr=float(self.train_cfg.get("learning_rate", 3e-4)),
+            [*self.actor.parameters(), *self.critic.parameters()], lr=self.initial_lr
         )
 
-        # Build action adapter
+        engine_cfg = first_env.engine_config
         self.action_adapter = SkyArenaActionAdapter(
-            candidate_slots=self.candidate_slots,
-            course_bins=32,
-            search_goal_grid_size=self.search_goal_grid_size,
+            candidate_slots=self.entity_slots,
+            course_bins=9,
             map_width=engine_cfg.map.width,
             map_height=engine_cfg.map.height,
             radar_freq=self.env_cfg.get("default_radar_freq", 1),
@@ -163,105 +149,50 @@ class SkyArenaMAPPOTrainer:
             max_jammers_per_side=self.env_cfg.get("max_jammers_per_side", 3),
         )
 
-        # Setup run dirs
-        run_train_cfg = dict(self.train_cfg)
-        run_train_cfg["logging"] = self.logging_cfg
-        self.run_dirs = ensure_run_dirs(run_train_cfg)
+        run_cfg = dict(self.train_cfg)
+        run_cfg["logging"] = self.logging_cfg
+        self.run_cfg = run_cfg
+        self.run_dirs = ensure_run_dirs(run_cfg)
         save_run_config(self.run_dirs, cfg)
-
         self.env_steps = 0
         self.update_idx = 0
+        self._load_requested_checkpoint()
 
-        init_checkpoint = str(self.train_cfg.get("init_checkpoint", "")).strip()
-
-        # Resume from checkpoint if requested
-        if bool(self.train_cfg.get("resume", False)):
-            if init_checkpoint:
-                print(
-                    f"[init_checkpoint] warning: resume=true, ignoring init_checkpoint {init_checkpoint}",
-                    flush=True,
-                )
-            ckpt_path = latest_checkpoint(run_train_cfg)
-            if ckpt_path is not None:
-                ckpt = load_checkpoint(ckpt_path, self.actor, self.critic, self.optimizer, map_location=self.device)
-                self.env_steps = int(ckpt.get("env_steps", 0))
-                self.update_idx = int(ckpt.get("update_idx", 0))
-                print(f"[resume] loaded checkpoint {ckpt_path} env_steps={self.env_steps}", flush=True)
-        elif init_checkpoint:
-            load_checkpoint(init_checkpoint, self.actor, self.critic, self.optimizer, map_location=self.device)
-            print(
-                f"[init_checkpoint] loaded warm-start checkpoint {init_checkpoint}; env_steps reset to 0",
-                flush=True,
-            )
-
-        # Initialize obs and hidden states
         self.current_obs = [env.reset() for env in self.envs]
-        self.search_goal_manager.reset_all()
-        self._episode_returns = np.zeros((self.num_envs,), dtype=np.float32)
-        self._episode_lengths = np.zeros((self.num_envs,), dtype=np.int32)
+        self._episode_returns = np.zeros(self.num_envs, dtype=np.float32)
+        self._episode_lengths = np.zeros(self.num_envs, dtype=np.int32)
         hidden_dim = self.actor.lstm_hidden_dim
-        self.actor_h = torch.zeros((self.num_envs, self.num_agents, hidden_dim), dtype=torch.float32, device=self.device)
-        self.actor_c = torch.zeros((self.num_envs, self.num_agents, hidden_dim), dtype=torch.float32, device=self.device)
-
-        self.writer = build_writer(run_train_cfg, purge_step=(self.env_steps if self.env_steps > 0 else None))
-        self.next_save_step = self.env_steps + self.save_interval
-        self.next_eval_step = self.env_steps + self.policy_eval_interval
-        self.next_gui_eval_step = (
-            self.env_steps + self.gui_eval_interval
-            if self.gui_eval_enabled and self.gui_eval_interval > 0
-            else None
+        self.actor_h = torch.zeros(
+            self.num_envs, self.num_agents, hidden_dim, device=self.device
         )
-        if self.next_gui_eval_step is not None:
-            render_mode = "human" if self.gui_eval_human else self.gui_eval_render_mode
-            if render_mode == "rgb_array":
-                print("[gui_eval] mode=rgb_array, no window will be opened", flush=True)
-                print("[gui_eval] use --gui_eval_human to open a live window", flush=True)
-            elif render_mode == "human":
-                print("[gui_eval] mode=human, a live window will be opened during GUI eval", flush=True)
+        self.actor_c = torch.zeros_like(self.actor_h)
+        self.writer = build_writer(run_cfg, purge_step=self.env_steps or None)
+        self.next_save_step = self.env_steps + self.save_interval
+        self.next_eval_step = self.env_steps + self.eval_interval
 
-    @staticmethod
-    def _mean_numeric_dicts(dicts: List[dict]) -> dict:
-        """Average numeric values across a list of dicts. Non-numeric keys are skipped."""
-        if not dicts:
-            return {}
-        result = {}
-        for key in dicts[0]:
-            values = []
-            for d in dicts:
-                v = d.get(key)
-                if v is not None and isinstance(v, (int, float, np.integer, np.floating, bool)):
-                    values.append(float(v))
-            if values:
-                result[key] = float(np.mean(values))
-        return result
-
-    @staticmethod
-    def _signed_angle_delta_deg(to_heading: np.ndarray, from_heading: np.ndarray) -> np.ndarray:
-        """Return signed shortest angle delta in degrees in [-180, 180)."""
-        return ((np.asarray(to_heading) - np.asarray(from_heading) + 540.0) % 360.0) - 180.0
-
-    @staticmethod
-    def _nearest_distance_between_alive(own, enemy, own_count: int, enemy_count: int) -> float | None:
-        own_alive = own.alive[:own_count]
-        enemy_alive = enemy.alive[:enemy_count]
-        if not np.any(own_alive) or not np.any(enemy_alive):
-            return None
-        own_pos = own.pos[:own_count][own_alive]
-        enemy_pos = enemy.pos[:enemy_count][enemy_alive]
-        diff = own_pos[:, None, :] - enemy_pos[None, :, :]
-        dist = np.sqrt(np.sum(diff * diff, axis=-1))
-        return float(np.min(dist))
-
-    @staticmethod
-    def _team_spread(own, own_count: int) -> float | None:
-        alive = own.alive[:own_count]
-        if int(np.count_nonzero(alive)) < 2:
-            return None
-        pos = own.pos[:own_count][alive]
-        diff = pos[:, None, :] - pos[None, :, :]
-        dist = np.sqrt(np.sum(diff * diff, axis=-1))
-        tri = np.triu_indices(pos.shape[0], k=1)
-        return float(np.mean(dist[tri]))
+    def _load_requested_checkpoint(self) -> None:
+        init_path = str(self.train_cfg.get("init_checkpoint", "")).strip()
+        checkpoint: Path | str | None = None
+        resume = bool(self.train_cfg.get("resume", False))
+        if resume:
+            checkpoint = latest_checkpoint(self.run_cfg)
+        elif init_path:
+            checkpoint = init_path
+        if checkpoint is None:
+            return
+        payload = load_checkpoint(
+            checkpoint,
+            self.actor,
+            self.critic,
+            self.optimizer if resume else None,
+            map_location=self.device,
+        )
+        if resume:
+            self.env_steps = int(payload.get("env_steps", 0))
+            self.update_idx = int(payload.get("update_idx", 0))
+            if self.opponent_pool is not None and "opponent_pool" in payload:
+                self.opponent_pool.load_state_dict(payload["opponent_pool"])
+        print(f"[checkpoint] loaded {checkpoint} at env_steps={self.env_steps}", flush=True)
 
     @staticmethod
     def _reset_recurrent_hidden_after_done(
@@ -270,1522 +201,640 @@ class SkyArenaMAPPOTrainer:
         prev_done: np.ndarray,
         num_agents: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        del num_agents
         if not np.any(prev_done):
             return h, c
-        device = h.device
-        reset_env = torch.as_tensor(prev_done.reshape(-1, 1), dtype=h.dtype, device=device)
-        reset_mask = reset_env.repeat_interleave(int(num_agents), dim=0)
-        return h * (1.0 - reset_mask), c * (1.0 - reset_mask)
+        if h.ndim == 2:
+            reset = torch.as_tensor(prev_done, dtype=h.dtype, device=h.device).reshape(-1, 1)
+            reset = reset.repeat_interleave(c.shape[0] // max(reset.shape[0], 1), dim=0)
+        else:
+            reset = torch.as_tensor(prev_done, dtype=h.dtype, device=h.device).reshape(-1, 1, 1)
+        return h * (1.0 - reset), c * (1.0 - reset)
 
-    def _collect_rollout_step_diagnostics(self, batch: RolloutBatch) -> dict:
-        """Compute per-step rollout diagnostics from actions / masks / obs."""
-        T, E = batch.reward.shape
-        N = self.num_agents
-
-        alive_mask = (batch.observations["alive_mask"][:, :, :N] > 0.5).astype(np.float32)
-        has_contact = (batch.observations["has_active_contact"][:, :, :N] > 0.5).astype(np.float32)
-        entity_mask = batch.observations["entity_mask"].reshape(T, E, N, -1).astype(np.float32)
-        candidate_ids = batch.observations["candidate_ids"].reshape(T, E, N, -1)
-        can_long = batch.observations["candidate_can_long"].reshape(T, E, N, -1).astype(np.float32)
-        can_short = batch.observations["candidate_can_short"].reshape(T, E, N, -1).astype(np.float32)
-        movement_mode_action = batch.movement_mode_action[:, :, :N]
-        course_action = batch.course_action[:, :, :N]
-        target_action = batch.target_action[:, :, :N]
-        fire_action = batch.fire_action[:, :, :N]
-
-        alive_count = alive_mask.sum(axis=-1)  # (T, E)
-        alive_rate = alive_count / max(N, 1)
-
-        # Per-agent entity count
-        entity_per_agent = entity_mask.sum(axis=-1)  # (T, E, N)
-        entity_valid_count = np.where(alive_mask > 0, entity_per_agent, 0.0).sum(axis=-1) / np.maximum(alive_count, 1)
-
-        # Contact rate among alive agents
-        contact_rate = (has_contact * alive_mask).sum(axis=-1) / np.maximum(alive_count, 1)
-
-        # Target / fire nonzero (binary per step: any alive agent selected target/fire > 0)
-        target_nonzero = np.any((target_action > 0) & (alive_mask > 0.5), axis=-1)
-        fire_nonzero = np.any((fire_action > 0) & (alive_mask > 0.5), axis=-1)
-
-        target_nonzero_rate = float(target_nonzero.mean())
-        fire_nonzero_rate = float(fire_nonzero.mean())
-
-        # no_target_rate: steps with alive agents but no target
-        has_alive = alive_count > 0
-        no_target_rate = float(np.where(has_alive, ~target_nonzero, 0.0).mean()) if has_alive.any() else 0.0
-
-        # no_fire_rate: steps with target but no fire
-        target_steps = max(int(target_nonzero.sum()), 1)
-        no_fire_rate = float((target_nonzero & ~fire_nonzero).sum()) / target_steps
-
-        # Target availability per alive agent
-        has_valid = np.any(candidate_ids >= 0, axis=-1)
-        target_available = np.where(alive_mask > 0, has_valid, 0.0).sum(axis=-1) / np.maximum(alive_count, 1)
-
-        any_entity = np.any(entity_mask > 0.5, axis=-1)
-        target_nonzero_when_entity_available = float(
-            np.count_nonzero((target_action > 0) & (alive_mask > 0.5) & any_entity)
-            / max(np.count_nonzero((alive_mask > 0.5) & any_entity), 1)
-        )
-        fireable_agent = np.any((can_long > 0.5) | (can_short > 0.5), axis=-1)
-        fire_nonzero_when_fireable = float(
-            np.count_nonzero((fire_action > 0) & (alive_mask > 0.5) & fireable_agent)
-            / max(np.count_nonzero((alive_mask > 0.5) & fireable_agent), 1)
-        )
-        valid_fire_rate_when_fireable = float(
-            np.count_nonzero((fire_action > 0) & (alive_mask > 0.5) & fireable_agent)
-            / max(np.count_nonzero((fire_action > 0) & (alive_mask > 0.5)), 1)
-        )
-        visible_but_not_fireable = any_entity & (~fireable_agent)
-        visible_but_not_fireable_rate = float(
-            np.count_nonzero((alive_mask > 0.5) & visible_but_not_fireable)
-            / max(np.count_nonzero(alive_mask > 0.5), 1)
+    def _team_weight(self) -> float:
+        if self.reward_mix_steps <= 0:
+            return self.team_reward_end
+        fraction = min(max(self.env_steps / self.reward_mix_steps, 0.0), 1.0)
+        return self.team_reward_start + fraction * (
+            self.team_reward_end - self.team_reward_start
         )
 
-        heading = (np.degrees(np.arctan2(
-            batch.observations["self_features"][:, :, :N, 3],
-            batch.observations["self_features"][:, :, :N, 2],
-        )) % 360.0).astype(np.float32)
-        delta = np.abs(((batch.decoded_course[:, :, :N] - heading + 540.0) % 360.0) - 180.0)
-        alive_delta = delta[alive_mask > 0.5]
-        heading_delta_abs_mean = float(np.mean(alive_delta)) if alive_delta.size else 0.0
-        spin_rate = float(np.mean(alive_delta > 60.0)) if alive_delta.size else 0.0
+    def _decode_action(self, env_index: int, obs: Mapping[str, np.ndarray], sampled: dict):
+        env = self.envs[env_index]
+        return self.action_adapter.decode(
+            course_action=sampled["course"][env_index],
+            target_action=sampled["target"][env_index],
+            fire_action=sampled["fire"][env_index],
+            own=env.engine.state.red,
+            candidate_ids=obs["candidate_ids"],
+            candidate_can_long=obs["candidate_can_long"],
+            candidate_can_short=obs["candidate_can_short"],
+            has_active_contact=obs["has_active_contact"] > 0.5,
+            current_heading=env.engine.state.red.heading[: self.num_agents],
+            entity_features=obs["entity_features"],
+            ew_state_key=env_index,
+            step_count=env.engine.state.step_count,
+        )
 
-        # Long / short available rates among valid candidates
-        valid = candidate_ids >= 0
-        n_valid = valid.sum()
-        long_count = (can_long * valid).sum()
-        short_count = (can_short * valid).sum()
-
-        return {
-            "target_nonzero_rate": target_nonzero_rate,
-            "fire_nonzero_rate": fire_nonzero_rate,
-            "no_target_rate": no_target_rate,
-            "no_fire_rate": no_fire_rate,
-            "alive_rate": float(alive_rate.mean()),
-            "contact_rate": float(contact_rate.mean()),
-            "entity_valid_count": float(entity_valid_count.mean()),
-            "target_available_rate": float(target_available.mean()),
-            "long_available_rate": float(long_count / max(n_valid, 1)),
-            "short_available_rate": float(short_count / max(n_valid, 1)),
-            "movement_mode_hist": np.bincount(movement_mode_action[alive_mask > 0.5].astype(np.int64), minlength=9).tolist(),
-            "course_hist": np.bincount(course_action[alive_mask > 0.5].astype(np.int64), minlength=32).tolist(),
-            "target_action_hist": np.bincount(target_action[alive_mask > 0.5].astype(np.int64), minlength=self.candidate_slots + 1).tolist(),
-            "fire_action_hist": np.bincount(fire_action[alive_mask > 0.5].astype(np.int64), minlength=3).tolist(),
-            "search_goal_refresh_rate": float(np.mean(batch.search_goal_refresh_mask[alive_mask > 0.5])) if np.any(alive_mask > 0.5) else 0.0,
-            "heading_delta_abs_mean": heading_delta_abs_mean,
-            "spin_rate": spin_rate,
-            "target_nonzero_when_entity_available": target_nonzero_when_entity_available,
-            "fire_nonzero_when_fireable": fire_nonzero_when_fireable,
-            "valid_fire_rate_when_fireable": valid_fire_rate_when_fireable,
-            "visible_but_not_fireable_rate": visible_but_not_fireable_rate,
-        }
-
-    def _summarize_rollout_episodes(self, episode_stats: List[Dict[str, Any]]) -> Dict[str, float]:
-        """Summarize naturally finished episodes seen inside the latest rollout.
-
-        Returns empty dict when no episodes finished (so nothing is logged).
-        """
-        episodes_finished = len(episode_stats)
-        if episodes_finished == 0:
-            return {}
-        red_wins = sum(1 for s in episode_stats if s.get("winner") == "red")
-        blue_wins = sum(1 for s in episode_stats if s.get("winner") == "blue")
-        draws = sum(1 for s in episode_stats if s.get("winner") not in ("red", "blue"))
-        avg_len = float(np.mean([float(s.get("episode_len", s.get("steps", 0))) for s in episode_stats]))
-        avg_return = float(np.mean([float(s.get("episode_return", 0.0)) for s in episode_stats]))
-        return {
-            "win_rate": red_wins / max(episodes_finished, 1),
-            "episode_len": avg_len,
-            "episode_return": avg_return,
-            "red_wins": float(red_wins),
-            "blue_wins": float(blue_wins),
-            "draws": float(draws),
-        }
+    def _step_all(self, actions: list) -> list[tuple[dict, float, bool, dict]]:
+        # Threads benchmark slower for this lightweight Python simulator due
+        # to GIL and scheduling contention. A process/vector backend should be
+        # introduced only together with a repeatable throughput benchmark.
+        return [
+            env.step(action)
+            for env, action in zip(self.envs, actions, strict=True)
+        ]
 
     @staticmethod
-    def _summarize_episode_metrics(episode_stats: List[Dict[str, Any]]) -> dict:
-        """Extract episode-level metrics from final info['metrics'] across episodes."""
-        if not episode_stats:
-            return {}
-        result = {}
-        for key in [
-            "red_kills", "blue_kills", "red_losses", "blue_losses",
-            "missiles_launched_long", "missiles_launched_short",
-            "missiles_hit", "missiles_missed",
-            "red_attempted_edges", "red_selected_edges", "red_invalid_fire_count",
-            "contact_to_fire_gap",
-        ]:
-            values = [float(v) for s in episode_stats
-                      if s.get("final_metrics") and (v := s["final_metrics"].get(key)) is not None]
-            if values:
-                result[key] = float(np.mean(values))
-        return result
+    def _numeric_means(rows: Iterable[Mapping[str, Any]]) -> dict[str, float]:
+        buckets: dict[str, list[float]] = {}
+        for row in rows:
+            for key, value in row.items():
+                if isinstance(value, (bool, int, float, np.integer, np.floating)):
+                    buckets.setdefault(key, []).append(float(value))
+        return {key: float(np.mean(values)) for key, values in buckets.items() if values}
 
-    def _collect_rollout(self) -> RolloutBatch:
-        """Collect rollout_steps of experience from all envs."""
-        example_obs = self.current_obs[0]
-        rollout_obs = allocate_rollout_obs(example_obs, self.rollout_steps, self.num_envs)
-        rollout_movement_mode = np.zeros((self.rollout_steps, self.num_envs, self.num_agents), dtype=np.int64)
-        rollout_course = np.zeros((self.rollout_steps, self.num_envs, self.num_agents), dtype=np.int64)
-        rollout_decoded_course = np.zeros((self.rollout_steps, self.num_envs, self.num_agents), dtype=np.float32)
-        rollout_search_goal = np.zeros((self.rollout_steps, self.num_envs, self.num_agents), dtype=np.int64)
-        rollout_search_goal_refresh = np.zeros((self.rollout_steps, self.num_envs, self.num_agents), dtype=np.bool_)
-        rollout_search_goal_planner_bias = np.zeros(
-            (self.rollout_steps, self.num_envs, self.num_agents, self.search_goal_bins),
-            dtype=np.float32,
-        )
-        rollout_target = np.zeros((self.rollout_steps, self.num_envs, self.num_agents), dtype=np.int64)
-        rollout_fire = np.zeros((self.rollout_steps, self.num_envs, self.num_agents), dtype=np.int64)
-        rollout_log_prob = np.zeros((self.rollout_steps, self.num_envs, self.num_agents), dtype=np.float32)
-        rollout_reward = np.zeros((self.rollout_steps, self.num_envs), dtype=np.float32)
-        rollout_done = np.zeros((self.rollout_steps, self.num_envs), dtype=np.float32)
-        rollout_value = np.zeros((self.rollout_steps, self.num_envs), dtype=np.float32)
-        initial_h = self.actor_h.detach().cpu().numpy().copy()
-        initial_c = self.actor_c.detach().cpu().numpy().copy()
-        episode_stats: List[Dict[str, Any]] = []
-        step_metrics_list: List[dict] = []
+    def _collect_rollout(self) -> tuple[RolloutBatch, list[dict]]:
+        example = self.current_obs[0]
+        obs_batch = allocate_batched_obs(example, self.num_envs)
+        observations = allocate_rollout_obs(example, self.rollout_steps, self.num_envs)
+        shape = (self.rollout_steps, self.num_envs, self.num_agents)
+        recurrent_shape = (*shape, self.actor.lstm_hidden_dim)
+        recurrent_h = np.empty(recurrent_shape, dtype=np.float32)
+        recurrent_c = np.empty(recurrent_shape, dtype=np.float32)
+        course = np.empty(shape, dtype=np.int64)
+        target = np.empty(shape, dtype=np.int64)
+        fire = np.empty(shape, dtype=np.int64)
+        log_prob = np.empty(shape, dtype=np.float32)
+        reward = np.empty(shape, dtype=np.float32)
+        done = np.empty(shape[:2], dtype=bool)
+        value = np.empty(shape, dtype=np.float32)
+        episode_stats: list[dict] = []
+        step_metrics: list[dict] = []
 
         for step in range(self.rollout_steps):
-            obs_batch = stack_env_obs(self.current_obs)
-            batched_obs = allocate_batched_obs(example_obs, self.num_envs)
-            fill_batched_obs(batched_obs, self.current_obs)
+            fill_batched_obs(obs_batch, self.current_obs)
+            for key in observations:
+                observations[key][step] = obs_batch[key]
+            recurrent_h[step] = self.actor_h.detach().cpu().numpy()
+            recurrent_c[step] = self.actor_c.detach().cpu().numpy()
 
             with torch.no_grad():
+                global_state = torch.as_tensor(
+                    obs_batch["global_state"], dtype=torch.float32, device=self.device
+                )
+                value[step] = self.critic(global_state).cpu().numpy()
                 sampled = sample_policy_actions(
                     self.actor,
-                    batched_obs,
+                    obs_batch,
                     (self.actor_h, self.actor_c),
                     self.device,
                     deterministic=False,
-                    search_goal_manager=self.search_goal_manager,
                 )
-                global_state_t = torch.as_tensor(batched_obs["global_state"], dtype=torch.float32, device=self.device)
-                value = self.critic(global_state_t).detach().cpu().numpy()
 
-            # Store obs
-            for key in rollout_obs:
-                rollout_obs[key][step] = batched_obs[key]
-            rollout_movement_mode[step] = sampled["movement_mode"]
-            rollout_course[step] = sampled["course"]
-            rollout_search_goal[step] = sampled["search_goal"]
-            rollout_search_goal_refresh[step] = sampled["search_goal_refresh_mask"]
-            rollout_search_goal_planner_bias[step] = sampled["search_goal_planner_bias"]
-            rollout_target[step] = sampled["target"]
-            rollout_fire[step] = sampled["fire"]
-            rollout_log_prob[step] = sampled["log_prob"]
-            rollout_value[step] = value
+            course[step] = sampled["course"]
+            target[step] = sampled["target"]
+            fire[step] = sampled["fire"]
+            log_prob[step] = sampled["log_prob"]
+            actions = [
+                self._decode_action(index, self.current_obs[index], sampled)
+                for index in range(self.num_envs)
+            ]
+            results = self._step_all(actions)
+            next_obs: list[dict] = []
+            team_weight = self._team_weight()
+            done_step = np.zeros(self.num_envs, dtype=bool)
+            for env_index, (new_obs, team_reward, env_done, info) in enumerate(results):
+                agent_reward = np.asarray(
+                    info.get("red_agent_reward", np.zeros(self.num_agents)), dtype=np.float32
+                )
+                if agent_reward.shape != (self.num_agents,):
+                    raise ValueError(
+                        f"red_agent_reward must have shape {(self.num_agents,)}, got {agent_reward.shape}"
+                    )
+                reward[step, env_index] = (
+                    (1.0 - team_weight) * agent_reward + team_weight * float(team_reward)
+                )
+                done_step[env_index] = env_done
+                self._episode_returns[env_index] += float(team_reward)
+                self._episode_lengths[env_index] += 1
+                metrics = info.get("metrics", {})
+                if isinstance(metrics, dict):
+                    step_metrics.append(metrics)
+                if env_done:
+                    episode_stats.append({
+                        "winner": str(info.get("winner", "draw")),
+                        "episode_return": float(self._episode_returns[env_index]),
+                        "episode_len": int(self._episode_lengths[env_index]),
+                        "opponent_name": str(info.get("opponent_name", "unknown")),
+                        **(metrics if isinstance(metrics, dict) else {}),
+                    })
+                    self._episode_returns[env_index] = 0.0
+                    self._episode_lengths[env_index] = 0
+                    self.action_adapter.reset_ew_state(env_index)
+                    new_obs = self.envs[env_index].reset()
+                next_obs.append(new_obs)
 
-            # Update hidden states
+            done[step] = done_step
+            self.current_obs = next_obs
             self.actor_h = sampled["next_h"].to(self.device)
             self.actor_c = sampled["next_c"].to(self.device)
-
-            # Step each env
-            new_obs_list = []
-            for env_idx, env in enumerate(self.envs):
-                course_i = sampled["course"][env_idx]
-                movement_mode_i = sampled["movement_mode"][env_idx]
-                search_goal_i = sampled["search_goal"][env_idx]
-                target_i = sampled["target"][env_idx]
-                fire_i = sampled["fire"][env_idx]
-
-                sky_action = self.action_adapter.decode(
-                    movement_mode_action=movement_mode_i,
-                    course_action=course_i,
-                    search_goal_action=search_goal_i,
-                    target_action=target_i,
-                    fire_action=fire_i,
-                    own=env.engine.state.red,
-                    candidate_ids=batched_obs["candidate_ids"][env_idx],
-                    candidate_can_long=batched_obs["candidate_can_long"][env_idx],
-                    candidate_can_short=batched_obs["candidate_can_short"][env_idx],
-                    has_active_contact=batched_obs["has_active_contact"][env_idx] > 0.5,
-                    current_heading=env.engine.state.red.heading[:env.red_fighter_num],
-                    enemy=env.engine.state.blue,
-                    entity_features=batched_obs["entity_features"][env_idx],
-                    ew_state_key=env_idx,
-                    step_count=env.engine.state.step_count,
-                )
-                rollout_decoded_course[step, env_idx] = sky_action.course[:self.num_agents]
-
-                env.set_current_search_goal_id(sampled["current_search_goal_id"][env_idx])
-                next_obs, reward, done, info = env.step(sky_action)
-                rollout_reward[step, env_idx] = reward
-                rollout_done[step, env_idx] = float(done)
-                self._episode_returns[env_idx] += float(reward)
-                self._episode_lengths[env_idx] += 1
-
-                # Collect per-step metrics
-                step_metrics_list.append(info.get("metrics", {}))
-
-                if done:
-                    episode_stats.append({
-                        "env_idx": env_idx,
-                        "winner": info.get("winner", "unknown"),
-                        "reason": info.get("reason", ""),
-                        "steps": env.engine.state.step_count,
-                        "episode_len": int(self._episode_lengths[env_idx]),
-                        "episode_return": float(self._episode_returns[env_idx]),
-                        "final_metrics": info.get("metrics", {}),
-                    })
-                    self._episode_returns[env_idx] = 0.0
-                    self._episode_lengths[env_idx] = 0
-                    next_obs = env.reset()
-                    self.search_goal_manager.reset_envs([env_idx])
-                    self.action_adapter.reset_ew_state(env_idx)
-                    self.actor_h[env_idx] = 0.0
-                    self.actor_c[env_idx] = 0.0
-
-                new_obs_list.append(next_obs)
-
-            self.current_obs = new_obs_list
+            self.actor_h, self.actor_c = self._reset_recurrent_hidden_after_done(
+                self.actor_h, self.actor_c, done_step, self.num_agents
+            )
             self.env_steps += self.num_envs
 
-        # Compute next value for GAE
+        fill_batched_obs(obs_batch, self.current_obs)
         with torch.no_grad():
-            final_batched = allocate_batched_obs(example_obs, self.num_envs)
-            fill_batched_obs(final_batched, self.current_obs)
-            global_state_t = torch.as_tensor(final_batched["global_state"], dtype=torch.float32, device=self.device)
-            next_value = self.critic(global_state_t).detach().cpu().numpy()
-
+            next_value = self.critic(torch.as_tensor(
+                obs_batch["global_state"], dtype=torch.float32, device=self.device
+            )).cpu().numpy()
         batch = RolloutBatch(
-            observations=rollout_obs,
-            initial_h=initial_h,
-            initial_c=initial_c,
-            movement_mode_action=rollout_movement_mode,
-            course_action=rollout_course,
-            decoded_course=rollout_decoded_course,
-            search_goal_action=rollout_search_goal,
-            search_goal_refresh_mask=rollout_search_goal_refresh,
-            search_goal_planner_bias=rollout_search_goal_planner_bias,
-            target_action=rollout_target,
-            fire_action=rollout_fire,
-            log_prob=rollout_log_prob,
-            reward=rollout_reward,
-            done=rollout_done,
-            value=rollout_value,
+            observations=observations,
+            recurrent_h=recurrent_h,
+            recurrent_c=recurrent_c,
+            course_action=course,
+            target_action=target,
+            fire_action=fire,
+            log_prob=log_prob,
+            reward=reward,
+            done=done,
+            value=value,
             next_value=next_value,
             episode_stats=episode_stats,
         )
-        return batch, step_metrics_list
+        batch.validate()
+        return batch, step_metrics
 
-    def _ppo_update(self, batch: RolloutBatch) -> Dict[str, float]:
-        """Run PPO update on collected rollout batch."""
+    @staticmethod
+    def _pack_time_major(array: np.ndarray, chunks) -> tuple[np.ndarray, np.ndarray]:
+        packed, valid = gather_recurrent_chunks(array, chunks)
+        axes = (1, 0, *range(2, packed.ndim))
+        return packed.transpose(axes), valid.T
+
+    def _ppo_update(self, batch: RolloutBatch) -> dict[str, float]:
         advantages, returns = compute_gae(
-            batch.reward, batch.value, batch.next_value, batch.done,
-            self.gamma, self.gae_lambda,
+            batch.reward,
+            batch.value,
+            batch.next_value,
+            batch.done,
+            self.gamma,
+            self.gae_lambda,
         )
-        # Normalize advantages
-        adv_flat = advantages.flatten()
-        adv_mean = adv_flat.mean()
-        adv_std = adv_flat.std() + 1e-8
-        advantages = (advantages - adv_mean) / adv_std
+        live_np = batch.observations["alive_mask"].astype(bool)
+        advantages = normalize_advantages(
+            torch.as_tensor(advantages, device=self.device),
+            torch.as_tensor(live_np, device=self.device),
+        ).cpu().numpy()
+        if self.use_popart:
+            self.critic.update_popart(torch.as_tensor(returns[live_np], device=self.device))
 
-        T, E = batch.reward.shape
-        N = self.num_agents
-        total_loss_sum = 0.0
-        pg_loss_sum = 0.0
-        vf_loss_sum = 0.0
-        ent_loss_sum = 0.0
-        n_updates = 0
+        chunks = make_recurrent_chunks(
+            batch.done, self.num_agents, self.recurrent_chunk_length
+        )
+        minibatch_chunks = max(1, math.ceil(len(chunks) / max(self.num_minibatches, 1)))
+        if self.use_lr_decay:
+            learning_rate = linear_lr(
+                self.initial_lr,
+                self.env_steps,
+                self.total_env_steps,
+                final_lr=self.min_lr,
+            )
+            set_optimizer_lr(self.optimizer, learning_rate)
+        else:
+            learning_rate = self.initial_lr
 
-        for _ in range(self.ppo_epochs):
-            # Flatten T*E for batch processing
-            obs_flat = {
-                key: torch.as_tensor(
-                    val.reshape(T * E, *val.shape[2:]), dtype=torch.float32, device=self.device
+        global_by_agent = np.broadcast_to(
+            batch.observations["global_state"][:, :, None, :],
+            (*batch.value.shape, batch.observations["global_state"].shape[-1]),
+        )
+        totals = {
+            "loss": 0.0,
+            "pg_loss": 0.0,
+            "vf_loss": 0.0,
+            "entropy": 0.0,
+            "approx_kl": 0.0,
+            "clip_fraction": 0.0,
+        }
+        updates = 0
+        stop_early = False
+        rng = np.random.default_rng(int(self.train_cfg.get("seed", 0)) + self.update_idx)
+
+        for _epoch in range(self.ppo_epochs):
+            for chunk_group in iter_recurrent_minibatches(
+                chunks, minibatch_chunks, shuffle=True, rng=rng
+            ):
+                actor_batch: dict[str, torch.Tensor] = {}
+                for key in ("self_features", "entity_features", "entity_mask", "agent_id"):
+                    packed, _ = self._pack_time_major(batch.observations[key], chunk_group)
+                    dtype = torch.long if key == "agent_id" else (
+                        torch.bool if key == "entity_mask" else torch.float32
+                    )
+                    actor_batch[key] = torch.as_tensor(packed, dtype=dtype, device=self.device)
+                h0_np, c0_np = chunk_initial_states(
+                    batch.recurrent_h, batch.recurrent_c, chunk_group
                 )
-                for key, val in batch.observations.items()
-                if key not in ("global_state",)
-            }
-            obs_flat["global_state"] = torch.as_tensor(
-                batch.observations["global_state"].reshape(T * E, -1), dtype=torch.float32, device=self.device
-            )
+                outputs = self.actor.forward_sequence(
+                    actor_batch,
+                    (
+                        torch.as_tensor(h0_np, dtype=torch.float32, device=self.device),
+                        torch.as_tensor(c0_np, dtype=torch.float32, device=self.device),
+                    ),
+                    episode_starts=None,
+                )
 
-            # Expand obs for agents: (T*E, N, ...) -> (T*E*N, ...)
-            self_feat = obs_flat["self_features"].reshape(T * E, N, -1)
-            entity_feat = obs_flat["entity_features"].reshape(T * E, N, *batch.observations["entity_features"].shape[3:])
-            entity_mask = obs_flat["entity_mask"].reshape(T * E, N, -1)
-            sem_map = obs_flat["semantic_map"].reshape(T * E, N, *batch.observations["semantic_map"].shape[3:])
-            goal_id = torch.as_tensor(batch.observations["current_search_goal_id"].reshape(T * E, N), dtype=torch.long, device=self.device)
-            agent_id = torch.as_tensor(batch.observations["agent_id"].reshape(T * E, N), dtype=torch.long, device=self.device)
-            region_feat = obs_flat["region_features"].reshape(T * E, N, *batch.observations["region_features"].shape[3:])
+                values: dict[str, torch.Tensor] = {}
+                valid_np: np.ndarray | None = None
+                sources = {
+                    "course": batch.course_action,
+                    "target": batch.target_action,
+                    "fire": batch.fire_action,
+                    "old_log_prob": batch.log_prob,
+                    "old_value": batch.value,
+                    "advantage": advantages,
+                    "returns": returns,
+                    "alive": live_np,
+                    "entity_mask": batch.observations["entity_mask"],
+                    "target_mask": batch.observations["target_mask"],
+                    "can_long": batch.observations["candidate_can_long"],
+                    "can_short": batch.observations["candidate_can_short"],
+                    "global_state": global_by_agent,
+                    "agent_id": batch.observations["agent_id"],
+                }
+                for key, source in sources.items():
+                    packed, valid_now = self._pack_time_major(source, chunk_group)
+                    valid_np = valid_now if valid_np is None else valid_np
+                    if packed.dtype == np.bool_:
+                        dtype = torch.bool
+                    elif np.issubdtype(packed.dtype, np.integer):
+                        dtype = torch.long
+                    else:
+                        dtype = torch.float32
+                    values[key] = torch.as_tensor(packed, dtype=dtype, device=self.device)
+                assert valid_np is not None
+                valid = torch.as_tensor(valid_np, dtype=torch.bool, device=self.device)
+                loss_mask = valid & values["alive"].bool()
 
-            flat_actor_batch = {
-                "self_features": self_feat.reshape(T * E * N, -1),
-                "entity_features": entity_feat.reshape(T * E * N, *entity_feat.shape[2:]),
-                "entity_mask": entity_mask.reshape(T * E * N, -1),
-                "semantic_map": sem_map.reshape(T * E * N, *sem_map.shape[2:]),
-                "current_search_goal_id": goal_id.reshape(T * E * N),
-                "agent_id": agent_id.reshape(T * E * N),
-                "region_features": region_feat.reshape(T * E * N, *region_feat.shape[2:]),
-            }
+                evaluated = evaluate_policy_heads(
+                    course_logits=outputs["course_logits"],
+                    target_logits=outputs["target_logits"],
+                    fire_logits=outputs["fire_logits"],
+                    course_action=values["course"],
+                    target_action=values["target"],
+                    fire_action=values["fire"],
+                    entity_mask=values["entity_mask"],
+                    alive_mask=values["alive"],
+                    candidate_can_long=values["can_long"],
+                    candidate_can_short=values["can_short"],
+                    target_mask=values["target_mask"],
+                )
+                new_log_prob = evaluated["log_prob"]
+                old_log_prob = values["old_log_prob"]
+                log_ratio = new_log_prob - old_log_prob
+                ratio = log_ratio.exp()
+                pg_unclipped = -values["advantage"] * ratio
+                pg_clipped = -values["advantage"] * ratio.clamp(
+                    1.0 - self.clip_coef, 1.0 + self.clip_coef
+                )
+                weights = loss_mask.to(torch.float32)
+                denominator = weights.sum().clamp_min(1.0)
+                pg_loss = (
+                    torch.maximum(pg_unclipped, pg_clipped) * weights
+                ).sum() / denominator
+                entropy = (evaluated["entropy"] * weights).sum() / denominator
 
-            h0 = torch.as_tensor(batch.initial_h.reshape(E * N, -1), dtype=torch.float32, device=self.device)
-            c0 = torch.as_tensor(batch.initial_c.reshape(E * N, -1), dtype=torch.float32, device=self.device)
+                predicted_value = self.critic(
+                    values["global_state"],
+                    values["agent_id"],
+                    normalized=self.use_popart,
+                )
+                value_target = values["returns"]
+                old_value = values["old_value"]
+                if self.use_popart:
+                    value_target = self.critic.normalize_targets(value_target)
+                    old_value = self.critic.normalize_targets(old_value)
+                value_loss = clipped_value_loss(
+                    predicted_value,
+                    old_value,
+                    value_target,
+                    self.value_clip_coef,
+                    valid_mask=loss_mask,
+                )
+                loss = (
+                    pg_loss
+                    + self.value_coef * value_loss
+                    - self.entropy_coef * entropy
+                )
 
-            # Forward pass through actor (step-by-step for LSTM)
-            all_course_logits = []
-            all_movement_mode_logits = []
-            all_sg_logits = []
-            all_target_logits = []
-            all_fire_logits = []
-            h, c = h0, c0
-            for t in range(T):
-                if t > 0:
-                    h, c = self._reset_recurrent_hidden_after_done(h, c, batch.done[t - 1], N)
-                step_batch = {k: v[t * E * N:(t + 1) * E * N] for k, v in flat_actor_batch.items()}
-                out = self.actor.step(step_batch, (h, c))
-                all_movement_mode_logits.append(out["movement_mode_logits"])
-                all_course_logits.append(out["course_logits"])
-                all_sg_logits.append(out["search_goal_logits"])
-                all_target_logits.append(out["target_logits"])
-                all_fire_logits.append(out["fire_logits"])
-                h, c = out["next_h"], out["next_c"]
+                self.optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    [*self.actor.parameters(), *self.critic.parameters()],
+                    self.max_grad_norm,
+                )
+                self.optimizer.step()
 
-            movement_mode_logits = torch.stack(all_movement_mode_logits, dim=0).reshape(T, E, N, -1)
-            course_logits = torch.stack(all_course_logits, dim=0).reshape(T, E, N, -1)
-            sg_logits = torch.stack(all_sg_logits, dim=0).reshape(T, E, N, -1)
-            target_logits = torch.stack(all_target_logits, dim=0).reshape(T, E, N, -1)
-            fire_logits_all = torch.stack(all_fire_logits, dim=0).reshape(T, E, N, -1, 3)
-
-            # Compute log probs
-            course_mask = torch.as_tensor(batch.observations["course_mask"].reshape(T, E, N, -1), dtype=torch.bool, device=self.device)
-            sg_mask = torch.as_tensor(batch.observations["search_goal_mask"].reshape(T, E, N, -1), dtype=torch.bool, device=self.device)
-            sg_bias = torch.as_tensor(batch.search_goal_planner_bias.reshape(T, E, N, -1), dtype=sg_logits.dtype, device=self.device)
-            target_mask = torch.as_tensor(batch.observations["target_mask"].reshape(T, E, N, -1), dtype=torch.bool, device=self.device)
-            alive_mask = torch.as_tensor(batch.observations["alive_mask"].reshape(T, E, N), dtype=torch.float32, device=self.device) > 0.5
-            has_contact = torch.as_tensor(batch.observations["has_active_contact"].reshape(T, E, N), dtype=torch.float32, device=self.device) > 0.5
-            entity_mask_t = torch.as_tensor(batch.observations["entity_mask"].reshape(T, E, N, -1), dtype=torch.bool, device=self.device)
-            candidate_can_long = torch.as_tensor(batch.observations["candidate_can_long"].reshape(T, E, N, -1), dtype=torch.bool, device=self.device)
-            candidate_can_short = torch.as_tensor(batch.observations["candidate_can_short"].reshape(T, E, N, -1), dtype=torch.bool, device=self.device)
-
-            movement_mode_act = torch.as_tensor(batch.movement_mode_action.reshape(T, E, N), dtype=torch.long, device=self.device)
-            course_act = torch.as_tensor(batch.course_action.reshape(T, E, N), dtype=torch.long, device=self.device)
-            sg_act = torch.as_tensor(batch.search_goal_action.reshape(T, E, N), dtype=torch.long, device=self.device)
-            target_act = torch.as_tensor(batch.target_action.reshape(T, E, N), dtype=torch.long, device=self.device)
-            fire_act = torch.as_tensor(batch.fire_action.reshape(T, E, N), dtype=torch.long, device=self.device)
-
-            movement_mode_mask = build_batched_movement_mode_mask(
-                target_action=target_act,
-                alive_mask=alive_mask,
-                entity_mask=entity_mask_t,
-                has_active_contact=has_contact,
-            )
-            movement_mode_dist = masked_categorical(
-                movement_mode_logits.reshape(T * E * N, -1),
-                movement_mode_mask.reshape(T * E * N, -1),
-            )
-            dynamic_course_mask = build_course_mask_for_movement_mode(
-                movement_mode=movement_mode_act,
-                alive_mask=alive_mask,
-                course_bins=course_logits.shape[-1],
-            ) & course_mask
-            course_dist = masked_categorical(course_logits.reshape(T * E * N, -1), dynamic_course_mask.reshape(T * E * N, -1))
-            sg_dist = masked_categorical((sg_logits + sg_bias).reshape(T * E * N, -1), sg_mask.reshape(T * E * N, -1))
-            target_dist = masked_categorical(target_logits.reshape(T * E * N, -1), target_mask.reshape(T * E * N, -1))
-
-            movement_mode_lp = movement_mode_dist.log_prob(movement_mode_act.reshape(T * E * N)).reshape(T, E, N)
-            course_lp = course_dist.log_prob(course_act.reshape(T * E * N)).reshape(T, E, N)
-            sg_lp_raw = sg_dist.log_prob(sg_act.reshape(T * E * N)).reshape(T, E, N)
-            refresh_mask = torch.as_tensor(batch.search_goal_refresh_mask.reshape(T, E, N), dtype=torch.bool, device=self.device)
-            sg_lp = torch.where(refresh_mask, sg_lp_raw, torch.zeros_like(sg_lp_raw))
-            target_lp = target_dist.log_prob(target_act.reshape(T * E * N)).reshape(T, E, N)
-
-            # Fire log prob: select fire logits for chosen target
-            target_act_clamped = torch.clamp(target_act, min=0, max=fire_logits_all.shape[3] - 1)
-            fire_logits_sel = fire_logits_all.gather(
-                3, target_act_clamped.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, -1, 3)
-            ).squeeze(3)
-            fire_mask_t = build_fire_mask_from_selected_targets(
-                target_action=target_act.reshape(T * E * N),
-                alive_mask=alive_mask.reshape(T * E * N),
-                candidate_can_long=candidate_can_long.reshape(T * E * N, -1),
-                candidate_can_short=candidate_can_short.reshape(T * E * N, -1),
-            ).reshape(T, E, N, 3)
-            fire_dist = masked_categorical(fire_logits_sel.reshape(T * E * N, 3), fire_mask_t.reshape(T * E * N, 3))
-            fire_lp = fire_dist.log_prob(fire_act.reshape(T * E * N)).reshape(T, E, N)
-
-            has_target_opportunity = alive_mask & torch.any(entity_mask_t, dim=-1)
-            movement_base_log_prob = movement_mode_lp + course_lp + sg_lp
-            movement_log_prob = torch.where(alive_mask, movement_base_log_prob, torch.zeros_like(movement_base_log_prob))
-            attack_log_prob = target_lp + fire_lp
-            new_log_prob = movement_log_prob + torch.where(
-                has_target_opportunity,
-                attack_log_prob,
-                torch.zeros_like(attack_log_prob),
-            )
-
-            old_log_prob = torch.as_tensor(batch.log_prob.reshape(T, E, N), dtype=torch.float32, device=self.device)
-            adv_t = torch.as_tensor(advantages.reshape(T, E), dtype=torch.float32, device=self.device).unsqueeze(-1).expand(-1, -1, N)
-
-            ratio = torch.exp(new_log_prob - old_log_prob)
-            pg_loss1 = -adv_t * ratio
-            pg_loss2 = -adv_t * torch.clamp(ratio, 1.0 - self.clip_coef, 1.0 + self.clip_coef)
-            pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-
-            # Value loss
-            global_state_t = torch.as_tensor(batch.observations["global_state"].reshape(T * E, -1), dtype=torch.float32, device=self.device)
-            new_value = self.critic(global_state_t).reshape(T, E)
-            returns_t = torch.as_tensor(returns, dtype=torch.float32, device=self.device)
-            vf_loss = F.mse_loss(new_value, returns_t)
-
-            # Entropy
-            ent = (movement_mode_dist.entropy() + course_dist.entropy() + sg_dist.entropy()).mean()
-
-            loss = pg_loss + self.vf_coef * vf_loss - self.ent_coef * ent
-            self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                list(self.actor.parameters()) + list(self.critic.parameters()),
-                self.max_grad_norm,
-            )
-            self.optimizer.step()
-
-            total_loss_sum += loss.item()
-            pg_loss_sum += pg_loss.item()
-            vf_loss_sum += vf_loss.item()
-            ent_loss_sum += ent.item()
-            n_updates += 1
+                with torch.no_grad():
+                    approx_kl = (
+                        ((ratio - 1.0) - log_ratio) * weights
+                    ).sum() / denominator
+                    clip_fraction = (
+                        ((ratio - 1.0).abs() > self.clip_coef).float() * weights
+                    ).sum() / denominator
+                for key, item in (
+                    ("loss", loss),
+                    ("pg_loss", pg_loss),
+                    ("vf_loss", value_loss),
+                    ("entropy", entropy),
+                    ("approx_kl", approx_kl),
+                    ("clip_fraction", clip_fraction),
+                ):
+                    totals[key] += float(item.detach().cpu())
+                updates += 1
+                if self.target_kl > 0.0 and float(approx_kl) > self.target_kl:
+                    stop_early = True
+                    break
+            if stop_early:
+                break
 
         self.update_idx += 1
+        result = {key: value / max(updates, 1) for key, value in totals.items()}
+        result.update({
+            "learning_rate": learning_rate,
+            "team_reward_weight": self._team_weight(),
+            "recurrent_chunks": float(len(chunks)),
+            "ppo_minibatches": float(updates),
+            "early_stop_kl": float(stop_early),
+        })
+        return result
+
+    def _rollout_diagnostics(self, batch: RolloutBatch) -> dict[str, float]:
+        alive = batch.observations["alive_mask"].astype(bool)
+        can_fire = (
+            batch.observations["candidate_can_long"]
+            | batch.observations["candidate_can_short"]
+        )
+        live_count = max(int(alive.sum()), 1)
         return {
-            "loss": total_loss_sum / max(n_updates, 1),
-            "pg_loss": pg_loss_sum / max(n_updates, 1),
-            "vf_loss": vf_loss_sum / max(n_updates, 1),
-            "entropy": ent_loss_sum / max(n_updates, 1),
+            "target_action_nonzero_rate": float(
+                ((batch.target_action > 0) & alive).sum() / live_count
+            ),
+            "fire_action_nonzero_rate": float(
+                ((batch.fire_action > 0) & alive).sum() / live_count
+            ),
+            "fireable_agent_rate": float(
+                (can_fire.any(axis=-1) & alive).sum() / live_count
+            ),
+            "alive_rate": float(alive.mean()),
+            "reward_mean": float(batch.reward.mean()),
         }
+
+    def _save(self, *, final: bool = False) -> Path:
+        extra = {}
+        if self.opponent_pool is not None:
+            extra["opponent_pool"] = self.opponent_pool.state_dict()
+        path = save_checkpoint(
+            train_cfg=self.run_cfg,
+            actor=self.actor,
+            critic=self.critic,
+            optimizer=self.optimizer,
+            env_steps=self.env_steps,
+            update_idx=self.update_idx,
+            extra=extra,
+        )
+        print(f"[checkpoint] saved{' final' if final else ''} {path}", flush=True)
+        return path
 
     def train(self) -> None:
-        """Main training loop."""
-        print(f"[train] Starting SkyArena MAPPO training. total_env_steps={self.total_env_steps}", flush=True)
-        while self.env_steps < self.total_env_steps:
-            batch, step_metrics_list = self._collect_rollout()
-            metrics = self._ppo_update(batch)
-
-            # --- Compute logging groups ---
-            # train/* (always written)
-            log_scalars(self.writer, "train", metrics, self.env_steps)
-
-            # rollout_step/* (always written — per-step averages)
-            step_diags = self._collect_rollout_step_diagnostics(batch)
-            log_scalars(self.writer, "rollout_step", step_diags, self.env_steps)
-
-            # metrics_step/* (always written — from env info["metrics"])
-            metrics_step = self._mean_numeric_dicts(step_metrics_list)
-            log_scalars(self.writer, "metrics_step", metrics_step, self.env_steps)
-
-            # episode_mean/* (only when episodes finished)
-            episode_metrics = self._summarize_rollout_episodes(batch.episode_stats)
-            if episode_metrics:
-                log_scalars(self.writer, "episode_mean", episode_metrics, self.env_steps)
-
-            # episode/* (from final info["metrics"] of finished episodes)
-            episode_final = self._summarize_episode_metrics(batch.episode_stats)
-            if episode_final:
-                log_scalars(self.writer, "episode", episode_final, self.env_steps)
-
-            print(
-                f"[train] steps={self.env_steps} loss={metrics['loss']:.4f} "
-                f"pg={metrics['pg_loss']:.4f} vf={metrics['vf_loss']:.4f} "
-                f"ent={metrics['entropy']:.4f}",
-                flush=True,
-            )
-            if episode_metrics:
-                n_finished = len(batch.episode_stats)
+        print(
+            f"[train] entity-MAPPO start envs={self.num_envs} "
+            f"rollout={self.rollout_steps} target_steps={self.total_env_steps}",
+            flush=True,
+        )
+        try:
+            while self.env_steps < self.total_env_steps:
+                start = time.perf_counter()
+                batch, step_metrics = self._collect_rollout()
+                collect_seconds = time.perf_counter() - start
+                update_metrics = self._ppo_update(batch)
+                throughput = (
+                    self.num_envs * self.rollout_steps / max(collect_seconds, 1e-9)
+                )
+                update_metrics["sample_steps_per_second"] = throughput
+                log_scalars(self.writer, "train", update_metrics, self.env_steps)
+                log_scalars(
+                    self.writer, "rollout", self._rollout_diagnostics(batch), self.env_steps
+                )
+                log_scalars(
+                    self.writer,
+                    "environment",
+                    self._numeric_means(step_metrics),
+                    self.env_steps,
+                )
+                if batch.episode_stats:
+                    winners = [row["winner"] for row in batch.episode_stats]
+                    episode_summary = {
+                        "win_rate": winners.count("red") / len(winners),
+                        "draw_rate": winners.count("draw") / len(winners),
+                        "return": float(np.mean([
+                            row["episode_return"] for row in batch.episode_stats
+                        ])),
+                        "episode_len": float(np.mean([
+                            row["episode_len"] for row in batch.episode_stats
+                        ])),
+                    }
+                    log_scalars(self.writer, "episode", episode_summary, self.env_steps)
                 print(
-                    f"[rollout] finished={n_finished} "
-                    f"win_rate={episode_metrics['win_rate']:.3f} "
-                    f"avg_len={episode_metrics['episode_len']:.1f}",
+                    f"[train] steps={self.env_steps} loss={update_metrics['loss']:.4f} "
+                    f"pg={update_metrics['pg_loss']:.4f} "
+                    f"vf={update_metrics['vf_loss']:.4f} "
+                    f"entropy={update_metrics['entropy']:.4f} "
+                    f"sample_sps={throughput:.1f}",
                     flush=True,
                 )
-            else:
-                print("[rollout] no episodes finished this update", flush=True)
-
-            if self.env_steps >= self.next_save_step:
-                path = save_checkpoint(
-                    train_cfg=self.train_cfg,
-                    actor=self.actor,
-                    critic=self.critic,
-                    optimizer=self.optimizer,
-                    env_steps=self.env_steps,
-                    update_idx=self.update_idx,
-                )
-                print(f"[checkpoint] saved {path}", flush=True)
-                self.next_save_step += self.save_interval
-
-            if self.env_steps >= self.next_eval_step:
-                eval_metrics = self.evaluate(
-                    num_episodes=self.policy_eval_episodes,
-                    deterministic=True,
-                    deterministic_reset=True,
-                    write_report=True,
-                    kind="eval",
-                )
-                log_scalars(self.writer, "eval", eval_metrics, self.env_steps)
-                self.next_eval_step += self.policy_eval_interval
-
-            if self.next_gui_eval_step is not None and self.env_steps >= self.next_gui_eval_step:
-                render_mode = "human" if self.gui_eval_human else self.gui_eval_render_mode
-                save_frames = bool(render_mode == "rgb_array" and self.gui_eval_save_frames)
-                output_dir = None
-                if save_frames:
-                    output_dir = (
-                        self.run_dirs["exp_dir"]
-                        / self.gui_eval_dir
-                        / f"step_{self.env_steps:09d}"
+                if self.save_interval > 0 and self.env_steps >= self.next_save_step:
+                    self._save()
+                    self.next_save_step += self.save_interval
+                if self.eval_interval > 0 and self.env_steps >= self.next_eval_step:
+                    log_scalars(
+                        self.writer,
+                        "eval",
+                        self.evaluate(self.eval_episodes, write_report=True),
+                        self.env_steps,
                     )
-                gui_metrics = self.evaluate(
-                    num_episodes=self.gui_eval_episodes,
-                    deterministic=self.gui_eval_deterministic,
-                    deterministic_reset=self.gui_eval_deterministic,
-                    render_mode=render_mode,
-                    max_steps=self.gui_eval_max_steps,
-                    output_dir=output_dir,
-                    save_visual=save_frames,
-                    render_every=self.gui_eval_render_every,
-                    step_tag=self.env_steps,
-                    write_report=True,
-                    kind="gui_eval",
-                )
-                log_scalars(self.writer, "gui_eval", gui_metrics, self.env_steps)
-                if output_dir is not None:
-                    print(f"[gui_eval] frame_artifacts={output_dir}", flush=True)
-                self.next_gui_eval_step += self.gui_eval_interval
+                    self.next_eval_step += self.eval_interval
+            self._save(final=True)
+        finally:
+            self.close()
 
-        latest_path = latest_checkpoint(self.train_cfg)
-        latest_steps = -1
-        if latest_path is not None:
-            try:
-                latest_steps = int(latest_path.stem.removeprefix("step_"))
-            except ValueError:
-                latest_steps = -1
-        if latest_steps < self.env_steps:
-            path = save_checkpoint(
-                train_cfg=self.train_cfg,
-                actor=self.actor,
-                critic=self.critic,
-                optimizer=self.optimizer,
-                env_steps=self.env_steps,
-                update_idx=self.update_idx,
-            )
-            print(f"[checkpoint] saved final {path}", flush=True)
-
-        print(f"[train] Done. env_steps={self.env_steps}", flush=True)
-
-    def _write_eval_report(
-        self,
-        kind: str,
-        summary: dict,
-        episodes: list,
-        checkpoint_path: str | None = None,
-    ) -> None:
-        """Write eval/gui_eval results as JSON to <exp_dir>/eval_reports/."""
-        import json
-        import time
-
+    def _write_eval_report(self, kind: str, summary: dict, episodes: list[dict]) -> Path:
         report_dir = self.run_dirs["exp_dir"] / "eval_reports"
         report_dir.mkdir(parents=True, exist_ok=True)
-
-        env_steps = summary.get("env_steps")
-        if env_steps is not None:
-            fname = f"{kind}_step_{int(env_steps):09d}.json"
-        else:
-            fname = f"{kind}_standalone_{int(time.time())}.json"
-
-        config_block = {
-            "experiment_name": str(self.cfg["train"].get("experiment_name", "")),
-            "blue_rule": str(self.env_cfg.get("blue_rule", "fix_rule_v2")),
-            "num_episodes": len(episodes),
-            "deterministic": summary.get("deterministic", None),
-            "checkpoint_path": str(checkpoint_path) if checkpoint_path else None,
-        }
-
-        def _safe(obj):
-            if isinstance(obj, (np.integer,)):
-                return int(obj)
-            if isinstance(obj, (np.floating,)):
-                return float(obj)
-            if isinstance(obj, np.ndarray):
-                return obj.tolist()
-            if isinstance(obj, torch.Tensor):
-                return obj.item()
-            if isinstance(obj, Path):
-                return str(obj)
-            return obj
-
+        path = report_dir / f"{kind}_step_{self.env_steps:09d}.json"
         report = {
             "kind": kind,
-            "env_steps": int(env_steps) if env_steps is not None else None,
-            "update_idx": int(summary.get("update_idx")) if summary.get("update_idx") is not None else None,
-            "timestamp_unix": time.time(),
-            "config": config_block,
+            "env_steps": self.env_steps,
+            "update_idx": self.update_idx,
+            "config": {
+                "experiment_name": self.train_cfg.get("experiment_name", ""),
+                "blue_rule": self.env_cfg.get("blue_rule", "fix_rule_v2"),
+            },
             "summary": summary,
             "episodes": episodes,
+            "timestamp_unix": time.time(),
         }
-        path = report_dir / fname
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(report, f, ensure_ascii=False, indent=2, default=_safe)
+        path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
         print(f"[eval_report] wrote {path}", flush=True)
+        return path
 
     def evaluate(
         self,
         num_episodes: int = 10,
-        checkpoint_path: Optional[str] = None,
+        checkpoint_path: str | None = None,
         *,
         deterministic: bool = True,
         deterministic_reset: bool = True,
-        render_mode: Optional[str] = None,
-        max_steps: Optional[int] = None,
-        output_dir: Optional[Path] = None,
+        render_mode: str | None = None,
+        max_steps: int | None = None,
+        output_dir: Path | None = None,
         save_visual: bool = False,
         render_every: int = 1,
-        step_tag: Optional[int] = None,
+        step_tag: int | None = None,
         write_report: bool = False,
         kind: str = "eval",
-    ) -> Dict[str, float]:
-        """Evaluate current policy."""
+    ) -> dict[str, float]:
+        """Evaluate only against the configured anchor rule, never the pool."""
+        del output_dir, save_visual, step_tag
         if checkpoint_path is not None:
-            load_checkpoint(checkpoint_path, self.actor, self.critic, map_location=self.device)
-
+            load_checkpoint(
+                checkpoint_path, self.actor, self.critic, map_location=self.device
+            )
+        eval_cfg = {**self.cfg, "env": {**self.env_cfg, "opponent_pool": []}}
         eval_env = SkyArenaMAPPOEnv(
-            self.cfg,
-            seed_offset=9999,
-            deterministic_reset=deterministic_reset,
+            eval_cfg, seed_offset=9999, deterministic_reset=deterministic_reset
         )
-        eval_search_goal_manager = TeamSearchPlanner(
-            TeamSearchPlannerConfig(
-                num_envs=1,
-                num_agents=self.num_agents,
-                map_size_x=eval_env.engine_config.map.width,
-                map_size_y=eval_env.engine_config.map.height,
-                search_goal_grid_size=self.search_goal_grid_size,
-                goal_hold_steps=int(self.env_cfg.get("goal_hold_steps", 10)),
-                goal_reach_radius=float(self.env_cfg.get("goal_reach_radius", 90.0)),
-            )
+        adapter = SkyArenaActionAdapter(
+            candidate_slots=eval_env.obs_builder.entity_slots,
+            course_bins=9,
+            map_width=eval_env.engine_config.map.width,
+            map_height=eval_env.engine_config.map.height,
+            radar_freq_count=self.env_cfg.get(
+                "radar_freq_count", eval_env.engine_config.radar.freq_count
+            ),
+            use_jammer_strategy=self.env_cfg.get("use_jammer_strategy", True),
+            jammer_range=self.env_cfg.get(
+                "jammer_range", eval_env.engine_config.jamming.range
+            ),
+            max_jammers_per_side=self.env_cfg.get("max_jammers_per_side", 3),
         )
-        if render_mode is not None:
-            eval_env.engine.render_mode = render_mode
-
-        hidden_dim = self.actor.lstm_hidden_dim
-        red_wins = 0
-        blue_wins = 0
-        draws = 0
-        truncated_count = 0
-        total_steps = 0
-        total_return = 0.0
-        total_red_kills = 0.0
-        total_blue_kills = 0.0
-
-        if save_visual and output_dir is not None:
-            output_dir.mkdir(parents=True, exist_ok=True)
-
-        eval_prefix = "gui_eval" if render_mode is not None else "eval"
-        step_value = int(self.env_steps if step_tag is None else step_tag)
-        render_every = max(1, int(render_every))
-        mode_text = render_mode if render_mode is not None else "policy"
-        if eval_prefix == "gui_eval":
-            print(
-                f"[gui_eval] start step={step_value} episodes={num_episodes} mode={mode_text}",
-                flush=True,
-            )
-            if render_mode == "rgb_array":
-                print("[gui_eval] mode=rgb_array, no window will be opened", flush=True)
-                print("[gui_eval] use --gui_eval_human to open a live window", flush=True)
-        else:
-            print(f"[eval] start step={step_value}", flush=True)
-
-        # Diagnostic accumulators (reset per-episode, averaged over episodes)
-        diag_target_nonzero_steps = 0
-        diag_fire_nonzero_steps = 0
-        diag_total_steps_diag = 0
-        diag_attempted_edges = 0
-        diag_selected_edges = 0
-        diag_invalid_fire = 0
-        diag_fireable_edges = 0
-        diag_fireable_agents = 0
-        diag_fireable_count = 0
-        diag_valid_candidates = 0
-        diag_valid_candidate_steps = 0
-        diag_long_available = 0
-        diag_short_available = 0
-        diag_candidate_pairs = 0
-        diag_missiles_remaining = 0
-        diag_missile_record_count = 0
-        diag_missiles_long = 0
-        diag_missiles_short = 0
-        diag_missiles_hit = 0
-        diag_missiles_missed = 0
-        diag_sel_exch = 0.0
-        diag_blue_attempted = 0
-        diag_blue_selected = 0
-        diag_blue_invalid = 0
-        diag_blue_fireable = 0
-        diag_blue_fireable_count = 0
-        diag_sel_exch_steps = 0
-        ep_sel_exch_sum = 0.0
-        # Fire head diagnostics accumulators
-        diag_fire_prob_no_fire = 0.0
-        diag_fire_prob_long = 0.0
-        diag_fire_prob_short = 0.0
-        diag_fire_entropy = 0.0
-        diag_fire_prob_steps = 0
-        diag_fire_mask_long = 0.0
-        diag_fire_mask_short = 0.0
-        diag_fire_argmax_nonzero = 0.0
-        diag_adapter_zeroed_fire = 0
-        diag_fire_nonzero_count = 0
-        diag_target_nonzero_count = 0
-        diag_tgt_can_long_sum = 0.0
-        diag_tgt_can_short_sum = 0.0
-        diag_tgt_fireable_sum = 0.0
-        diag_heading_change_sum = 0.0
-        diag_heading_change_count = 0
-        diag_spin_count = 0
-        diag_heading_flip_count = 0
-        diag_heading_flip_denom = 0
-        diag_reference_hist = np.zeros(9, dtype=np.int64)
-        diag_course_hist = np.zeros(32, dtype=np.int64)
-        diag_target_hist = np.zeros(self.candidate_slots + 1, dtype=np.int64)
-        diag_fire_hist = np.zeros(3, dtype=np.int64)
-        diag_contact_agents_sum = 0.0
-        diag_late_contact_sum = 0.0
-        diag_late_contact_count = 0
-        diag_nearest_blue_distance_sum = 0.0
-        diag_nearest_blue_distance_count = 0
-        diag_nearest_blue_distance_final_sum = 0.0
-        diag_nearest_blue_distance_final_count = 0
-        diag_search_goal_refresh_sum = 0
-        diag_search_goal_refresh_denom = 0
-        diag_red_team_spread_sum = 0.0
-        diag_red_team_spread_count = 0
-        diag_blue_alive_final_sum = 0.0
-        episode_records: list = []
-
-        for ep in range(num_episodes):
-            if eval_prefix == "gui_eval":
-                print(f"[gui_eval] episode {ep + 1}/{num_episodes} start", flush=True)
-            obs = eval_env.reset()
-            eval_search_goal_manager.reset_all()
-            self.action_adapter.reset_ew_state("eval")
-            h = torch.zeros((1, self.num_agents, hidden_dim), dtype=torch.float32, device=self.device)
-            c = torch.zeros((1, self.num_agents, hidden_dim), dtype=torch.float32, device=self.device)
-            done = False
-            ep_steps = 0
-            ep_return = 0.0
-            info: Dict[str, Any] = {}
-            episode_truncated = False
-
-            # Per-episode diagnostic accumulators
-            ep_target_nonzero_steps = 0
-            ep_fire_nonzero_steps = 0
-            ep_attempted_edges = 0
-            ep_selected_edges = 0
-            ep_invalid_fire = 0
-            ep_fireable_edges = 0
-            ep_fireable_agents = 0
-            ep_fireable_count = 0
-            # Blue per-episode accumulators (from cache, like red)
-            ep_blue_attempted = 0
-            ep_blue_selected = 0
-            ep_blue_invalid = 0
-            ep_blue_fireable = 0
-            ep_blue_fireable_count = 0
-            ep_sel_exch_sum = 0.0
-            ep_sel_exch_steps = 0
-            # Fire head diagnostics per-episode
-            ep_fire_prob_no_fire = 0.0
-            ep_fire_prob_long = 0.0
-            ep_fire_prob_short = 0.0
-            ep_fire_entropy = 0.0
-            ep_fire_prob_steps = 0
-            ep_fire_mask_long = 0.0
-            ep_fire_mask_short = 0.0
-            ep_fire_argmax_nonzero = 0.0
-            # Adapter zeroing diagnostics
-            ep_adapter_zeroed_fire = 0
-            ep_fire_nonzero_count = 0
-            ep_target_nonzero_count = 0
-            ep_tgt_can_long_sum = 0.0
-            ep_tgt_can_short_sum = 0.0
-            ep_tgt_fireable_sum = 0.0
-            # Movement/search diagnostics per episode.
-            ep_heading_change_sum = 0.0
-            ep_heading_change_count = 0
-            ep_spin_count = 0
-            ep_heading_flip_count = 0
-            ep_heading_flip_denom = 0
-            ep_prev_turn_delta = np.zeros(self.num_agents, dtype=np.float32)
-            ep_prev_turn_valid = np.zeros(self.num_agents, dtype=bool)
-            ep_reference_hist = np.zeros(9, dtype=np.int64)
-            ep_course_hist = np.zeros(32, dtype=np.int64)
-            ep_target_hist = np.zeros(self.candidate_slots + 1, dtype=np.int64)
-            ep_fire_hist = np.zeros(3, dtype=np.int64)
-            ep_contact_agents_sum = 0.0
-            ep_late_contact_sum = 0.0
-            ep_late_contact_count = 0
-            ep_nearest_blue_distance_sum = 0.0
-            ep_nearest_blue_distance_count = 0
-            ep_search_goal_refresh_sum = 0
-            ep_search_goal_refresh_denom = 0
-            ep_red_team_spread_sum = 0.0
-            ep_red_team_spread_count = 0
-
-            frame_dir: Optional[Path] = None
-            if save_visual and render_mode == "rgb_array" and output_dir is not None:
-                stem = f"step_{step_value:09d}_episode_{ep:03d}"
-                frame_dir = output_dir / f"{stem}_frames"
-                frame_dir.mkdir(parents=True, exist_ok=True)
-
-            while not done and (max_steps is None or ep_steps < max_steps):
-                obs_batch = {k: v[np.newaxis] for k, v in obs.items()}
-                with torch.no_grad():
+        records: list[dict] = []
+        render_every = max(int(render_every), 1)
+        was_training = self.actor.training
+        self.actor.eval()
+        try:
+            for episode in range(int(num_episodes)):
+                obs = eval_env.reset()
+                h = torch.zeros(
+                    1, self.num_agents, self.actor.lstm_hidden_dim, device=self.device
+                )
+                c = torch.zeros_like(h)
+                done = False
+                episode_return = 0.0
+                steps = 0
+                target_nonzero = 0
+                fire_nonzero = 0
+                info: dict[str, Any] = {}
+                while not done and (max_steps is None or steps < max_steps):
+                    obs_batch = {key: value[None] for key, value in obs.items()}
                     sampled = sample_policy_actions(
-                        self.actor, obs_batch, (h, c), self.device, deterministic=deterministic,
-                        search_goal_manager=eval_search_goal_manager,
-                        return_diagnostics=True,
+                        self.actor,
+                        obs_batch,
+                        (h, c),
+                        self.device,
+                        deterministic,
                     )
-                sky_action = self.action_adapter.decode(
-                    course_action=sampled["course"][0],
-                    search_goal_action=sampled["search_goal"][0],
-                    target_action=sampled["target"][0],
-                    fire_action=sampled["fire"][0],
-                    own=eval_env.engine.state.red,
-                    candidate_ids=obs_batch["candidate_ids"][0],
-                    candidate_can_long=obs_batch["candidate_can_long"][0],
-                    candidate_can_short=obs_batch["candidate_can_short"][0],
-                    has_active_contact=obs_batch["has_active_contact"][0] > 0.5,
-                    current_heading=eval_env.engine.state.red.heading[:eval_env.red_fighter_num],
-                    movement_mode_action=sampled["movement_mode"][0],
-                    enemy=eval_env.engine.state.blue,
-                    entity_features=obs_batch["entity_features"][0],
-                    ew_state_key="eval",
-                    step_count=eval_env.engine.state.step_count,
-                )
-                # --- Adapter zeroing diagnostics ---
-                fire_policy = sampled["fire"][0]  # (N,) raw policy fire action
-                fire_decoded = sky_action.fire_type  # (N,) decoded fire type
-                tgt_policy = sampled["target"][0]  # (N,) 1-indexed slot
-                tgt_decoded = sky_action.target_idx  # (N,) enemy index
-                alive = (obs_batch["alive_mask"][0] > 0.5)
-                can_long_arr = obs_batch["candidate_can_long"][0]
-                can_short_arr = obs_batch["candidate_can_short"][0]
-                # adapter zeroed: policy wanted fire but adapter set fire_type=0
-                adapter_zeroed = (fire_policy > 0) & (fire_decoded == 0) & alive
-                ep_adapter_zeroed_fire += int(np.count_nonzero(adapter_zeroed))
-                ep_fire_nonzero_count += int(np.count_nonzero((fire_policy > 0) & alive))
-                has_tgt = (tgt_policy > 0) & alive
-                n_tgt = int(np.count_nonzero(has_tgt))
-                ep_target_nonzero_count += n_tgt
-                if n_tgt > 0:
-                    slot_idx = np.clip(tgt_policy[has_tgt] - 1, 0, can_long_arr.shape[1] - 1)
-                    idx = np.arange(has_tgt.shape[0])[has_tgt]
-                    tgt_long = can_long_arr[idx, slot_idx]
-                    tgt_short = can_short_arr[idx, slot_idx]
-                    tgt_fireable = tgt_long | tgt_short
-                    ep_tgt_can_long_sum += float(np.sum(tgt_long))
-                    ep_tgt_can_short_sum += float(np.sum(tgt_short))
-                    ep_tgt_fireable_sum += float(np.sum(tgt_fireable))
-
-                current_heading = eval_env.engine.state.red.heading[:eval_env.red_fighter_num].copy()
-                turn_delta = self._signed_angle_delta_deg(sky_action.course, current_heading)
-                alive_contact = alive & (obs_batch["has_active_contact"][0] > 0.5)
-                if np.any(alive):
-                    ep_heading_change_sum += float(np.sum(np.abs(turn_delta[alive])))
-                    ep_heading_change_count += int(np.count_nonzero(alive))
-                    ep_spin_count += int(np.count_nonzero(np.abs(turn_delta[alive]) > 60.0))
-                    ep_contact_agents_sum += float(np.count_nonzero(alive_contact))
-                    ep_reference_hist += np.bincount(
-                        np.asarray(sampled["movement_mode"][0][alive], dtype=np.int64),
-                        minlength=9,
-                    )[:9]
-                    ep_course_hist += np.bincount(
-                        np.asarray(sampled["course"][0][alive], dtype=np.int64),
-                        minlength=32,
-                    )[:32]
-                    ep_target_hist += np.bincount(
-                        np.asarray(sampled["target"][0][alive], dtype=np.int64),
-                        minlength=self.candidate_slots + 1,
-                    )[: self.candidate_slots + 1]
-                    ep_fire_hist += np.bincount(
-                        np.asarray(sampled["fire"][0][alive], dtype=np.int64),
-                        minlength=3,
-                    )[:3]
-                    refresh_mask = np.asarray(sampled["search_goal_refresh_mask"][0], dtype=bool)
-                    ep_search_goal_refresh_sum += int(np.count_nonzero(refresh_mask & alive))
-                    ep_search_goal_refresh_denom += int(np.count_nonzero(alive))
-
-                    turn_active = alive_contact
-                    valid_flip = turn_active & ep_prev_turn_valid
-                    if np.any(valid_flip):
-                        prev = ep_prev_turn_delta[valid_flip]
-                        cur = turn_delta[valid_flip]
-                        strong = (np.abs(prev) >= 11.25) & (np.abs(cur) >= 11.25)
-                        ep_heading_flip_count += int(np.count_nonzero(strong & (np.sign(prev) != np.sign(cur))))
-                        ep_heading_flip_denom += int(np.count_nonzero(strong))
-                    ep_prev_turn_delta[turn_active] = turn_delta[turn_active]
-                    ep_prev_turn_valid[turn_active] = True
-                    ep_prev_turn_valid[~turn_active] = False
-
-                    max_steps_ref = max_steps if max_steps is not None else eval_env.engine_config.max_steps
-                    if eval_env.engine.state.step_count >= int(0.75 * max(max_steps_ref, 1)):
-                        ep_late_contact_sum += 1.0 if np.any(alive_contact) else 0.0
-                        ep_late_contact_count += 1
-
-                nearest_dist = self._nearest_distance_between_alive(
-                    eval_env.engine.state.red,
-                    eval_env.engine.state.blue,
-                    eval_env.red_fighter_num,
-                    eval_env.blue_fighter_num,
-                )
-                if nearest_dist is not None:
-                    ep_nearest_blue_distance_sum += nearest_dist
-                    ep_nearest_blue_distance_count += 1
-                team_spread = self._team_spread(eval_env.engine.state.red, eval_env.red_fighter_num)
-                if team_spread is not None:
-                    ep_red_team_spread_sum += team_spread
-                    ep_red_team_spread_count += 1
-
-                eval_env.set_current_search_goal_id(sampled["current_search_goal_id"][0])
-                obs, reward, done, info = eval_env.step(sky_action)
-                ep_return += float(reward)
-                h = sampled["next_h"].to(self.device)
-                c = sampled["next_c"].to(self.device)
-                ep_steps += 1
-
-                # --- Diagnostics collection per step ---
-                alive_mask = (obs_batch["alive_mask"][0] > 0.5)
-                target = sampled["target"][0]
-                fire = sampled["fire"][0]
-                if np.any(alive_mask):
-                    if np.any(target[alive_mask] > 0):
-                        ep_target_nonzero_steps += 1
-                    if np.any(fire[alive_mask] > 0):
-                        ep_fire_nonzero_steps += 1
-
-                cache = eval_env.engine.state.cache
-                if cache is not None:
-                    attempted = int(np.count_nonzero(
-                        cache.red_attempted_long_matrix | cache.red_attempted_short_matrix
-                    )) if cache.red_attempted_long_matrix.size > 0 else 0
-                    selected = int(np.count_nonzero(
-                        cache.red_selected_long_matrix | cache.red_selected_short_matrix
-                    )) if cache.red_selected_long_matrix.size > 0 else 0
-                    ep_attempted_edges += attempted
-                    ep_selected_edges += selected
-                    # invalid = attempted but not selected
-                    ep_invalid_fire += max(0, attempted - selected)
-
-                    fe = int(np.count_nonzero(
-                        cache.red_fireable_long | cache.red_fireable_short
+                    action = adapter.decode(
+                        course_action=sampled["course"][0],
+                        target_action=sampled["target"][0],
+                        fire_action=sampled["fire"][0],
+                        own=eval_env.engine.state.red,
+                        candidate_ids=obs["candidate_ids"],
+                        candidate_can_long=obs["candidate_can_long"],
+                        candidate_can_short=obs["candidate_can_short"],
+                        has_active_contact=obs["has_active_contact"] > 0.5,
+                        current_heading=eval_env.engine.state.red.heading[: self.num_agents],
+                        entity_features=obs["entity_features"],
+                        ew_state_key="eval",
+                        step_count=eval_env.engine.state.step_count,
+                    )
+                    alive = obs["alive_mask"] > 0.5
+                    target_nonzero += int(np.count_nonzero(
+                        (sampled["target"][0] > 0) & alive
                     ))
-                    fa = int(np.count_nonzero(
-                        np.any(cache.red_fireable_long | cache.red_fireable_short, axis=1)
+                    fire_nonzero += int(np.count_nonzero(
+                        (sampled["fire"][0] > 0) & alive
                     ))
-                    ep_fireable_edges += fe
-                    ep_fireable_agents += fa
-                    ep_fireable_count += 1
-                    # Blue metrics from cache (like red)
-                    b_att = int(np.count_nonzero(
-                        cache.blue_attempted_long_matrix | cache.blue_attempted_short_matrix
-                    )) if cache.blue_attempted_long_matrix.size > 0 else 0
-                    b_sel = int(np.count_nonzero(
-                        cache.blue_selected_long_matrix | cache.blue_selected_short_matrix
-                    )) if cache.blue_selected_long_matrix.size > 0 else 0
-                    ep_blue_attempted += b_att
-                    ep_blue_selected += b_sel
-                    ep_blue_invalid += max(0, b_att - b_sel)
-                    b_fe = int(np.count_nonzero(
-                        cache.blue_fireable_long | cache.blue_fireable_short
-                    ))
-                    ep_blue_fireable += b_fe
-                    ep_blue_fireable_count += 1
-                    # selected_expected_exchange per step
-                    sm = info.get("metrics", {})
-                    sel_ex = sm.get("selected_expected_exchange")
-                    if sel_ex is not None:
-                        ep_sel_exch_sum += float(sel_ex)
-                        ep_sel_exch_steps += 1
+                    obs, team_reward, done, info = eval_env.step(action)
+                    episode_return += float(team_reward)
+                    h, c = sampled["next_h"], sampled["next_c"]
+                    steps += 1
+                    if render_mode is not None and steps % render_every == 0:
+                        eval_env.engine.render(render_mode)
+                records.append({
+                    "episode": episode,
+                    "winner": str(info.get("winner", "draw")),
+                    "episode_return": episode_return,
+                    "episode_len": steps,
+                    "target_action_nonzero_count": target_nonzero,
+                    "fire_action_nonzero_count": fire_nonzero,
+                    **(
+                        info.get("metrics", {})
+                        if isinstance(info.get("metrics"), dict)
+                        else {}
+                    ),
+                })
+        finally:
+            self.actor.train(was_training)
+            eval_env.engine.close()
 
-                # --- Fire probability diagnostics per step ---
-                fire_logits_sel = sampled.get("fire_logits_selected")
-                fire_raw_mask = sampled.get("fire_mask")
-                if fire_logits_sel is not None and fire_raw_mask is not None and np.any(alive_mask):
-                    logits = fire_logits_sel[0].astype(np.float64)  # (N, 3)
-                    fmask = fire_raw_mask[0]  # (N, 3)
-                    logits = logits - logits.max(axis=-1, keepdims=True)
-                    exp_l = np.exp(logits)
-                    probs = exp_l / exp_l.sum(axis=-1, keepdims=True)  # (N, 3)
-                    alive_probs = probs[alive_mask]
-                    alive_fmask = fmask[alive_mask]
-                    if alive_probs.shape[0] > 0:
-                        ep_fire_prob_no_fire += float(alive_probs[:, 0].mean())
-                        ep_fire_prob_long += float(alive_probs[:, 1].mean())
-                        ep_fire_prob_short += float(alive_probs[:, 2].mean())
-                        eps = 1e-12
-                        ep_fire_entropy += float((-alive_probs * np.log(alive_probs + eps)).sum(axis=-1).mean())
-                        ep_fire_prob_steps += 1
-                        ep_fire_mask_long += float(alive_fmask[:, 1].mean())
-                        ep_fire_mask_short += float(alive_fmask[:, 2].mean())
-                        fire_argmax = np.argmax(logits[alive_mask], axis=-1)
-                        ep_fire_argmax_nonzero += float(np.mean(fire_argmax > 0))
-
-                # Candidate data from obs (before step)
-                cid = obs_batch["candidate_ids"][0]
-                can_long = obs_batch["candidate_can_long"][0]
-                can_short = obs_batch["candidate_can_short"][0]
-                valid_mask = cid >= 0
-                n_valid = int(np.count_nonzero(valid_mask))
-                diag_valid_candidates += n_valid
-                diag_valid_candidate_steps += 1
-                if n_valid > 0:
-                    diag_long_available += int(np.count_nonzero(can_long & valid_mask))
-                    diag_short_available += int(np.count_nonzero(can_short & valid_mask))
-                    diag_candidate_pairs += n_valid
-
-                should_render = False
-                if render_mode == "human":
-                    should_render = True
-                elif render_mode is not None:
-                    should_render = ep_steps == 1 or (ep_steps % render_every == 0)
-                if should_render:
-                    frame = eval_env.engine.render(render_mode)
-                    if frame is not None and save_visual:
-                        if frame_dir is not None:
-                            np.savez_compressed(frame_dir / f"frame_{ep_steps:05d}.npz", frame=frame)
-
-            if not done and max_steps is not None:
-                episode_truncated = True
-
-            if render_mode is not None and render_mode != "human":
-                frame = eval_env.engine.render(render_mode)
-                if frame is not None and save_visual and frame_dir is not None:
-                    np.savez_compressed(frame_dir / f"frame_{ep_steps:05d}_final.npz", frame=frame)
-
-            winner = "draw" if episode_truncated else str(info.get("winner", "draw"))
-            if winner == "red":
-                red_wins += 1
-            elif winner == "blue":
-                blue_wins += 1
-            else:
-                draws += 1
-            if episode_truncated:
-                truncated_count += 1
-            total_steps += ep_steps
-            total_return += ep_return
-            metrics = info.get("metrics", {})
-            total_red_kills += float(metrics.get("red_kills", 0.0))
-            total_blue_kills += float(metrics.get("blue_kills", 0.0))
-            if eval_prefix == "gui_eval":
-                status = "truncated" if episode_truncated else winner
-                print(
-                    f"[gui_eval] episode {ep + 1}/{num_episodes} done "
-                    f"steps={ep_steps} winner={status}",
-                    flush=True,
-                )
-
-            # --- Per-episode diagnostics accumulation ---
-            nz_steps = max(ep_steps, 1)
-            ep_target_rate = ep_target_nonzero_steps / nz_steps
-            ep_fire_rate = ep_fire_nonzero_steps / nz_steps
-            ep_attempted_mean = ep_attempted_edges / nz_steps
-            ep_selected_mean = ep_selected_edges / nz_steps
-            ep_invalid_mean = ep_invalid_fire / nz_steps
-            ep_fireable_mean = ep_fireable_edges / max(ep_fireable_count, 1)
-            ep_red_missiles = int(np.sum(eval_env.engine.state.red.long_ammo[:eval_env.red_fighter_num])
-                                  + np.sum(eval_env.engine.state.red.short_ammo[:eval_env.red_fighter_num]))
-            ep_blue_missiles = int(np.sum(eval_env.engine.state.blue.long_ammo[:eval_env.blue_fighter_num])
-                                   + np.sum(eval_env.engine.state.blue.short_ammo[:eval_env.blue_fighter_num]))
-
-            # Blue step-mean rates
-            ep_blue_attempted_mean = ep_blue_attempted / nz_steps
-            ep_blue_selected_mean = ep_blue_selected / nz_steps
-            ep_blue_fireable_mean = ep_blue_fireable / max(ep_blue_fireable_count, 1)
-            ep_blue_invalid_mean = ep_blue_invalid / nz_steps
-            # selected_expected_exchange step mean
-            ep_sel_exch_mean = ep_sel_exch_sum / max(ep_sel_exch_steps, 1)
-
-            # Fire prob means
-            fp_denom = max(ep_fire_prob_steps, 1)
-            ep_fire_noop_mean = ep_fire_prob_no_fire / fp_denom
-            ep_fire_long_mean = ep_fire_prob_long / fp_denom
-            ep_fire_short_mean = ep_fire_prob_short / fp_denom
-            ep_fire_ent_mean = ep_fire_entropy / fp_denom
-            ep_fire_mask_long_rate = ep_fire_mask_long / fp_denom
-            ep_fire_mask_short_rate = ep_fire_mask_short / fp_denom
-            ep_fire_argmax_nz_rate = ep_fire_argmax_nonzero / fp_denom
-            # Adapter diag rates
-            ep_adapter_zeroed_rate = ep_adapter_zeroed_fire / max(ep_fire_nonzero_count, 1)
-            ep_tgt_fireable_steps = max(ep_target_nonzero_count, 1)
-            ep_tgt_can_long_rate = ep_tgt_can_long_sum / ep_tgt_fireable_steps
-            ep_tgt_can_short_rate = ep_tgt_can_short_sum / ep_tgt_fireable_steps
-            ep_tgt_fireable_rate = ep_tgt_fireable_sum / ep_tgt_fireable_steps
-            ep_heading_change_mean = ep_heading_change_sum / max(ep_heading_change_count, 1)
-            ep_spin_rate = ep_spin_count / max(ep_heading_change_count, 1)
-            ep_heading_flip_rate = ep_heading_flip_count / max(ep_heading_flip_denom, 1)
-            ep_contact_agents_mean = ep_contact_agents_sum / nz_steps
-            ep_late_contact_rate = ep_late_contact_sum / max(ep_late_contact_count, 1)
-            ep_nearest_blue_distance_mean = ep_nearest_blue_distance_sum / max(ep_nearest_blue_distance_count, 1)
-            ep_nearest_blue_distance_final = self._nearest_distance_between_alive(
-                eval_env.engine.state.red,
-                eval_env.engine.state.blue,
-                eval_env.red_fighter_num,
-                eval_env.blue_fighter_num,
-            )
-            ep_search_goal_refresh_rate = ep_search_goal_refresh_sum / max(ep_search_goal_refresh_denom, 1)
-            ep_red_team_spread = ep_red_team_spread_sum / max(ep_red_team_spread_count, 1)
-            ep_blue_alive_final = int(metrics.get("blue_alive", eval_env.engine.state.blue.fighter_alive_count))
-
-            episode_records.append({
-                "episode": ep,
-                "seed": int(self.cfg["train"].get("seed", 0) + 9999 + ep),
-                "winner": winner,
-                "reason": str(info.get("reason", "")),
-                "steps": ep_steps,
-                "return": float(ep_return),
-                "red_kills": float(metrics.get("red_kills", 0)),
-                "blue_kills": float(metrics.get("blue_kills", 0)),
-                "red_alive": int(metrics.get("red_alive", 0)),
-                "blue_alive": int(metrics.get("blue_alive", 0)),
-                "red_missiles_remaining": int(ep_red_missiles),
-                "blue_missiles_remaining": int(ep_blue_missiles),
-                "target_action_nonzero_rate": float(ep_target_rate),
-                "fire_action_nonzero_rate": float(ep_fire_rate),
-                "red_fireable_edges_mean": float(ep_fireable_mean),
-                "blue_fireable_edges_mean": float(ep_blue_fireable_mean),
-                "red_attempted_edges_mean": float(ep_attempted_mean),
-                "blue_attempted_edges_mean": float(ep_blue_attempted_mean),
-                "red_selected_edges_mean": float(ep_selected_mean),
-                "blue_selected_edges_mean": float(ep_blue_selected_mean),
-                "red_invalid_fire_count_mean": float(ep_invalid_mean),
-                "blue_invalid_fire_count_mean": float(ep_blue_invalid_mean),
-                "selected_expected_exchange_mean": float(ep_sel_exch_mean),
-                "missiles_launched_long": int(metrics.get("missiles_launched_long", 0)),
-                "missiles_launched_short": int(metrics.get("missiles_launched_short", 0)),
-                "missiles_hit": int(metrics.get("missiles_hit", 0)),
-                "missiles_missed": int(metrics.get("missiles_missed", 0)),
-                "fire_argmax_nonzero_rate": float(ep_fire_argmax_nz_rate),
-                "fire_noop_prob_mean": float(ep_fire_noop_mean),
-                "fire_long_prob_mean": float(ep_fire_long_mean),
-                "fire_short_prob_mean": float(ep_fire_short_mean),
-                "fire_entropy_mean": float(ep_fire_ent_mean),
-                "fire_valid_mask_long_rate": float(ep_fire_mask_long_rate),
-                "fire_valid_mask_short_rate": float(ep_fire_mask_short_rate),
-                "adapter_zeroed_fire_rate": float(ep_adapter_zeroed_rate),
-                "target_selected_fireable_rate": float(ep_tgt_fireable_rate),
-                "target_selected_nonfireable_rate": 1.0 - float(ep_tgt_fireable_rate),
-                "selected_target_can_long_rate": float(ep_tgt_can_long_rate),
-                "selected_target_can_short_rate": float(ep_tgt_can_short_rate),
-                "heading_change_mean": float(ep_heading_change_mean),
-                "heading_delta_abs_mean": float(ep_heading_change_mean),
-                "heading_flip_rate": float(ep_heading_flip_rate),
-                "spin_rate": float(ep_spin_rate),
-                "movement_mode_hist": ep_reference_hist.astype(int).tolist(),
-                "course_hist": ep_course_hist.astype(int).tolist(),
-                "course_action_histogram": ep_course_hist.astype(int).tolist(),
-                "target_action_hist": ep_target_hist.astype(int).tolist(),
-                "fire_action_hist": ep_fire_hist.astype(int).tolist(),
-                "contact_agents_mean": float(ep_contact_agents_mean),
-                "late_contact_rate": float(ep_late_contact_rate),
-                "nearest_blue_distance_mean": float(ep_nearest_blue_distance_mean),
-                "nearest_blue_distance_final": (
-                    None if ep_nearest_blue_distance_final is None else float(ep_nearest_blue_distance_final)
-                ),
-                "search_goal_refresh_rate": float(ep_search_goal_refresh_rate),
-                "red_team_spread": float(ep_red_team_spread),
-                "blue_alive_final": int(ep_blue_alive_final),
-            })
-
-            diag_missiles_long += int(metrics.get("missiles_launched_long", 0))
-            diag_missiles_short += int(metrics.get("missiles_launched_short", 0))
-            diag_missiles_hit += int(metrics.get("missiles_hit", 0))
-            diag_missiles_missed += int(metrics.get("missiles_missed", 0))
-            diag_sel_exch += float(metrics.get("selected_expected_exchange", 0.0))
-            diag_blue_attempted += ep_blue_attempted
-            diag_blue_selected += ep_blue_selected
-            diag_blue_invalid += ep_blue_invalid
-            diag_blue_fireable += ep_blue_fireable
-            diag_blue_fireable_count += ep_blue_fireable_count
-            diag_sel_exch_steps += ep_sel_exch_steps
-            # Fire prob diag accumulation
-            diag_fire_prob_no_fire += ep_fire_prob_no_fire
-            diag_fire_prob_long += ep_fire_prob_long
-            diag_fire_prob_short += ep_fire_prob_short
-            diag_fire_entropy += ep_fire_entropy
-            diag_fire_prob_steps += ep_fire_prob_steps
-            diag_fire_mask_long += ep_fire_mask_long
-            diag_fire_mask_short += ep_fire_mask_short
-            diag_adapter_zeroed_fire += ep_adapter_zeroed_fire
-            diag_fire_nonzero_count += ep_fire_nonzero_count
-            diag_target_nonzero_count += ep_target_nonzero_count
-            diag_tgt_can_long_sum += ep_tgt_can_long_sum
-            diag_tgt_can_short_sum += ep_tgt_can_short_sum
-            diag_tgt_fireable_sum += ep_tgt_fireable_sum
-            diag_heading_change_sum += ep_heading_change_sum
-            diag_heading_change_count += ep_heading_change_count
-            diag_spin_count += ep_spin_count
-            diag_heading_flip_count += ep_heading_flip_count
-            diag_heading_flip_denom += ep_heading_flip_denom
-            diag_reference_hist += ep_reference_hist
-            diag_course_hist += ep_course_hist
-            diag_target_hist += ep_target_hist
-            diag_fire_hist += ep_fire_hist
-            diag_contact_agents_sum += ep_contact_agents_sum
-            diag_late_contact_sum += ep_late_contact_sum
-            diag_late_contact_count += ep_late_contact_count
-            diag_nearest_blue_distance_sum += ep_nearest_blue_distance_sum
-            diag_nearest_blue_distance_count += ep_nearest_blue_distance_count
-            if ep_nearest_blue_distance_final is not None:
-                diag_nearest_blue_distance_final_sum += float(ep_nearest_blue_distance_final)
-                diag_nearest_blue_distance_final_count += 1
-            diag_search_goal_refresh_sum += ep_search_goal_refresh_sum
-            diag_search_goal_refresh_denom += ep_search_goal_refresh_denom
-            diag_red_team_spread_sum += ep_red_team_spread_sum
-            diag_red_team_spread_count += ep_red_team_spread_count
-            diag_blue_alive_final_sum += float(ep_blue_alive_final)
-
-            diag_fire_argmax_nonzero += ep_fire_argmax_nonzero
-            diag_blue_fireable += int(metrics.get("blue_fireable_edges", 0))
-
-            diag_target_nonzero_steps += ep_target_nonzero_steps
-            diag_fire_nonzero_steps += ep_fire_nonzero_steps
-            diag_total_steps_diag += ep_steps
-            diag_attempted_edges += ep_attempted_edges
-            diag_selected_edges += ep_selected_edges
-            diag_invalid_fire += ep_invalid_fire
-            diag_fireable_edges += ep_fireable_edges
-            diag_fireable_agents += ep_fireable_agents
-            diag_fireable_count += ep_fireable_count
-            diag_missiles_remaining += ep_red_missiles
-            diag_missile_record_count += 1
-
-            if eval_prefix == "gui_eval":
-                print(
-                    f"[gui_eval_diag] red_attempted={ep_attempted_mean:.2f} "
-                    f"red_selected={ep_selected_mean:.2f} "
-                    f"red_invalid={ep_invalid_mean:.2f} "
-                    f"red_fireable_edges_mean={ep_fireable_mean:.1f} "
-                    f"target_nonzero_rate={ep_target_rate:.3f} "
-                    f"fire_nonzero_rate={ep_fire_rate:.3f} "
-                    f"red_missiles_remaining={ep_red_missiles}",
-                    flush=True,
-                )
-
-        eval_env.engine.close()
-
-        win_rate = red_wins / max(num_episodes, 1)
-        avg_steps = total_steps / max(num_episodes, 1)
-        avg_return = total_return / max(num_episodes, 1)
-        avg_red_kills = total_red_kills / max(num_episodes, 1)
-        avg_blue_kills = total_blue_kills / max(num_episodes, 1)
-
-        # Overall diagnostic rates
-        diag_denom = max(diag_total_steps_diag, 1)
-        diag_fireable_denom = max(diag_fireable_count, 1)
-        diag_candidate_denom = max(diag_candidate_pairs, 1)
-        diag_missile_denom = max(diag_missile_record_count, 1)
-        red_target_nonzero_rate = diag_target_nonzero_steps / diag_denom
-        red_fire_nonzero_rate = diag_fire_nonzero_steps / diag_denom
-        red_attempted_edges = diag_attempted_edges / diag_denom
-        red_selected_edges = diag_selected_edges / diag_denom
-        red_invalid_fire_count_total = float(diag_invalid_fire)
-        red_invalid_fire_count_per_episode = red_invalid_fire_count_total / max(num_episodes, 1)
-        red_fireable_edges = diag_fireable_edges / diag_fireable_denom
-        red_fireable_agents = diag_fireable_agents / diag_fireable_denom
-        red_candidate_valid_count = diag_valid_candidates / diag_denom
-        red_long_available_rate = diag_long_available / diag_candidate_denom
-        red_short_available_rate = diag_short_available / diag_candidate_denom
-        red_missiles_remaining = diag_missiles_remaining / diag_missile_denom
-
-        # Blue step-mean metrics
-        blue_attempted_edges = diag_blue_attempted / diag_denom
-        blue_selected_edges = diag_blue_selected / diag_denom
-        blue_fireable_edges = diag_blue_fireable / max(diag_blue_fireable_count, 1)
-        blue_invalid_fire_count_total = float(diag_blue_invalid)
-        blue_invalid_fire_count_per_episode = blue_invalid_fire_count_total / max(num_episodes, 1)
-        sel_exch_mean = diag_sel_exch / max(diag_sel_exch_steps, 1)
-
-        # Fire head diagnostics
-        fire_prob_denom = max(diag_fire_prob_steps, 1)
-        fire_noop_prob_mean = diag_fire_prob_no_fire / fire_prob_denom
-        fire_long_prob_mean = diag_fire_prob_long / fire_prob_denom
-        fire_short_prob_mean = diag_fire_prob_short / fire_prob_denom
-        fire_entropy_mean = diag_fire_entropy / fire_prob_denom
-        fire_mask_long_rate = diag_fire_mask_long / fire_prob_denom
-        fire_mask_short_rate = diag_fire_mask_short / fire_prob_denom
-        fire_argmax_nonzero_rate = diag_fire_argmax_nonzero / fire_prob_denom
-
-        # Adapter zeroing / target fireability diagnostics
-        adapter_zeroed_rate = diag_adapter_zeroed_fire / max(diag_fire_nonzero_count, 1)
-        tgt_fireable_denom = max(diag_target_nonzero_count, 1)
-        target_selected_fireable_rate = diag_tgt_fireable_sum / tgt_fireable_denom
-        selected_target_can_long_rate = diag_tgt_can_long_sum / tgt_fireable_denom
-        selected_target_can_short_rate = diag_tgt_can_short_sum / tgt_fireable_denom
-        heading_change_mean = diag_heading_change_sum / max(diag_heading_change_count, 1)
-        spin_rate = diag_spin_count / max(diag_heading_change_count, 1)
-        heading_flip_rate = diag_heading_flip_count / max(diag_heading_flip_denom, 1)
-        movement_mode_hist = diag_reference_hist.astype(int).tolist()
-        course_action_histogram = diag_course_hist.astype(int).tolist()
-        target_action_hist = diag_target_hist.astype(int).tolist()
-        fire_action_hist = diag_fire_hist.astype(int).tolist()
-        contact_agents_mean = diag_contact_agents_sum / diag_denom
-        late_contact_rate = diag_late_contact_sum / max(diag_late_contact_count, 1)
-        nearest_blue_distance_mean = diag_nearest_blue_distance_sum / max(diag_nearest_blue_distance_count, 1)
-        nearest_blue_distance_final = (
-            diag_nearest_blue_distance_final_sum / max(diag_nearest_blue_distance_final_count, 1)
-        )
-        search_goal_refresh_rate = diag_search_goal_refresh_sum / max(diag_search_goal_refresh_denom, 1)
-        red_team_spread = diag_red_team_spread_sum / max(diag_red_team_spread_count, 1)
-        blue_alive_final = diag_blue_alive_final_sum / max(num_episodes, 1)
-
-        # --- Write eval report ---
+        winners = [record["winner"] for record in records]
+        denominator = max(len(winners), 1)
+        summary = {
+            "win_rate": winners.count("red") / denominator,
+            "blue_win_rate": winners.count("blue") / denominator,
+            "draw_rate": winners.count("draw") / denominator,
+            "avg_return": float(np.mean([
+                record["episode_return"] for record in records
+            ])) if records else 0.0,
+            "avg_episode_len": float(np.mean([
+                record["episode_len"] for record in records
+            ])) if records else 0.0,
+        }
+        final_metrics = self._numeric_means(records)
+        for key in (
+            "red_fireable_edges",
+            "red_attempted_edges",
+            "red_selected_edges",
+            "red_invalid_fire_count",
+            "red_missiles_remaining",
+            "selected_expected_exchange",
+        ):
+            if key in final_metrics:
+                summary[key] = final_metrics[key]
         if write_report:
-            n_eps = max(num_episodes, 1)
-            report_summary = {
-                "env_steps": step_value,
-                "update_idx": int(self.update_idx),
-                "deterministic": deterministic,
-                "win_rate": win_rate,
-                "avg_return": avg_return,
-                "episode_len": avg_steps,
-                "red_wins": float(red_wins),
-                "blue_wins": float(blue_wins),
-                "draws": float(draws),
-                "red_kills": avg_red_kills,
-                "blue_kills": avg_blue_kills,
-                # Step-mean metrics (per-step averages over episodes)
-                "target_action_nonzero_rate": red_target_nonzero_rate,
-                "fire_action_nonzero_rate": red_fire_nonzero_rate,
-                "red_fireable_edges_mean": red_fireable_edges,
-                "blue_fireable_edges_mean": blue_fireable_edges,
-                "red_attempted_edges_mean": red_attempted_edges,
-                "blue_attempted_edges_mean": blue_attempted_edges,
-                "red_selected_edges_mean": red_selected_edges,
-                "blue_selected_edges_mean": blue_selected_edges,
-                "red_invalid_fire_count_mean": red_invalid_fire_count_per_episode,
-                "blue_invalid_fire_count_mean": blue_invalid_fire_count_per_episode,
-                "red_invalid_fire_count_total": red_invalid_fire_count_total,
-                "blue_invalid_fire_count_total": blue_invalid_fire_count_total,
-                "selected_expected_exchange_mean": sel_exch_mean,
-                # Episode-final cumulative metrics
-                "missiles_launched_long": diag_missiles_long / n_eps,
-                "missiles_launched_short": diag_missiles_short / n_eps,
-                "missiles_hit": diag_missiles_hit / n_eps,
-                "missiles_missed": diag_missiles_missed / n_eps,
-                "red_missiles_remaining": red_missiles_remaining,
-                # Fire head diagnostics
-                "fire_argmax_nonzero_rate": fire_argmax_nonzero_rate,
-                "fire_noop_prob_mean": fire_noop_prob_mean,
-                "fire_long_prob_mean": fire_long_prob_mean,
-                "fire_short_prob_mean": fire_short_prob_mean,
-                "fire_entropy_mean": fire_entropy_mean,
-                "fire_valid_mask_long_rate": fire_mask_long_rate,
-                "fire_valid_mask_short_rate": fire_mask_short_rate,
-                # Adapter zeroing / target fireability diagnostics
-                "adapter_zeroed_fire_rate": adapter_zeroed_rate,
-                "target_selected_fireable_rate": target_selected_fireable_rate,
-                "target_selected_nonfireable_rate": 1.0 - target_selected_fireable_rate,
-                "selected_target_can_long_rate": selected_target_can_long_rate,
-                "selected_target_can_short_rate": selected_target_can_short_rate,
-                # Movement/search diagnostics
-                "heading_change_mean": heading_change_mean,
-                "heading_delta_abs_mean": heading_change_mean,
-                "heading_flip_rate": heading_flip_rate,
-                "spin_rate": spin_rate,
-                "movement_mode_hist": movement_mode_hist,
-                "course_hist": course_action_histogram,
-                "course_action_histogram": course_action_histogram,
-                "target_action_hist": target_action_hist,
-                "fire_action_hist": fire_action_hist,
-                "contact_agents_mean": contact_agents_mean,
-                "late_contact_rate": late_contact_rate,
-                "nearest_blue_distance_mean": nearest_blue_distance_mean,
-                "nearest_blue_distance_final": nearest_blue_distance_final,
-                "search_goal_refresh_rate": search_goal_refresh_rate,
-                "red_team_spread": red_team_spread,
-                "blue_alive_final": blue_alive_final,
-                # Backward-compat aliases
-                "target_nonzero_rate": red_target_nonzero_rate,
-                "fire_nonzero_rate": red_fire_nonzero_rate,
-                "red_fireable_edges": red_fireable_edges,
-                "red_attempted_edges": red_attempted_edges,
-                "red_selected_edges": red_selected_edges,
-                "red_invalid_fire_count": red_invalid_fire_count_per_episode,
-            }
-            self._write_eval_report(
-                kind=kind,
-                summary=report_summary,
-                episodes=episode_records,
-                checkpoint_path=checkpoint_path,
-            )
-
+            self._write_eval_report(kind, summary, records)
         print(
-            f"[{eval_prefix}] done step={step_value} win_rate={win_rate:.3f} "
-            f"avg_steps={avg_steps:.1f} avg_return={avg_return:.3f}",
+            f"[eval] episodes={len(records)} win_rate={summary['win_rate']:.3f} "
+            f"avg_len={summary['avg_episode_len']:.1f}",
             flush=True,
         )
-        return {
-            "win_rate": win_rate,
-            "red_wins": float(red_wins),
-            "blue_wins": float(blue_wins),
-            "draws": float(draws),
-            "truncated": float(truncated_count),
-            "avg_steps": avg_steps,
-            "avg_return": avg_return,
-            "episode_len": avg_steps,
-            "red_kills": avg_red_kills,
-            "blue_kills": avg_blue_kills,
-            # Diagnostics — bare keys for direct consumption
-            "target_nonzero_rate": red_target_nonzero_rate,
-            "fire_nonzero_rate": red_fire_nonzero_rate,
-            "target_action_nonzero_rate": red_target_nonzero_rate,
-            "fire_action_nonzero_rate": red_fire_nonzero_rate,
-            "red_attempted_edges": red_attempted_edges,
-            "red_selected_edges": red_selected_edges,
-            "red_invalid_fire_count": red_invalid_fire_count_per_episode,
-            "red_invalid_fire_count_total": red_invalid_fire_count_total,
-            # Fire head diagnostics
-            "fire_argmax_nonzero_rate": fire_argmax_nonzero_rate,
-            "fire_noop_prob_mean": fire_noop_prob_mean,
-            "fire_long_prob_mean": fire_long_prob_mean,
-            "fire_short_prob_mean": fire_short_prob_mean,
-            "fire_entropy_mean": fire_entropy_mean,
-            "fire_valid_mask_long_rate": fire_mask_long_rate,
-            "fire_valid_mask_short_rate": fire_mask_short_rate,
-            # Adapter zeroing / target fireability diagnostics
-            "adapter_zeroed_fire_rate": adapter_zeroed_rate,
-            "target_selected_fireable_rate": target_selected_fireable_rate,
-            "target_selected_nonfireable_rate": 1.0 - target_selected_fireable_rate,
-            "selected_target_can_long_rate": selected_target_can_long_rate,
-            "selected_target_can_short_rate": selected_target_can_short_rate,
-            # Movement/search diagnostics
-            "heading_change_mean": heading_change_mean,
-            "heading_delta_abs_mean": heading_change_mean,
-            "heading_flip_rate": heading_flip_rate,
-            "spin_rate": spin_rate,
-            "movement_mode_hist": movement_mode_hist,
-            "course_hist": course_action_histogram,
-            "course_action_histogram": course_action_histogram,
-            "target_action_hist": target_action_hist,
-            "fire_action_hist": fire_action_hist,
-            "contact_agents_mean": contact_agents_mean,
-            "late_contact_rate": late_contact_rate,
-            "nearest_blue_distance_mean": nearest_blue_distance_mean,
-            "nearest_blue_distance_final": nearest_blue_distance_final,
-            "search_goal_refresh_rate": search_goal_refresh_rate,
-            "red_team_spread": red_team_spread,
-            "blue_alive_final": blue_alive_final,
-            # Diagnostics — prefixed for backward compat
-            "diagnostics_red_target_nonzero_rate": red_target_nonzero_rate,
-            "diagnostics_red_fire_nonzero_rate": red_fire_nonzero_rate,
-            "diagnostics_red_attempted_edges": red_attempted_edges,
-            "diagnostics_red_selected_edges": red_selected_edges,
-            "diagnostics_red_invalid_fire_count": red_invalid_fire_count_per_episode,
-            "diagnostics_red_invalid_fire_count_total": red_invalid_fire_count_total,
-            "diagnostics_red_fireable_edges": red_fireable_edges,
-            "diagnostics_red_fireable_agents": red_fireable_agents,
-            "diagnostics_red_candidate_valid_count": red_candidate_valid_count,
-            "diagnostics_red_long_available_rate": red_long_available_rate,
-            "diagnostics_red_short_available_rate": red_short_available_rate,
-            "diagnostics_red_missiles_remaining": red_missiles_remaining,
-        }
+        return summary
+
+    def close(self) -> None:
+        for env in self.envs:
+            env.engine.close()
+        if self.writer is not None:
+            self.writer.close()
+            self.writer = None

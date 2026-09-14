@@ -1,5 +1,9 @@
 # SkyArena2D 训练说明
 
+> 本文保留了部分 Movement V3 和串行 stage 课程的历史说明。当前训练入口与
+> 网络/动作契约以 [`BASELINE_V2.md`](BASELINE_V2.md) 为准；默认训练使用
+> `configs/mappo_skyarena_baseline_v2.yaml`，规则对手池取代手工 stage 切换。
+
 ## 当前状态
 
 - MAPPO 训练管线已经可以运行，但仍处于实验阶段。
@@ -87,7 +91,10 @@ Scoreboard 第二行新增 `attempt`、`selected`、`invalid` 计数（R/B），
 
 这些文件应放在 `train_dir/`、`logs/` 或本地临时目录中。
 
-## MAPPO 课程训练
+## 历史 MAPPO 课程训练（已停用）
+
+Baseline V2 在同一训练过程中从规则对手池动态采样。下面的串行课程仅用于解释
+旧 checkpoint 来源；Movement V3 checkpoint 不能加载到 Baseline V2。
 
 主课程顺序固定为：
 

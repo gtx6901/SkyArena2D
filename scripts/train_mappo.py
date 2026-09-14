@@ -7,13 +7,13 @@ from pathlib import Path
 # Add parent dir to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from skyarena2d.rl.utils.config import load_mappo_config
 from skyarena2d.rl.algo.mappo_trainer import SkyArenaMAPPOTrainer
+from skyarena2d.rl.utils.config import load_mappo_config
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/mappo_skyarena.yaml")
+    parser.add_argument("--config", default="configs/mappo_skyarena_baseline_v2.yaml")
     parser.add_argument("--total_env_steps", type=int, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--save_interval", type=int, default=None)

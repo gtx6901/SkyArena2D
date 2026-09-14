@@ -1,0 +1,75 @@
+train:
+  experiment_name: baseline_v2
+  train_dir: train_dir/skyarena_mappo_v2
+  seed: 42
+  device: cuda
+  num_envs: 16
+  rollout_steps: 128
+  total_env_steps: 5000000
+  learning_rate: 0.0003
+  lr_decay: linear
+  min_learning_rate: 0.00003
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_coef: 0.2
+  value_clip_coef: 0.2
+  entropy_coef: 0.01
+  value_coef: 0.5
+  ppo_epochs: 4
+  recurrent_chunk_length: 32
+  num_minibatches: 8
+  max_grad_norm: 0.5
+  target_kl: 0.03
+  popart: true
+  team_reward_start: 0.5
+  team_reward_end: 1.0
+  reward_mix_steps: 1000000
+  save_interval: 100000
+  eval_interval: 50000
+  resume: false
+  init_checkpoint: ""
+
+env:
+  config_path: configs/env_10v10_full.yaml
+  blue_rule: fix_rule_v2
+  opponent_pool:
+    - no_attack_rule
+    - patrol_rule
+    - rush_rule
+    - fix_rule_like
+    - fix_rule_v2
+  opponent_pool_uniform_mix: 0.15
+  candidate_slots: 10
+  track_memory_steps: 16
+  use_jammer_strategy: true
+  radar_freq_count: 10
+  radar_cycle_interval: 8
+  radar_stride: 3
+  jammer_cycle_interval: 6
+  jammer_stride: 7
+  jammer_barrage_prob: 0.0
+  max_jammers_per_side: 3
+
+model:
+  entity_embed_dim: 128
+  attention_heads: 4
+  attention_layers: 2
+  trunk_dim: 192
+  lstm_hidden_dim: 192
+  critic_hidden_dim: 256
+
+logging:
+  tensorboard: true
+
+evaluation:
+  policy_eval_interval: 50000
+  policy_eval_episodes: 10
+  gui_eval_enabled: false
+  gui_eval_interval: 0
+  gui_eval_episodes: 1
+  gui_eval_max_steps: 1200
+  gui_eval_render_mode: rgb_array
+  gui_eval_save_frames: false
+  gui_eval_render_every: 20
+  gui_eval_dir: gui_eval
+  gui_eval_deterministic: true

@@ -10,13 +10,14 @@ Use this workflow when `target_action`, `fire_action`, target masks, or launch d
 
 ## Checklist
 
-- Confirm `target_mask` allows only fireable candidates.
+- Confirm `target_mask` allows valid `entity_mask` candidates, including non-fireable attention targets.
+- Confirm friendly tokens and padding are excluded from `target_mask`.
 - Confirm `fireable = candidate_can_long || candidate_can_short`.
-- Confirm visible or tracked non-fireable candidates may appear in entity features but cannot be selected by `target_action`.
+- Confirm visible or tracked non-fireable candidates may be selected by `target_action`, but cannot fire unless the selected target is fireable for the requested weapon.
+- Confirm Baseline V2 course decoding uses one of nine relative heading deltas.
 - Confirm rollout, PPO update, policy eval, and GUI eval use the same action semantics.
 - Confirm fire is resolved against the current observed state before this step's movement produces the next obs.
-- Check `target_selected_nonfireable_rate`; it should be near 0.
-- Check `adapter_zeroed_fire_rate`; it must be 0.
+- Treat `target_selected_nonfireable_rate` as a diagnostic only; selected attention targets can be non-fireable.
 - Check `fire_action > 0` corresponds to an actual legal launch, not just a target candidate.
 - Compare `red_attempted_edges` and `red_selected_edges` to separate attempts from accepted launches.
 

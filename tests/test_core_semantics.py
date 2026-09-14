@@ -16,16 +16,12 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from skyarena2d.adapters.action_types import SkyArenaSideAction
 from skyarena2d.core.config import EnvConfig
 from skyarena2d.core.engine import SkyArenaEngine
 from skyarena2d.core.reward import compute_rewards
-from skyarena2d.core.termination import TerminationResult
 from skyarena2d.opponents.no_attack_rule import NoAttackRuleOpponent
 from skyarena2d.rl.adapters.skyarena_mappo_env import SkyArenaMAPPOEnv
-from skyarena2d.training.action_adapter import SkyArenaActionAdapter
 from skyarena2d.training.obs_builder import SkyArenaTrainingObsBuilder
-
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -50,7 +46,7 @@ def _base_config_2v2() -> EnvConfig:
 # ---------------------------------------------------------------------------
 
 def test_target_mask_allows_nonfireable_entity_candidates() -> None:
-    """Movement V3 target_action is attention/engagement target, not fire permission."""
+    """The pointer selects enemy attention targets, not friendly entity tokens."""
     cfg = _base_config_2v2()
     env = SkyArenaEngine(cfg)
     env.reset(seed=0)
@@ -77,21 +73,22 @@ def test_target_mask_allows_nonfireable_entity_candidates() -> None:
         fireable_long=cache.red_fireable_long[:2, :2],
         fireable_short=cache.red_fireable_short[:2, :2],
         step_count=1, max_steps=100,
-        current_search_goal_id=np.zeros(2, dtype=np.int64),
     )
 
     target_mask = policy_obs["target_mask"]  # (2, slots+1)
     candidate_can_long = policy_obs["candidate_can_long"]  # (2, slots)
-    candidate_can_short = policy_obs["candidate_can_short"]  # (2, slots)
 
     for i in range(2):
         # slot 0 (no target) must always be allowed
         assert target_mask[i, 0], f"Agent {i}: slot 0 must be allowed"
-        for s in range(min(2, candidate_can_long.shape[1])):
-            valid_entity = policy_obs["entity_mask"][i, s]
-            assert target_mask[i, s + 1] == valid_entity, (
+        for s in range(candidate_can_long.shape[1]):
+            selectable_enemy = (
+                policy_obs["entity_mask"][i, s]
+                and policy_obs["candidate_ids"][i, s] >= 0
+            )
+            assert target_mask[i, s + 1] == selectable_enemy, (
                 f"Agent {i} slot {s + 1}: mask={target_mask[i, s + 1]}, "
-                f"entity_mask={valid_entity}"
+                f"selectable_enemy={selectable_enemy}"
             )
 
 
@@ -124,12 +121,10 @@ def test_selected_target_can_be_nonfireable_attention_target() -> None:
         fireable_long=cache.red_fireable_long[:2, :2],
         fireable_short=cache.red_fireable_short[:2, :2],
         step_count=1, max_steps=100,
-        current_search_goal_id=np.zeros(2, dtype=np.int64),
     )
 
     # Simulate policy: for each fireable slot, target_action should select it
     can_long = policy_obs["candidate_can_long"]
-    can_short = policy_obs["candidate_can_short"]
     for i in range(2):
         for s in range(can_long.shape[1]):
             if policy_obs["candidate_ids"][i, s] >= 0:
@@ -197,6 +192,10 @@ def test_discovery_rewards_each_enemy_once() -> None:
     env = SkyArenaEngine(cfg)
     env.reset(seed=0)
     state = env.get_state()
+    state.red.pos[:] = np.array([[100.0, 100.0], [100.0, 120.0]], dtype=np.float32)
+    state.red.heading[:] = 0.0
+    state.blue.pos[:] = np.array([[200.0, 100.0], [200.0, 120.0]], dtype=np.float32)
+    state.blue.heading[:] = 180.0
 
     # Initially blue team has 2 alive fighters (id 0 and 1)
     assert state.blue.alive_count == 2
@@ -209,8 +208,7 @@ def test_discovery_rewards_each_enemy_once() -> None:
                  "detector_action": np.zeros((0, 2), dtype=np.float32)},
     })
     # Both blue enemies should be discovered on first step (both visible)
-    dc = info["reward_components"].get("discovery", {})
-    red_new_1 = dc.get("red_new_count", 0)
+    assert info["reward_components"].get("discovery", {}).get("red_new_count", 0) > 0
 
     # Step 2: same enemies, no new discoveries
     obs2, reward2, _, _, info2 = env.step({
@@ -287,18 +285,16 @@ def test_eval_episode_seeds_no_repeat() -> None:
             "config_path": "configs/env_10v10_fast.yaml",
             "blue_rule": "no_attack_rule",
             "candidate_slots": 6,
-            "search_goal_grid_size": 8,
             "track_memory_steps": 10,
             "use_jammer_strategy": False,
         },
-        "model": {"semantic_map_size": 50},
+        "model": {},
     }
     env = SkyArenaMAPPOEnv(cfg, seed_offset=9999, deterministic_reset=True)
 
     seeds = set()
     for ep in range(10):
         env.reset()
-        s = env.engine.state.episode_idx
         seeds.add(int(env._base_seed + env.seed_offset + ep))
     assert len(seeds) == 10, f"Expected 10 unique eval seeds, got {len(seeds)}"
 

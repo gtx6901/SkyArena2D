@@ -1,21 +1,15 @@
 """SkyArena MAPPO environment adapter.
 
-Wraps SkyArenaEngine for MAPPO training.
-
-Status: experimental but runnable.
+Wraps SkyArenaEngine with the Baseline V2 training contract.
 """
 from __future__ import annotations
-
-from pathlib import Path
-from typing import Any, Dict
 
 import numpy as np
 
 from skyarena2d.adapters.action_types import SkyArenaSideAction
 from skyarena2d.core.config import load_config
 from skyarena2d.core.engine import SkyArenaEngine
-from skyarena2d.opponents import RULES
-from skyarena2d.training.action_adapter import SkyArenaActionAdapter
+from skyarena2d.opponents import RULES, RuleOpponentPool
 from skyarena2d.training.obs_builder import SkyArenaTrainingObsBuilder
 
 
@@ -25,10 +19,16 @@ class SkyArenaMAPPOEnv:
     Red side is controlled by MAPPO policy.
     Blue side is controlled by rule-based opponent.
 
-    This adapter is part of the experimental RL stack.
+    The red policy uses compact entity observations; blue is rule-controlled.
     """
 
-    def __init__(self, cfg: dict, seed_offset: int = 0, deterministic_reset: bool = False):
+    def __init__(
+        self,
+        cfg: dict,
+        seed_offset: int = 0,
+        deterministic_reset: bool = False,
+        opponent_pool: RuleOpponentPool | None = None,
+    ):
         self.cfg = cfg
         self.seed_offset = seed_offset
         self.deterministic_reset = bool(deterministic_reset)
@@ -41,7 +41,8 @@ class SkyArenaMAPPOEnv:
         self.engine_config = load_config(config_path)
         self.engine = SkyArenaEngine(self.engine_config)
 
-        # Create blue opponent
+        # Create the blue opponent. Training environments may share a pool so
+        # outcomes collected by every worker affect subsequent sampling.
         blue_rule_name = env_cfg.get("blue_rule", "fix_rule_v2")
         if blue_rule_name not in RULES:
             raise ValueError(f"Unknown blue rule: {blue_rule_name}")
@@ -50,39 +51,39 @@ class SkyArenaMAPPOEnv:
         if blue_rule_name == "no_attack_rule":
             opponent_kwargs["map_width"] = self.engine_config.map.width
             opponent_kwargs["map_height"] = self.engine_config.map.height
+        self.blue_rule_name = blue_rule_name
+        pool_names = list(env_cfg.get("opponent_pool", []))
+        self.opponent_pool = opponent_pool
+        if self.opponent_pool is None and pool_names and not self.deterministic_reset:
+            kwargs_by_name = {
+                "no_attack_rule": {
+                    "map_width": self.engine_config.map.width,
+                    "map_height": self.engine_config.map.height,
+                }
+            }
+            self.opponent_pool = RuleOpponentPool(
+                pool_names,
+                RULES,
+                seed=self._base_seed + seed_offset + 7000,
+                uniform_mix=float(env_cfg.get("opponent_pool_uniform_mix", 0.15)),
+                kwargs_by_name=kwargs_by_name,
+            )
+        self.current_opponent_name = blue_rule_name
         self.blue_opponent = RULES[blue_rule_name](**opponent_kwargs)
 
         # Create obs builder
         self.obs_builder = SkyArenaTrainingObsBuilder(
             num_fighters=self.engine_config.teams.red_fighters,
             candidate_slots=env_cfg.get("candidate_slots", 6),
-            search_goal_grid_size=env_cfg.get("search_goal_grid_size", 8),
             map_width=self.engine_config.map.width,
             map_height=self.engine_config.map.height,
-            semantic_map_size=cfg["model"].get("semantic_map_size", 100),
             track_memory_steps=env_cfg.get("track_memory_steps", 10),
-        )
-
-        # Create action adapter
-        self.action_adapter = SkyArenaActionAdapter(
-            candidate_slots=env_cfg.get("candidate_slots", 6),
-            course_bins=32,
-            search_goal_grid_size=env_cfg.get("search_goal_grid_size", 8),
-            map_width=self.engine_config.map.width,
-            map_height=self.engine_config.map.height,
-            radar_freq=1,
-            jammer_freq=env_cfg.get("default_jammer_freq", 1),
-            use_jammer_strategy=env_cfg.get("use_jammer_strategy", True),
-            jammer_range=env_cfg.get("jammer_range", self.engine_config.jamming.range),
-            jammer_memory_steps=env_cfg.get("jammer_memory_steps", 10),
-            max_jammers_per_side=env_cfg.get("max_jammers_per_side", 3),
         )
 
         self.red_fighter_num = self.engine_config.teams.red_fighters
         self.blue_fighter_num = self.engine_config.teams.blue_fighters
         self._last_obs = None
         self._last_info = None
-        self._current_search_goal_id = np.zeros(self.red_fighter_num, dtype=np.int64)
 
     def reset(self) -> dict:
         """Reset environment and return initial policy obs for red."""
@@ -94,17 +95,19 @@ class SkyArenaMAPPOEnv:
             opp_seed = self._base_seed + self.seed_offset * 100000 + self._reset_counter + 1000
 
         obs, info = self.engine.reset(seed=env_seed)
-        self.blue_opponent.reset(seed=opp_seed)
+        if self.opponent_pool is not None:
+            self.current_opponent_name, self.blue_opponent = self.opponent_pool.sample(seed=opp_seed)
+        else:
+            self.current_opponent_name = self.blue_rule_name
+            self.blue_opponent.reset(seed=opp_seed)
         self._reset_counter += 1
         self.obs_builder.reset()
-        self.action_adapter.reset_ew_state()
-        self._current_search_goal_id[:] = 0
 
         self._last_obs = obs
         self._last_info = info
 
         # Build policy obs for red
-        return self._build_policy_obs(obs, info)
+        return self._build_policy_obs()
 
     def step(self, sky_action: SkyArenaSideAction) -> tuple[dict, float, bool, dict]:
         """Step environment with red action.
@@ -140,28 +143,21 @@ class SkyArenaMAPPOEnv:
 
         # Compute red team reward
         red_reward = float(reward.get("red", 0.0))
+        red_agent_reward = np.asarray(reward.get("red_unit", []), dtype=np.float32)[
+            : self.red_fighter_num
+        ].copy()
         done = terminated or truncated
+        info["red_agent_reward"] = red_agent_reward
+        info["opponent_name"] = self.current_opponent_name
+        if done and self.opponent_pool is not None:
+            self.opponent_pool.record_result(self.current_opponent_name, str(info.get("winner", "draw")))
 
         # Build next policy obs
-        policy_obs = self._build_policy_obs(obs, info)
+        policy_obs = self._build_policy_obs()
 
         return policy_obs, red_reward, done, info
 
-    def set_current_search_goal_id(self, goal_id: np.ndarray) -> None:
-        """Set current search goal ids for the next policy obs build.
-
-        goal_id: (red_fighter_num,) int64 array where 0 means no active goal and
-        1..G*G means goal_id + 1.
-        """
-        goal_id = np.asarray(goal_id, dtype=np.int64)
-        if goal_id.shape != (self.red_fighter_num,):
-            raise ValueError(
-                f"goal_id shape must be ({self.red_fighter_num},), got {goal_id.shape}"
-            )
-        max_goal = self.obs_builder.search_goal_grid_size ** 2
-        self._current_search_goal_id = np.clip(goal_id, 0, max_goal).astype(np.int64, copy=True)
-
-    def _build_policy_obs(self, obs: dict, info: dict) -> dict:
+    def _build_policy_obs(self) -> dict:
         """Build policy observation for red side."""
         # Use cached visible/fireable matrices from engine state
         cache = self.engine.state.cache
@@ -183,7 +179,6 @@ class SkyArenaMAPPOEnv:
             fireable_short=fireable_short,
             step_count=self.engine.state.step_count,
             max_steps=self.engine_config.max_steps,
-            current_search_goal_id=self._current_search_goal_id.copy(),
         )
 
         # Add global state for critic
@@ -199,11 +194,13 @@ class SkyArenaMAPPOEnv:
     def obs_shapes(self) -> dict:
         """Return observation shapes for building actor/critic."""
         return {
-            "self_features": (self.red_fighter_num, 20),
-            "entity_features": (self.red_fighter_num, self.obs_builder.candidate_slots, 10),
-            "semantic_map": (self.red_fighter_num, 9, self.obs_builder.semantic_map_size, self.obs_builder.semantic_map_size),
-            "region_features": (self.red_fighter_num, self.obs_builder.search_goal_grid_size ** 2, 10),
-            "global_state": (181,),
+            "self_features": (self.red_fighter_num, 22),
+            "entity_features": (
+                self.red_fighter_num,
+                self.obs_builder.entity_slots,
+                20,
+            ),
+            "global_state": (self.global_state_dim,),
         }
 
     @property

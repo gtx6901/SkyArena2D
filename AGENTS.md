@@ -44,14 +44,21 @@ If one of these must change, first document the bug, the intended training seman
 
 ## Current Action Semantics
 
-- `target_action` means `fire_target_action`.
+- Current action semantics are Baseline V2; Movement V2/V3 are historical only.
+- The learned actor has exactly three heads: `course_action`, `target_action`, and `fire_action`.
+- `course_action` selects one of nine relative heading deltas.
+- `target_action` means engagement / attention target.
 - `target_action == 0` means no target.
-- `target_action > 0` may select only a fireable candidate.
-- `fireable = candidate_can_long || candidate_can_short`.
+- `target_action > 0` points to an enemy entity token whose target mask is true.
+- `target_action` is not limited to fireable candidates.
+- `fireable = candidate_can_long || candidate_can_short` gates only `fire_action`.
+- `fire_action == 0` means no fire, `1` means long missile, and `2` means short missile.
+- `fire_action > 0` must apply only to the selected target and only when that target is fireable for the requested weapon.
 - `engine.step()` resolves weapon fire against the current observed state before applying this step's movement.
-- Visible or tracked candidates may appear in `entity_features`, but are not necessarily selectable by `target_action`.
-- `adapter_zeroed_fire_rate` must be 0.
-- `target_selected_nonfireable_rate` should be near 0.
+- Visible or tracked candidates may appear in `entity_features` and are selectable by `target_action`, even when not currently fireable.
+- Friendly entity tokens and padding are never targetable.
+- Radar and jamming remain rule-based and outside the actor action space.
+- Baseline V2 checkpoints are incompatible with Movement V3 checkpoints.
 
 ## Debug Priority
 

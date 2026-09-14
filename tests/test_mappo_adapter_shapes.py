@@ -8,11 +8,11 @@ import torch
 # Add parent dir to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from skyarena2d.adapters.action_types import SkyArenaSideAction
 from skyarena2d.rl.adapters.skyarena_mappo_env import SkyArenaMAPPOEnv
 from skyarena2d.rl.models.actor import SkyArenaActor
 from skyarena2d.rl.models.critic import SkyArenaCritic
 from skyarena2d.rl.utils.config import load_mappo_config
-from skyarena2d.adapters.action_types import SkyArenaSideAction
 
 
 def test_env_reset_obs_shapes():
@@ -24,22 +24,17 @@ def test_env_reset_obs_shapes():
     print("Testing env reset obs shapes...")
     assert "self_features" in obs
     assert "entity_features" in obs
-    assert "semantic_map" in obs
-    assert "region_features" in obs
+    assert "semantic_map" not in obs
+    assert "region_features" not in obs
     assert "global_state" in obs
-    assert "current_search_goal_id" in obs
+    assert "current_search_goal_id" not in obs
 
     N = env.red_fighter_num
     S = env.obs_builder.candidate_slots
-    G = env.obs_builder.search_goal_grid_size
-    M = env.obs_builder.semantic_map_size
 
-    assert obs["self_features"].shape == (N, 20), f"Got {obs['self_features'].shape}"
-    assert obs["entity_features"].shape == (N, S, 10), f"Got {obs['entity_features'].shape}"
-    assert obs["semantic_map"].shape == (N, 9, M, M), f"Got {obs['semantic_map'].shape}"
-    assert obs["region_features"].shape == (N, G * G, 10), f"Got {obs['region_features'].shape}"
+    assert obs["self_features"].shape == (N, 22), f"Got {obs['self_features'].shape}"
+    assert obs["entity_features"].shape == (N, S, 20), f"Got {obs['entity_features'].shape}"
     assert obs["global_state"].shape == (181,), f"Got {obs['global_state'].shape}"
-    assert obs["current_search_goal_id"].shape == (N,), f"Got {obs['current_search_goal_id'].shape}"
     print("✓ Env reset obs shapes correct")
 
 
@@ -47,7 +42,7 @@ def test_env_step_returns_correct_types():
     """Test that env step returns correct types."""
     cfg = load_mappo_config("configs/mappo_skyarena.yaml")
     env = SkyArenaMAPPOEnv(cfg, seed_offset=0)
-    obs = env.reset()
+    env.reset()
 
     print("Testing env step return types...")
     N = env.red_fighter_num
@@ -77,32 +72,25 @@ def test_actor_forward_shapes():
     actor = SkyArenaActor(
         self_dim=obs_shapes["self_features"][1],
         entity_dim=obs_shapes["entity_features"][2],
-        map_channels=obs_shapes["semantic_map"][1],
-        candidate_slots=6,
+        candidate_slots=obs_shapes["entity_features"][1],
         num_agents=env.red_fighter_num,
-        course_bins=32,
-        search_goal_bins=64,
-        region_feature_dim=obs_shapes["region_features"][2],
+        course_bins=9,
         trunk_dim=192,
         lstm_hidden_dim=192,
         entity_embed_dim=96,
-        map_embed_dim=96,
-        semantic_map_size=100,
     )
 
     obs = env.reset()
     batch_size = 1
     N = env.red_fighter_num
+    S = obs_shapes["entity_features"][1]
 
     # Create dummy batch
     batch = {
         "self_features": torch.as_tensor(obs["self_features"][np.newaxis], dtype=torch.float32),
         "entity_features": torch.as_tensor(obs["entity_features"][np.newaxis], dtype=torch.float32),
         "entity_mask": torch.as_tensor(obs["entity_mask"][np.newaxis], dtype=torch.bool),
-        "semantic_map": torch.as_tensor(obs["semantic_map"][np.newaxis], dtype=torch.float32),
-        "current_search_goal_id": torch.as_tensor(obs["current_search_goal_id"][np.newaxis], dtype=torch.long),
         "agent_id": torch.as_tensor(obs["agent_id"][np.newaxis], dtype=torch.long),
-        "region_features": torch.as_tensor(obs["region_features"][np.newaxis], dtype=torch.float32),
     }
 
     # Flatten for actor
@@ -110,10 +98,7 @@ def test_actor_forward_shapes():
         "self_features": batch["self_features"].reshape(batch_size * N, -1),
         "entity_features": batch["entity_features"].reshape(batch_size * N, *batch["entity_features"].shape[2:]),
         "entity_mask": batch["entity_mask"].reshape(batch_size * N, -1),
-        "semantic_map": batch["semantic_map"].reshape(batch_size * N, *batch["semantic_map"].shape[2:]),
-        "current_search_goal_id": batch["current_search_goal_id"].reshape(batch_size * N),
         "agent_id": batch["agent_id"].reshape(batch_size * N),
-        "region_features": batch["region_features"].reshape(batch_size * N, *batch["region_features"].shape[2:]),
     }
 
     h = torch.zeros((batch_size * N, 192), dtype=torch.float32)
@@ -122,11 +107,9 @@ def test_actor_forward_shapes():
     with torch.no_grad():
         out = actor.step(flat_batch, (h, c))
 
-    assert out["course_logits"].shape == (batch_size * N, 32), f"Got {out['course_logits'].shape}"
-    assert out["movement_mode_logits"].shape == (batch_size * N, 9), f"Got {out['movement_mode_logits'].shape}"
-    assert out["search_goal_logits"].shape == (batch_size * N, 64), f"Got {out['search_goal_logits'].shape}"
-    assert out["target_logits"].shape == (batch_size * N, 7), f"Got {out['target_logits'].shape}"
-    assert out["fire_logits"].shape == (batch_size * N, 7, 3), f"Got {out['fire_logits'].shape}"
+    assert out["course_logits"].shape == (batch_size * N, 9), f"Got {out['course_logits'].shape}"
+    assert out["target_logits"].shape == (batch_size * N, S + 1), f"Got {out['target_logits'].shape}"
+    assert out["fire_logits"].shape == (batch_size * N, S + 1, 3), f"Got {out['fire_logits'].shape}"
     print("✓ Actor forward shapes correct")
 
 

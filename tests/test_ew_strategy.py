@@ -39,7 +39,7 @@ def _make_team(n: int) -> TeamState:
 def _empty_candidates(n: int, slots: int = 6) -> tuple[np.ndarray, np.ndarray]:
     return (
         np.full((n, slots), -1, dtype=np.int64),
-        np.zeros((n, slots, 10), dtype=np.float32),
+        np.zeros((n, slots, 20), dtype=np.float32),
     )
 
 
@@ -173,8 +173,7 @@ def test_action_adapter_uses_ew_strategy_radar_freq() -> None:
     own = _make_team(n)
     adapter = SkyArenaActionAdapter(
         candidate_slots=6,
-        course_bins=16,
-        search_goal_grid_size=8,
+        course_bins=9,
         map_width=3000.0,
         map_height=4000.0,
         radar_freq=1,
@@ -187,7 +186,6 @@ def test_action_adapter_uses_ew_strategy_radar_freq() -> None:
 
     action = adapter.decode(
         course_action=np.zeros(n, dtype=np.int32),
-        search_goal_action=np.zeros(n, dtype=np.int32),
         target_action=np.zeros(n, dtype=np.int32),
         fire_action=np.zeros(n, dtype=np.int32),
         own=own,

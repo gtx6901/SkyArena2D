@@ -23,7 +23,7 @@ python scripts/play_gui.py --red fix_rule_v2 --blue fix_rule_v2 --config configs
 用于确认训练管线可以端到端跑通。这个命令不用于判断收敛质量。
 
 ```bash
-python scripts/train_mappo.py --config configs/mappo_skyarena_smoke.yaml --total_env_steps 1024 --device cpu
+python scripts/train_mappo.py --config configs/mappo_skyarena_baseline_v2_smoke.yaml --total_env_steps 1024 --device cpu
 ```
 
 ## MAPPO 正式训练
@@ -31,13 +31,13 @@ python scripts/train_mappo.py --config configs/mappo_skyarena_smoke.yaml --total
 用于较长时间训练。默认假设使用 CUDA。
 
 ```bash
-python scripts/train_mappo.py --config configs/mappo_skyarena_train.yaml --device cuda
+python scripts/train_mappo.py --config configs/mappo_skyarena_baseline_v2.yaml --device cuda
 ```
 
 默认配置会保留 GUI eval 次数并记录指标，但不会保存逐帧文件。需要完全跳过 GUI eval 时可显式关闭：
 
 ```bash
-python scripts/train_mappo.py --config configs/mappo_skyarena_smoke.yaml --total_env_steps 1024 --device cpu --disable_gui_eval
+python scripts/train_mappo.py --config configs/mappo_skyarena_baseline_v2_smoke.yaml --total_env_steps 1024 --device cpu --disable_gui_eval
 ```
 
 ## MAPPO 评估
@@ -45,7 +45,7 @@ python scripts/train_mappo.py --config configs/mappo_skyarena_smoke.yaml --total
 用指定 checkpoint 跑评估。
 
 ```bash
-python scripts/evaluate_mappo.py --config configs/mappo_skyarena_train.yaml --checkpoint <path> --episodes 10 --device cuda
+python scripts/evaluate_mappo.py --config configs/mappo_skyarena_baseline_v2.yaml --checkpoint <path> --episodes 10 --device cuda
 ```
 
 ## TensorBoard
@@ -64,12 +64,10 @@ tensorboard --logdir train_dir/skyarena_mappo_train
 
 常用分组：
 - `train/*` — PPO loss、pg_loss、vf_loss、entropy
-- `rollout_step/*` — 每步平均动作/mask 诊断
-- `metrics_step/*` — info["metrics"] 步均诊断
-- `episode_mean/*` — 仅在有 episode 结束时写入的 episode 级指标
+- `rollout/*` — 动作、mask、存活率与 reward 诊断
+- `environment/*` — info["metrics"] 步均诊断
 - `episode/*` — 最终 info["metrics"] 的 episode 级指标
 - `eval/*` — policy eval 聚合指标
-- `gui_eval/*` — GUI eval 聚合指标
 
 ## Trace 评估
 

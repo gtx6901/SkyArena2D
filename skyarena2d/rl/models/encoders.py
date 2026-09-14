@@ -1,64 +1,111 @@
-"""Neural network encoder building blocks for SkyArena MAPPO."""
+"""Neural-network encoder building blocks for SkyArena MAPPO."""
 from __future__ import annotations
 
 import torch
 from torch import nn
 
 
-def mlp(input_dim: int, hidden_dims: list[int], output_dim: int, activation=nn.ReLU) -> nn.Sequential:
-    """Build a simple MLP."""
-    layers = []
+def mlp(
+    input_dim: int,
+    hidden_dims: list[int],
+    output_dim: int,
+    activation: type[nn.Module] = nn.ReLU,
+) -> nn.Sequential:
+    """Build a small feed-forward network."""
+    layers: list[nn.Module] = []
     last_dim = input_dim
     for hidden_dim in hidden_dims:
-        layers.append(nn.Linear(last_dim, hidden_dim))
-        layers.append(activation())
+        layers.extend((nn.Linear(last_dim, hidden_dim), activation()))
         last_dim = hidden_dim
     layers.append(nn.Linear(last_dim, output_dim))
     return nn.Sequential(*layers)
 
 
+class _SetAttentionBlock(nn.Module):
+    """Permutation-equivariant masked self-attention block."""
+
+    def __init__(self, embed_dim: int, num_heads: int) -> None:
+        super().__init__()
+        self.attention = nn.MultiheadAttention(
+            embed_dim, num_heads, batch_first=True
+        )
+        self.attention_norm = nn.LayerNorm(embed_dim)
+        self.feed_forward = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 2),
+            nn.GELU(),
+            nn.Linear(embed_dim * 2, embed_dim),
+        )
+        self.output_norm = nn.LayerNorm(embed_dim)
+
+    def forward(
+        self, tokens: torch.Tensor, key_padding_mask: torch.Tensor
+    ) -> torch.Tensor:
+        attended, _ = self.attention(
+            tokens,
+            tokens,
+            tokens,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        tokens = self.attention_norm(tokens + attended)
+        return self.output_norm(tokens + self.feed_forward(tokens))
+
+
 class EntityEncoder(nn.Module):
-    """Encode fixed-slot enemy candidates and pool them for the actor trunk."""
+    """Encode a padded entity set and retain every token for pointer heads.
 
-    def __init__(self, entity_dim: int, embed_dim: int):
+    No slot-position embedding is used: permuting entity tokens and their mask
+    permutes the returned slot embeddings while leaving the pooled embedding
+    unchanged (up to floating-point reduction noise).
+    """
+
+    def __init__(
+        self,
+        entity_dim: int,
+        embed_dim: int,
+        *,
+        num_heads: int = 4,
+        num_layers: int = 2,
+    ) -> None:
         super().__init__()
-        self.slot_encoder = mlp(entity_dim, [embed_dim], embed_dim)
-
-    def forward(self, entity_features: torch.Tensor, entity_mask: torch.Tensor):
-        # entity_features: [B, K, D]
-        slot_embeddings = self.slot_encoder(entity_features)
-        mask = entity_mask.unsqueeze(-1).float()
-        masked_embeddings = slot_embeddings * mask
-        denom = torch.clamp(mask.sum(dim=1), min=1.0)
-        pooled = masked_embeddings.sum(dim=1) / denom
-        return slot_embeddings, pooled
-
-
-class SemanticMapEncoder(nn.Module):
-    """Small CNN for the semantic screen branch."""
-
-    def __init__(self, in_channels: int, output_dim: int, input_size: int, pooling: str = "spatial_flatten"):
-        super().__init__()
-        if str(pooling).strip().lower() != "spatial_flatten":
-            raise ValueError(f"Unsupported map encoder pooling: {pooling}")
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, 16, kernel_size=5, stride=2, padding=2),
-            nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
+        if embed_dim % num_heads != 0:
+            raise ValueError(
+                f"entity embed_dim={embed_dim} must be divisible by heads={num_heads}"
+            )
+        self.input_encoder = nn.Sequential(
+            nn.Linear(entity_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
         )
-        with torch.no_grad():
-            dummy = torch.zeros(1, in_channels, input_size, input_size)
-            conv_out = self.conv(dummy)
-        self.proj = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(int(conv_out.numel()), output_dim),
-            nn.ReLU(),
+        self.blocks = nn.ModuleList(
+            _SetAttentionBlock(embed_dim, num_heads) for _ in range(num_layers)
         )
+        self.pool_score = nn.Linear(embed_dim, 1)
 
-    def forward(self, semantic_map: torch.Tensor) -> torch.Tensor:
-        return self.proj(self.conv(semantic_map))
+    def forward(
+        self, entity_features: torch.Tensor, entity_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if entity_features.ndim != 3:
+            raise ValueError("entity_features must have shape [batch, slots, dim]")
+        mask = entity_mask.to(dtype=torch.bool)
+        if mask.shape != entity_features.shape[:2]:
+            raise ValueError("entity_mask must match entity_features [batch, slots]")
+
+        tokens = self.input_encoder(entity_features)
+        # MultiheadAttention cannot consume a row whose keys are all masked.
+        safe_mask = mask.clone()
+        has_entity = safe_mask.any(dim=1)
+        if safe_mask.shape[1] and torch.any(~has_entity):
+            safe_mask[~has_entity, 0] = True
+        key_padding_mask = ~safe_mask
+        for block in self.blocks:
+            tokens = block(tokens, key_padding_mask)
+            tokens = tokens * mask.unsqueeze(-1).to(tokens.dtype)
+
+        scores = self.pool_score(tokens).squeeze(-1)
+        scores = scores.masked_fill(~safe_mask, torch.finfo(scores.dtype).min)
+        weights = torch.softmax(scores, dim=1)
+        weights = weights * mask.to(weights.dtype)
+        weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1.0)
+        pooled = torch.sum(tokens * weights.unsqueeze(-1), dim=1)
+        return tokens, pooled

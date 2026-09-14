@@ -1,4 +1,6 @@
-# Movement V2
+# Movement V2（历史设计，已停用）
+
+> 当前可训练接口见 [`BASELINE_V2.md`](BASELINE_V2.md)。
 
 Movement V2 changes the red policy movement interface from current-heading-relative steering to a learned reference-frame interface.
 

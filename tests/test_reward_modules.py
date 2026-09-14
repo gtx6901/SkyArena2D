@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from skyarena2d.core.config import load_config
 from skyarena2d.core.engine import SkyArenaEngine
@@ -167,9 +166,7 @@ def test_engine_reward_is_team_level_with_debug_unit_fields():
     assert abs(float(reward["blue_unit_sum"]) - float(blue_unit.sum())) < 1e-6
 
     state = env.get_state()
-    red_alive = state.red.alive
-    blue_alive = state.blue.alive
-    red_team = float(np.mean(red_unit[red_alive]) if np.any(red_alive) else np.mean(red_unit))
-    blue_team = float(np.mean(blue_unit[blue_alive]) if np.any(blue_alive) else np.mean(blue_unit))
+    red_team = float(red_unit.sum() / max(state.red.total_units, 1))
+    blue_team = float(blue_unit.sum() / max(state.blue.total_units, 1))
     assert abs(float(reward["red"]) - red_team) < 1e-6
     assert abs(float(reward["blue"]) - blue_team) < 1e-6

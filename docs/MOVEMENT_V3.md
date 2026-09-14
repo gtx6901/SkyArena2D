@@ -1,4 +1,8 @@
-# Movement V3
+# Movement V3（历史设计，已停用）
+
+> Baseline V2 已删除 movement mode、search goal planner 和 semantic map。
+> 当前可训练接口见 [`BASELINE_V2.md`](BASELINE_V2.md)。本文只保留用于解释旧
+> checkpoint 与旧实验记录，不能作为当前代码契约。
 
 Movement V3 replaces Movement V2 reference-frame steering with a hybrid movement-mode action space.
 
@@ -48,6 +52,14 @@ Invalid modes are masked during rollout rather than silently repaired by the ada
 - Without refresh, the held goal continues and search-goal logprob is zero.
 
 Actor observation uses `current_search_goal_id` with 0 as no active goal and 1..G*G as goal id + 1. The adapter receives executed region ids as 0..G*G-1.
+
+The manager also keeps low-dimensional structured search state: recent team and agent goals, team position/goal spread, search-axis progress, no-contact age, and last-contact region. This is planner memory, not an explicit visited grid or per-enemy track map.
+
+`build_planner_bias()` combines conservative route-reuse penalties, axis-progress bias, goal-spread bias, no-contact expansion, and short-lived last-contact recheck bias. Coefficients come from the stage config.
+
+## Semantic Map
+
+`SemanticMapEncoderV2` produces both a global map embedding and per-region map embeddings. The global embedding feeds the actor fusion trunk, while the region embeddings are added to search-goal region features before computing `search_goal_logits`.
 
 ## Compatibility
 

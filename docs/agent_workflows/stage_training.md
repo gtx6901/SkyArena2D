@@ -1,5 +1,8 @@
 # Stage Training
 
+> Historical Movement V3 workflow. Baseline V2 uses the rule opponent pool in
+> `configs/mappo_skyarena_baseline_v2.yaml` and does not chain stage checkpoints.
+
 Use this workflow to run or review MAPPO curriculum stages.
 
 ## Stages

@@ -242,7 +242,6 @@ def compute_rewards(
     if _mod_enabled("discovery"):
         tracker = state.tracker
         first_seen = _mod_weight("discovery", "first_seen", 0.08)
-        team_shared = _mod_weight("discovery", "team_shared", 1.0)  # bool-ish: >0 = team-shared
         red_new = tracker.red_new_discoveries
         blue_new = tracker.blue_new_discoveries
         if red_new > 0:
@@ -316,8 +315,14 @@ def compute_rewards(
     state.last_round_reward_red = red_round
     state.last_round_reward_blue = blue_round
 
-    red_team = float(np.mean(red_rewards[state.red.alive]) if np.any(state.red.alive) else np.mean(red_rewards))
-    blue_team = float(np.mean(blue_rewards[state.blue.alive]) if np.any(state.blue.alive) else np.mean(blue_rewards))
+    # Keep the team-reward scale independent of how many units happen to remain
+    # alive.  In particular, resolution rewards are written to the destroyed
+    # unit after ``alive`` has been cleared; averaging only the survivors would
+    # silently discard that loss and change the scale throughout an episode.
+    # A fixed full-roster denominator preserves both the loss signal and a
+    # stable per-unit reward scale for mixed fighter/detector teams.
+    red_team = float(np.sum(red_rewards, dtype=np.float64) / max(state.red.total_units, 1))
+    blue_team = float(np.sum(blue_rewards, dtype=np.float64) / max(state.blue.total_units, 1))
 
     maca_reward = {
         "side1_detector_reward": red_rewards[state.red.detector_indices].tolist(),

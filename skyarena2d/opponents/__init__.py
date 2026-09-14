@@ -5,6 +5,7 @@ from .fix_rule_like import FixRuleLikeOpponent
 from .fix_rule_v2 import FixRuleV2Opponent
 from .no_attack_rule import NoAttackRuleOpponent
 from .patrol_rule import PatrolRuleOpponent
+from .pool import RuleOpponentPool
 from .random_rule import RandomRuleOpponent
 from .rush_rule import RushRuleOpponent
 
@@ -25,5 +26,6 @@ __all__ = [
     "RandomRuleOpponent",
     "FixRuleLikeOpponent",
     "FixRuleV2Opponent",
+    "RuleOpponentPool",
     "RULES",
 ]

@@ -1,25 +1,18 @@
-"""Tests for SkyArenaActionAdapter shapes and behavior."""
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from skyarena2d.core.state import TeamState
-from skyarena2d.training.action_adapter import SkyArenaActionAdapter
+from skyarena2d.training.action_adapter import TURN_DELTAS_DEG, SkyArenaActionAdapter
 
 
-def _make_team(n: int, side: str, pos_x_start: float = 0.0) -> TeamState:
-    pos = np.zeros((n, 2), dtype=np.float32)
-    for i in range(n):
-        pos[i, 0] = pos_x_start + i * 100.0
-        pos[i, 1] = 500.0 + i * 50.0
-
+def _team(n: int = 2) -> TeamState:
     return TeamState(
-        side=side,
+        side="red",
         num_fighters=n,
         num_detectors=0,
         alive=np.ones(n, dtype=bool),
-        pos=pos,
+        pos=np.zeros((n, 2), dtype=np.float32),
         heading=np.full(n, 90.0, dtype=np.float32),
         speed=np.full(n, 2.0, dtype=np.float32),
         unit_type=np.zeros(n, dtype=np.int32),
@@ -41,379 +34,105 @@ def _make_team(n: int, side: str, pos_x_start: float = 0.0) -> TeamState:
     )
 
 
-def _make_adapter(n_slots: int = 6) -> SkyArenaActionAdapter:
-    return SkyArenaActionAdapter(
-        candidate_slots=n_slots,
-        course_bins=32,
-        search_goal_grid_size=8,
-        map_width=3000.0,
-        map_height=4000.0,
-        radar_freq=1,
-        jammer_freq=0,
+def _decode(adapter: SkyArenaActionAdapter, own: TeamState, **overrides):
+    n, slots = own.num_fighters, adapter.candidate_slots
+    args = {
+        "course_action": np.full(n, 4, dtype=np.int64),
+        "target_action": np.zeros(n, dtype=np.int64),
+        "fire_action": np.zeros(n, dtype=np.int64),
+        "own": own,
+        "candidate_ids": np.full((n, slots), -1, dtype=np.int64),
+        "candidate_can_long": np.zeros((n, slots), dtype=bool),
+        "candidate_can_short": np.zeros((n, slots), dtype=bool),
+        "has_active_contact": np.zeros(n, dtype=bool),
+        "current_heading": own.heading[:n].copy(),
+    }
+    args.update(overrides)
+    return adapter.decode(**args)
+
+
+def test_atomic_turns_are_relative_to_current_heading() -> None:
+    own = _team()
+    adapter = SkyArenaActionAdapter(candidate_slots=3, use_jammer_strategy=False, jammer_freq=0)
+    action = _decode(adapter, own, course_action=np.array([0, 8]))
+    np.testing.assert_allclose(action.course, [0.0, 180.0])
+    assert TURN_DELTAS_DEG.shape == (9,)
+
+
+def test_pointer_can_select_only_enemy_tokens() -> None:
+    own = _team(1)
+    adapter = SkyArenaActionAdapter(candidate_slots=3, use_jammer_strategy=False, jammer_freq=0)
+    ids = np.array([[-1, 4, -1]], dtype=np.int64)
+    long = np.array([[False, True, False]])
+
+    ally = _decode(
+        adapter,
+        own,
+        target_action=np.array([1]),
+        fire_action=np.array([1]),
+        candidate_ids=ids,
+        candidate_can_long=long,
     )
-
-
-def test_decode_output_shapes():
-    """Verify SkyArenaSideAction has correct shapes for N=4."""
-    N = 4
-    own = _make_team(N, "red")
-    adapter = _make_adapter()
-
-    candidate_ids = np.full((N, 6), -1, dtype=np.int64)
-    candidate_can_long = np.zeros((N, 6), dtype=bool)
-    candidate_can_short = np.zeros((N, 6), dtype=bool)
-
-    action = adapter.decode(
-        course_action=np.zeros(N, dtype=np.int32),
-        search_goal_action=np.zeros(N, dtype=np.int32),
-        target_action=np.zeros(N, dtype=np.int32),
-        fire_action=np.zeros(N, dtype=np.int32),
-        own=own,
-        candidate_ids=candidate_ids,
-        candidate_can_long=candidate_can_long,
-        candidate_can_short=candidate_can_short,
-        has_active_contact=np.zeros(N, dtype=bool),
-        current_heading=np.full(N, 90.0, dtype=np.float32),
+    enemy = _decode(
+        adapter,
+        own,
+        target_action=np.array([2]),
+        fire_action=np.array([1]),
+        candidate_ids=ids,
+        candidate_can_long=long,
     )
-
-    assert action.course.shape == (N,), f"course shape: {action.course.shape}"
-    assert action.radar_freq.shape == (N,), f"radar_freq shape: {action.radar_freq.shape}"
-    assert action.jammer_freq.shape == (N,), f"jammer_freq shape: {action.jammer_freq.shape}"
-    assert action.fire_type.shape == (N,), f"fire_type shape: {action.fire_type.shape}"
-    assert action.target_idx.shape == (N,), f"target_idx shape: {action.target_idx.shape}"
+    assert ally.target_idx[0] == -1 and ally.fire_type[0] == 0
+    assert enemy.target_idx[0] == 4 and enemy.fire_type[0] == 1
 
 
-def test_free_course_uses_absolute_heading():
-    """Movement V3: FREE_COURSE interprets course_action as absolute global heading."""
-    N = 1
-    own = _make_team(N, "red")
-    adapter = _make_adapter()
-
-    candidate_ids = np.full((N, 6), -1, dtype=np.int64)
-    candidate_can_long = np.zeros((N, 6), dtype=bool)
-    candidate_can_short = np.zeros((N, 6), dtype=bool)
-
-    # course_action=8 in 32 bins -> 90 degrees absolute heading
-    action = adapter.decode(
-        movement_mode_action=np.array([0], dtype=np.int32),
-        course_action=np.array([8], dtype=np.int32),
-        search_goal_action=np.zeros(N, dtype=np.int32),
-        target_action=np.zeros(N, dtype=np.int32),
-        fire_action=np.zeros(N, dtype=np.int32),
-        own=own,
-        candidate_ids=candidate_ids,
-        candidate_can_long=candidate_can_long,
-        candidate_can_short=candidate_can_short,
-        has_active_contact=np.array([True], dtype=bool),
-        current_heading=np.array([90.0], dtype=np.float32),
+def test_weapon_choice_is_conditioned_on_selected_target() -> None:
+    own = _team(1)
+    adapter = SkyArenaActionAdapter(candidate_slots=2, use_jammer_strategy=False, jammer_freq=0)
+    ids = np.array([[2, 3]])
+    long = np.array([[True, False]])
+    short = np.array([[False, True]])
+    action = _decode(
+        adapter,
+        own,
+        target_action=np.array([2]),
+        fire_action=np.array([1]),
+        candidate_ids=ids,
+        candidate_can_long=long,
+        candidate_can_short=short,
     )
+    assert action.target_idx[0] == 3
+    assert action.fire_type[0] == 0
 
-    assert abs(action.course[0] - 90.0) < 1e-3
 
-
-def test_selected_target_movement_uses_residual_offset():
-    """Movement V3: selected-target mode uses target bearing plus residual offset."""
-    N = 1
-    own = _make_team(N, "red")
-    adapter = _make_adapter()
-
-    candidate_ids = np.array([[0, -1, -1, -1, -1, -1]], dtype=np.int64)
-    candidate_can_long = np.array([[True, False, False, False, False, False]], dtype=bool)
-    candidate_can_short = np.zeros((N, 6), dtype=bool)
-    entity_features = np.zeros((N, 6, 10), dtype=np.float32)
-    entity_features[0, 0, 3] = 0.0  # bearing 0 degrees
-
-    action = adapter.decode(
-        movement_mode_action=np.array([3], dtype=np.int32),
-        course_action=np.array([2], dtype=np.int32),
-        search_goal_action=np.zeros(N, dtype=np.int32),
-        target_action=np.array([1], dtype=np.int32),
-        fire_action=np.zeros(N, dtype=np.int32),
-        own=own,
-        candidate_ids=candidate_ids,
-        candidate_can_long=candidate_can_long,
-        candidate_can_short=candidate_can_short,
-        has_active_contact=np.array([True], dtype=bool),
-        current_heading=np.array([90.0], dtype=np.float32),
-        entity_features=entity_features,
+def test_native_action_bridge_still_encodes_valid_launch() -> None:
+    own = _team(1)
+    adapter = SkyArenaActionAdapter(candidate_slots=1, use_jammer_strategy=False, jammer_freq=0)
+    action = _decode(
+        adapter,
+        own,
+        target_action=np.array([1]),
+        fire_action=np.array([2]),
+        candidate_ids=np.array([[5]]),
+        candidate_can_short=np.array([[True]]),
     )
+    encoded = action.to_maca_fighter_action(max_enemy=10)
+    assert encoded.shape == (1, 4)
+    assert encoded[0, 3] == 16.0
 
-    assert abs(action.course[0] - 22.5) < 1e-3
 
-
-def test_search_goal_action_without_contact():
-    """Without contact, course should point toward search_goal region center."""
-    N = 1
-    own = _make_team(N, "red")
-    adapter = _make_adapter()
-
-    candidate_ids = np.full((N, 6), -1, dtype=np.int64)
-    candidate_can_long = np.zeros((N, 6), dtype=bool)
-    candidate_can_short = np.zeros((N, 6), dtype=bool)
-
-    # Agent at (0, 500), search_goal_action=0 -> region 0 center
-    # Region 0 center: col=0, row=0 -> cx = 0.5 * (3000/8) = 187.5, cy = 0.5 * (4000/8) = 250
-    action = adapter.decode(
-        movement_mode_action=np.array([1], dtype=np.int32),
-        course_action=np.zeros(N, dtype=np.int32),
-        search_goal_action=np.array([0], dtype=np.int32),
-        target_action=np.zeros(N, dtype=np.int32),
-        fire_action=np.zeros(N, dtype=np.int32),
-        own=own,
-        candidate_ids=candidate_ids,
-        candidate_can_long=candidate_can_long,
-        candidate_can_short=candidate_can_short,
-        has_active_contact=np.array([False], dtype=bool),
-        current_heading=np.array([90.0], dtype=np.float32),
+def test_dead_agent_keeps_heading_and_cannot_target() -> None:
+    own = _team(1)
+    own.alive[0] = False
+    adapter = SkyArenaActionAdapter(candidate_slots=1, use_jammer_strategy=False, jammer_freq=0)
+    action = _decode(
+        adapter,
+        own,
+        course_action=np.array([8]),
+        target_action=np.array([1]),
+        fire_action=np.array([1]),
+        candidate_ids=np.array([[0]]),
+        candidate_can_long=np.array([[True]]),
     )
-
-    # Compute expected heading toward region 0 center
-    cx, cy = adapter._region_centers[0]
-    ox, oy = float(own.pos[0, 0]), float(own.pos[0, 1])
-    expected = np.degrees(np.arctan2(cy - oy, cx - ox)) % 360.0
-
-    assert abs(action.course[0] - expected) < 1e-3, (
-        f"Expected course {expected}, got {action.course[0]}"
-    )
-
-
-def test_fire_blocked_by_mask():
-    """Fire type 1 (long) should be blocked if candidate_can_long=False."""
-    N = 1
-    own = _make_team(N, "red")
-    adapter = _make_adapter()
-
-    # Slot 0 has enemy 0, but cannot fire long
-    candidate_ids = np.array([[0, -1, -1, -1, -1, -1]], dtype=np.int64)
-    candidate_can_long = np.array([[False, False, False, False, False, False]], dtype=bool)
-    candidate_can_short = np.array([[False, False, False, False, False, False]], dtype=bool)
-
-    action = adapter.decode(
-        course_action=np.zeros(N, dtype=np.int32),
-        search_goal_action=np.zeros(N, dtype=np.int32),
-        target_action=np.array([1], dtype=np.int32),  # target slot 0
-        fire_action=np.array([1], dtype=np.int32),    # try long fire
-        own=own,
-        candidate_ids=candidate_ids,
-        candidate_can_long=candidate_can_long,
-        candidate_can_short=candidate_can_short,
-        has_active_contact=np.array([True], dtype=bool),
-        current_heading=np.array([90.0], dtype=np.float32),
-    )
-
-    # Fire should be blocked
-    assert action.fire_type[0] == 0, (
-        f"Expected fire_type=0 (blocked), got {action.fire_type[0]}"
-    )
-    # Target idx should still be set
-    assert action.target_idx[0] == 0, (
-        f"Expected target_idx=0, got {action.target_idx[0]}"
-    )
-
-
-def test_target_action_zero_means_no_fire():
-    """target_action=0 should result in target_idx=-1 and fire_type=0."""
-    N = 2
-    own = _make_team(N, "red")
-    adapter = _make_adapter()
-
-    candidate_ids = np.array([[0, 1, -1, -1, -1, -1], [0, -1, -1, -1, -1, -1]], dtype=np.int64)
-    candidate_can_long = np.ones((N, 6), dtype=bool)
-    candidate_can_short = np.ones((N, 6), dtype=bool)
-
-    action = adapter.decode(
-        course_action=np.zeros(N, dtype=np.int32),
-        search_goal_action=np.zeros(N, dtype=np.int32),
-        target_action=np.zeros(N, dtype=np.int32),  # 0 = no target
-        fire_action=np.ones(N, dtype=np.int32),      # would fire long if target set
-        own=own,
-        candidate_ids=candidate_ids,
-        candidate_can_long=candidate_can_long,
-        candidate_can_short=candidate_can_short,
-        has_active_contact=np.ones(N, dtype=bool),
-        current_heading=np.full(N, 90.0, dtype=np.float32),
-    )
-
-    for i in range(N):
-        assert action.target_idx[i] == -1, (
-            f"Agent {i}: expected target_idx=-1, got {action.target_idx[i]}"
-        )
-        assert action.fire_type[i] == 0, (
-            f"Agent {i}: expected fire_type=0, got {action.fire_type[i]}"
-        )
-
-
-def test_fire_allowed_when_can_long():
-    """Fire type 1 (long) should be allowed when candidate_can_long=True."""
-    N = 1
-    own = _make_team(N, "red")
-    adapter = _make_adapter()
-
-    candidate_ids = np.array([[3, -1, -1, -1, -1, -1]], dtype=np.int64)
-    candidate_can_long = np.array([[True, False, False, False, False, False]], dtype=bool)
-    candidate_can_short = np.array([[False, False, False, False, False, False]], dtype=bool)
-
-    action = adapter.decode(
-        course_action=np.zeros(N, dtype=np.int32),
-        search_goal_action=np.zeros(N, dtype=np.int32),
-        target_action=np.array([1], dtype=np.int32),  # target slot 0
-        fire_action=np.array([1], dtype=np.int32),    # long fire
-        own=own,
-        candidate_ids=candidate_ids,
-        candidate_can_long=candidate_can_long,
-        candidate_can_short=candidate_can_short,
-        has_active_contact=np.array([True], dtype=bool),
-        current_heading=np.array([90.0], dtype=np.float32),
-    )
-
-    assert action.fire_type[0] == 1, f"Expected fire_type=1, got {action.fire_type[0]}"
-    assert action.target_idx[0] == 3, f"Expected target_idx=3, got {action.target_idx[0]}"
-
-
-def test_to_maca_fighter_action():
-    """Verify SkyArenaSideAction.to_maca_fighter_action produces correct encoding."""
-    N = 2
-    own = _make_team(N, "red")
-    adapter = _make_adapter()
-
-    candidate_ids = np.array([[5, -1, -1, -1, -1, -1], [-1, -1, -1, -1, -1, -1]], dtype=np.int64)
-    candidate_can_long = np.array([[True, False, False, False, False, False], [False] * 6], dtype=bool)
-    candidate_can_short = np.array([[False] * 6, [False] * 6], dtype=bool)
-
-    action = adapter.decode(
-        course_action=np.zeros(N, dtype=np.int32),
-        search_goal_action=np.zeros(N, dtype=np.int32),
-        target_action=np.array([1, 0], dtype=np.int32),
-        fire_action=np.array([1, 0], dtype=np.int32),
-        own=own,
-        candidate_ids=candidate_ids,
-        candidate_can_long=candidate_can_long,
-        candidate_can_short=candidate_can_short,
-        has_active_contact=np.array([True, False], dtype=bool),
-        current_heading=np.array([90.0, 45.0], dtype=np.float32),
-    )
-
-    maca = action.to_maca_fighter_action(max_enemy=10)
-    assert maca.shape == (N, 4)
-    # Agent 0 fires long at enemy 5: hit_target = 5 + 1 = 6
-    assert maca[0, 3] == 6.0, f"Expected 6.0, got {maca[0, 3]}"
-    # Agent 1 no fire
-    assert maca[1, 3] == 0.0, f"Expected 0.0, got {maca[1, 3]}"
-
-
-def test_rule_based_jammer_opens_on_contact_without_actor_head():
-    N = 2
-    own = _make_team(N, "red")
-    adapter = SkyArenaActionAdapter(
-        candidate_slots=6,
-        course_bins=16,
-        search_goal_grid_size=8,
-        map_width=3000.0,
-        map_height=4000.0,
-        radar_freq=1,
-        jammer_freq=1,
-        use_jammer_strategy=True,
-        jammer_range=320.0,
-        max_jammers_per_side=1,
-    )
-
-    candidate_ids = np.array([[0, -1, -1, -1, -1, -1], [1, -1, -1, -1, -1, -1]], dtype=np.int64)
-    candidate_can_long = np.zeros((N, 6), dtype=bool)
-    candidate_can_short = np.zeros((N, 6), dtype=bool)
-    entity_features = np.zeros((N, 6, 10), dtype=np.float32)
-    diag = np.hypot(3000.0, 4000.0)
-    entity_features[0, 0, 2] = 300.0 / diag
-    entity_features[1, 0, 2] = 100.0 / diag
-
-    action = adapter.decode(
-        course_action=np.zeros(N, dtype=np.int32),
-        search_goal_action=np.zeros(N, dtype=np.int32),
-        target_action=np.zeros(N, dtype=np.int32),
-        fire_action=np.zeros(N, dtype=np.int32),
-        own=own,
-        candidate_ids=candidate_ids,
-        candidate_can_long=candidate_can_long,
-        candidate_can_short=candidate_can_short,
-        has_active_contact=np.ones(N, dtype=bool),
-        current_heading=np.full(N, 90.0, dtype=np.float32),
-        entity_features=entity_features,
-        ew_state_key="test",
-        step_count=5,
-    )
-
-    assert action.jammer_freq[0] == 0
-    assert action.jammer_freq[1] == 8
-
-
-def test_rule_based_jammer_memory_holds_then_expires():
-    N = 1
-    own = _make_team(N, "red")
-    adapter = SkyArenaActionAdapter(
-        candidate_slots=6,
-        course_bins=16,
-        search_goal_grid_size=8,
-        map_width=3000.0,
-        map_height=4000.0,
-        radar_freq=1,
-        jammer_freq=2,
-        use_jammer_strategy=True,
-        jammer_range=320.0,
-        jammer_memory_steps=2,
-    )
-
-    candidate_ids = np.array([[0, -1, -1, -1, -1, -1]], dtype=np.int64)
-    candidate_can_long = np.zeros((N, 6), dtype=bool)
-    candidate_can_short = np.zeros((N, 6), dtype=bool)
-    entity_features = np.zeros((N, 6, 10), dtype=np.float32)
-    entity_features[0, 0, 2] = 100.0 / np.hypot(3000.0, 4000.0)
-
-    adapter.decode(
-        course_action=np.zeros(N, dtype=np.int32),
-        search_goal_action=np.zeros(N, dtype=np.int32),
-        target_action=np.zeros(N, dtype=np.int32),
-        fire_action=np.zeros(N, dtype=np.int32),
-        own=own,
-        candidate_ids=candidate_ids,
-        candidate_can_long=candidate_can_long,
-        candidate_can_short=candidate_can_short,
-        has_active_contact=np.ones(N, dtype=bool),
-        current_heading=np.full(N, 90.0, dtype=np.float32),
-        entity_features=entity_features,
-        ew_state_key="test-memory",
-        step_count=10,
-    )
-
-    no_candidates = np.full((N, 6), -1, dtype=np.int64)
-    held = adapter.decode(
-        course_action=np.zeros(N, dtype=np.int32),
-        search_goal_action=np.zeros(N, dtype=np.int32),
-        target_action=np.zeros(N, dtype=np.int32),
-        fire_action=np.zeros(N, dtype=np.int32),
-        own=own,
-        candidate_ids=no_candidates,
-        candidate_can_long=candidate_can_long,
-        candidate_can_short=candidate_can_short,
-        has_active_contact=np.zeros(N, dtype=bool),
-        current_heading=np.full(N, 90.0, dtype=np.float32),
-        entity_features=entity_features,
-        ew_state_key="test-memory",
-        step_count=12,
-    )
-    expired = adapter.decode(
-        course_action=np.zeros(N, dtype=np.int32),
-        search_goal_action=np.zeros(N, dtype=np.int32),
-        target_action=np.zeros(N, dtype=np.int32),
-        fire_action=np.zeros(N, dtype=np.int32),
-        own=own,
-        candidate_ids=no_candidates,
-        candidate_can_long=candidate_can_long,
-        candidate_can_short=candidate_can_short,
-        has_active_contact=np.zeros(N, dtype=bool),
-        current_heading=np.full(N, 90.0, dtype=np.float32),
-        entity_features=entity_features,
-        ew_state_key="test-memory",
-        step_count=13,
-    )
-
-    assert held.jammer_freq[0] == 3
-    assert expired.jammer_freq[0] == 0
+    assert action.course[0] == 90.0
+    assert action.target_idx[0] == -1
+    assert action.fire_type[0] == 0

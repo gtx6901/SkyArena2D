@@ -1,5 +1,9 @@
 # SkyArena2D 配置说明
 
+> 当前唯一推荐的 RL 配置是 `mappo_skyarena_baseline_v2.yaml`，快速验证使用
+> `mappo_skyarena_baseline_v2_smoke.yaml`。下文旧 `mappo_skyarena*` 与 stage
+> 配置只用于解释历史实验，不再代表当前 actor/checkpoint 契约。
+
 ## 1. `configs/env_10v10_full.yaml`
 
 这是环境和战斗语义的主配置文件。

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from skyarena2d.core.state import TeamState
 from skyarena2d.training.obs_builder import SkyArenaTrainingObsBuilder
@@ -46,10 +45,8 @@ def _make_builder(n: int = 2) -> SkyArenaTrainingObsBuilder:
     return SkyArenaTrainingObsBuilder(
         num_fighters=n,
         candidate_slots=6,
-        search_goal_grid_size=8,
         map_width=3000.0,
         map_height=4000.0,
-        semantic_map_size=32,
         track_memory_steps=10,
     )
 
@@ -74,7 +71,6 @@ def test_invisible_enemy_not_in_candidates():
         fireable_short=fireable_short,
         step_count=0,
         max_steps=1000,
-        current_search_goal_id=np.zeros(2, dtype=np.int64),
     )
 
     candidate_ids = obs["candidate_ids"]  # (2, 6)
@@ -90,9 +86,9 @@ def test_invisible_enemy_not_in_candidates():
         f"Enemy 1 missing from red[0] candidates: {candidate_ids[0]}"
     )
 
-    # entity_mask[0] should have exactly 1 True (for blue[1])
-    assert entity_mask[0].sum() == 1, (
-        f"Expected 1 valid candidate for red[0], got {entity_mask[0].sum()}"
+    # entity set includes one ally plus the one visible enemy.
+    assert entity_mask[0].sum() == 2, (
+        f"Expected one ally and one enemy for red[0], got {entity_mask[0].sum()}"
     )
 
 
@@ -116,7 +112,6 @@ def test_visible_enemy_in_candidates():
         fireable_short=fireable_short,
         step_count=0,
         max_steps=1000,
-        current_search_goal_id=np.zeros(2, dtype=np.int64),
     )
 
     candidate_ids = obs["candidate_ids"]
@@ -162,8 +157,8 @@ def test_global_state_contains_all_enemies():
     )
 
 
-def test_semantic_map_no_invisible_enemy():
-    """enemy_visible channel (channel 3) must be 0 for invisible enemies."""
+def test_compact_obs_has_no_semantic_map_or_invisible_enemy():
+    """Compact policy obs must omit the grid and exclude invisible enemies."""
     red = _make_team(2, "red", pos_x_start=0.0)
     blue = _make_team(2, "blue", pos_x_start=1500.0)
 
@@ -182,18 +177,10 @@ def test_semantic_map_no_invisible_enemy():
         fireable_short=fireable_short,
         step_count=0,
         max_steps=1000,
-        current_search_goal_id=np.zeros(2, dtype=np.int64),
     )
 
-    semantic_map = obs["semantic_map"]  # (N, 9, M, M)
-    # Channel 3 = enemy_visible
-    enemy_visible_channel = semantic_map[:, 3, :, :]
-
-    # Should be all zeros since no enemies are visible
-    assert enemy_visible_channel.sum() == 0.0, (
-        f"enemy_visible channel has non-zero values for invisible enemies: "
-        f"{enemy_visible_channel.sum()}"
-    )
+    assert "semantic_map" not in obs
+    assert np.all(obs["candidate_ids"] == -1)
 
 
 def test_obs_shapes_10v10():
@@ -205,10 +192,8 @@ def test_obs_shapes_10v10():
     builder = SkyArenaTrainingObsBuilder(
         num_fighters=N,
         candidate_slots=6,
-        search_goal_grid_size=8,
         map_width=3000.0,
         map_height=4000.0,
-        semantic_map_size=100,
         track_memory_steps=10,
     )
 
@@ -224,24 +209,23 @@ def test_obs_shapes_10v10():
         fireable_short=fireable_short,
         step_count=100,
         max_steps=1500,
-        current_search_goal_id=np.zeros(N, dtype=np.int64),
     )
 
-    assert obs["self_features"].shape == (N, 20)
-    assert obs["entity_features"].shape == (N, 6, 10)
-    assert obs["entity_mask"].shape == (N, 6)
-    assert obs["candidate_ids"].shape == (N, 6)
-    assert obs["candidate_can_long"].shape == (N, 6)
-    assert obs["candidate_can_short"].shape == (N, 6)
-    assert obs["semantic_map"].shape == (N, 9, 100, 100)
-    assert obs["current_search_goal_id"].shape == (N,)
+    assert obs["self_features"].shape == (N, 22)
+    assert obs["entity_features"].shape == (N, 19, 20)
+    assert obs["entity_mask"].shape == (N, 19)
+    assert obs["candidate_ids"].shape == (N, 19)
+    assert obs["candidate_can_long"].shape == (N, 19)
+    assert obs["candidate_can_short"].shape == (N, 19)
+    assert "semantic_map" not in obs
+    assert "current_search_goal_id" not in obs
     assert obs["agent_id"].shape == (N,)
-    assert obs["region_features"].shape == (N, 64, 10)
+    assert "region_features" not in obs
     assert obs["alive_mask"].shape == (N,)
     assert obs["has_active_contact"].shape == (N,)
-    assert obs["course_mask"].shape == (N, 32)
-    assert obs["search_goal_mask"].shape == (N, 64)
-    assert obs["target_mask"].shape == (N, 7)
+    assert obs["course_mask"].shape == (N, 9)
+    assert "search_goal_mask" not in obs
+    assert obs["target_mask"].shape == (N, 20)
 
 
 def test_track_memory_includes_recently_seen():
@@ -264,7 +248,6 @@ def test_track_memory_includes_recently_seen():
         fireable_short=fireable_short,
         step_count=0,
         max_steps=1000,
-        current_search_goal_id=np.zeros(1, dtype=np.int64),
     )
 
     # Step 5: enemy is no longer visible, but within track_memory_steps=10
@@ -277,7 +260,6 @@ def test_track_memory_includes_recently_seen():
         fireable_short=fireable_short,
         step_count=5,
         max_steps=1000,
-        current_search_goal_id=np.zeros(1, dtype=np.int64),
     )
 
     # Enemy should still appear via track memory
@@ -307,7 +289,6 @@ def test_track_memory_expires():
         fireable_short=fireable_short,
         step_count=0,
         max_steps=1000,
-        current_search_goal_id=np.zeros(1, dtype=np.int64),
     )
 
     # Step 15: enemy not visible, beyond track_memory_steps=10
@@ -320,7 +301,6 @@ def test_track_memory_expires():
         fireable_short=fireable_short,
         step_count=15,
         max_steps=1000,
-        current_search_goal_id=np.zeros(1, dtype=np.int64),
     )
 
     candidate_ids = obs["candidate_ids"]
