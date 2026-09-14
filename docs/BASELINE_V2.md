@@ -58,3 +58,23 @@ to `fix_rule_v2`. Historical learned checkpoints require a symmetric blue-policy
 adapter and are a follow-up extension of the same pool interface.
 
 Baseline V2 checkpoints are intentionally incompatible with Movement V3.
+
+## Fire-control metric semantics
+
+`WeaponStepResult.fireable_*` records the action-time, pre-launch opportunity
+that the policy acted on. It must not be rewritten after ammunition is consumed:
+an accepted last-missile launch is still evidence that the agent had a legal
+opportunity on that step. The post-movement observation independently recomputes
+next-step fireability from the remaining ammunition.
+
+Environment step metrics remain instantaneous. Evaluation reports sum
+`fireable`, `attempted`, `selected`, and selected-exchange fields across each
+episode, while terminal counters such as kills and missiles come from the
+episode tracker. Fire execution rate uses selected agents divided by fireable
+agent-steps, so it is bounded by one. Each evaluation episode records its actual
+reset seed.
+
+This correction changes diagnostics only. It does not alter action dimensions,
+launch acceptance, hit probabilities, rewards, network tensors, or checkpoint
+compatibility. Validation covers last-missile opportunities, multi-step report
+aggregation, and deterministic non-repeating evaluation seeds.

@@ -181,9 +181,11 @@ def update_tracker(
         blue_selected_matrix = weapon_result.blue_selected_long_matrix | weapon_result.blue_selected_short_matrix
         red_selected_edges = int(np.count_nonzero(red_selected_matrix))
         blue_selected_edges = int(np.count_nonzero(blue_selected_matrix))
+        red_selected_agents = int(np.count_nonzero(np.any(red_selected_matrix, axis=1)))
+        blue_selected_agents = int(np.count_nonzero(np.any(blue_selected_matrix, axis=1)))
 
-        tracker.fire_executions_red += red_selected_edges
-        tracker.fire_executions_blue += blue_selected_edges
+        tracker.fire_executions_red += red_selected_agents
+        tracker.fire_executions_blue += blue_selected_agents
 
         red_attempted_matrix = weapon_result.red_attempted_long_matrix | weapon_result.red_attempted_short_matrix
         blue_attempted_matrix = weapon_result.blue_attempted_long_matrix | weapon_result.blue_attempted_short_matrix

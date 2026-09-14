@@ -25,8 +25,10 @@ def test_eval_reset_seed_sequence_is_reproducible():
 
     env_a.reset()
     a_pos_1 = env_a.engine.state.red.pos.copy()
+    a_seed_1 = env_a.last_reset_seed
     env_a.reset()
     a_pos_2 = env_a.engine.state.red.pos.copy()
+    a_seed_2 = env_a.last_reset_seed
 
     env_b.reset()
     b_pos_1 = env_b.engine.state.red.pos.copy()
@@ -36,3 +38,4 @@ def test_eval_reset_seed_sequence_is_reproducible():
     assert not np.allclose(a_pos_1, a_pos_2)
     assert np.allclose(a_pos_1, b_pos_1)
     assert np.allclose(a_pos_2, b_pos_2)
+    assert (a_seed_1, a_seed_2) == (42, 43)

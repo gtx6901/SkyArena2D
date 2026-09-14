@@ -49,6 +49,35 @@ from .rollout import (
     sample_policy_actions,
 )
 
+_EVAL_EPISODE_SUM_KEYS = (
+    "red_fireable_edges",
+    "blue_fireable_edges",
+    "fireability_edge_advantage",
+    "red_fireable_agents",
+    "blue_fireable_agents",
+    "expected_red_kills_proxy",
+    "expected_blue_kills_proxy",
+    "expected_exchange_proxy",
+    "red_attempted_edges",
+    "blue_attempted_edges",
+    "red_selected_edges",
+    "blue_selected_edges",
+    "selected_edge_advantage",
+    "selected_expected_red_kills",
+    "selected_expected_blue_kills",
+    "selected_expected_exchange",
+)
+
+
+def _accumulate_eval_step_metrics(
+    totals: dict[str, float], step_metrics: Mapping[str, Any]
+) -> None:
+    """Accumulate instantaneous engine metrics into episode-level eval totals."""
+    for key in _EVAL_EPISODE_SUM_KEYS:
+        value = step_metrics.get(key)
+        if isinstance(value, (int, float, np.number)):
+            totals[key] = totals.get(key, 0.0) + float(value)
+
 
 class SkyArenaMAPPOTrainer:
     """CTDE MAPPO with an entity-set recurrent actor and per-agent critic."""
@@ -745,6 +774,7 @@ class SkyArenaMAPPOTrainer:
                 steps = 0
                 target_nonzero = 0
                 fire_nonzero = 0
+                episode_metric_totals: dict[str, float] = {}
                 info: dict[str, Any] = {}
                 while not done and (max_steps is None or steps < max_steps):
                     obs_batch = {key: value[None] for key, value in obs.items()}
@@ -777,23 +807,29 @@ class SkyArenaMAPPOTrainer:
                         (sampled["fire"][0] > 0) & alive
                     ))
                     obs, team_reward, done, info = eval_env.step(action)
+                    step_metrics = info.get("metrics", {})
+                    if isinstance(step_metrics, Mapping):
+                        _accumulate_eval_step_metrics(episode_metric_totals, step_metrics)
                     episode_return += float(team_reward)
                     h, c = sampled["next_h"], sampled["next_c"]
                     steps += 1
                     if render_mode is not None and steps % render_every == 0:
                         eval_env.engine.render(render_mode)
+                final_metrics = (
+                    dict(info.get("metrics", {}))
+                    if isinstance(info.get("metrics"), dict)
+                    else {}
+                )
+                final_metrics.update(episode_metric_totals)
                 records.append({
                     "episode": episode,
+                    "seed": eval_env.last_reset_seed,
                     "winner": str(info.get("winner", "draw")),
                     "episode_return": episode_return,
                     "episode_len": steps,
                     "target_action_nonzero_count": target_nonzero,
                     "fire_action_nonzero_count": fire_nonzero,
-                    **(
-                        info.get("metrics", {})
-                        if isinstance(info.get("metrics"), dict)
-                        else {}
-                    ),
+                    **final_metrics,
                 })
         finally:
             self.actor.train(was_training)

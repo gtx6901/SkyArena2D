@@ -84,6 +84,7 @@ class SkyArenaMAPPOEnv:
         self.blue_fighter_num = self.engine_config.teams.blue_fighters
         self._last_obs = None
         self._last_info = None
+        self.last_reset_seed: int | None = None
 
     def reset(self) -> dict:
         """Reset environment and return initial policy obs for red."""
@@ -94,6 +95,7 @@ class SkyArenaMAPPOEnv:
             env_seed = self._base_seed + self.seed_offset * 100000 + self._reset_counter
             opp_seed = self._base_seed + self.seed_offset * 100000 + self._reset_counter + 1000
 
+        self.last_reset_seed = env_seed
         obs, info = self.engine.reset(seed=env_seed)
         if self.opponent_pool is not None:
             self.current_opponent_name, self.blue_opponent = self.opponent_pool.sample(seed=opp_seed)

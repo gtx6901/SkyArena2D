@@ -85,6 +85,29 @@ def test_attempted_and_selected_matrix_on_valid_fire():
     assert info["metrics"]["red_attempted_edges"] >= info["metrics"]["red_selected_edges"] >= 1
 
 
+def test_last_missile_launch_keeps_action_time_fireability():
+    """An accepted final missile remains a fireable opportunity for that step."""
+    env = _make_env(seed=22)
+    assert env.state is not None
+    red_n = env.state.red.num_fighters
+
+    env.state.red.pos[:, :] = np.array([100.0, 200.0], dtype=np.float32)
+    env.state.blue.pos[:, :] = np.array([150.0, 200.0], dtype=np.float32)
+    env.state.red.long_ammo[:] = 0
+    env.state.red.short_ammo[:] = 0
+    env.state.red.long_ammo[0] = 1
+
+    fighter_action = np.zeros((red_n, 4), dtype=np.float32)
+    fighter_action[0, 1] = 1.0
+    fighter_action[0, 3] = 1.0
+    _, _, _, _, info = env.step({"red": {"fighter_action": fighter_action}, "blue": {}})
+
+    metrics = info["metrics"]
+    assert metrics["red_selected_edges"] == 1
+    assert metrics["red_fireable_edges"] >= 1
+    assert metrics["red_fire_execution_rate_given_opportunity"] == pytest.approx(1.0)
+
+
 def test_selected_fire_execution_rate():
     """After many steps, if agents fire when opportunity exists, execution rate > 0."""
     env = _make_env(seed=3)
