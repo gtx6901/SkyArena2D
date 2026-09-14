@@ -48,6 +48,13 @@
 典型特征：
 
 - `num_envs` 更大。
+- `env_backend: subprocess` 使用常驻进程并行推进环境；策略推理和 MAPPO
+  更新仍由主进程在 GPU 上批处理。
+- `env_workers` 控制常驻 worker 数；`auto` 默认保留两个逻辑 CPU、且不超过
+  `num_envs`。正式跑前可用 `scripts/benchmark_env_runner.py` 对具体 CPU 比较不同
+  worker 数。当前 16 环境配置在 i9-13900H 上实测以 16 workers 最快。
+- Linux CUDA 训练推荐 `env_start_method: forkserver`，避免从已初始化 CUDA 的
+  主进程直接 `fork`。
 - `rollout_steps` 更稳定。
 - `save_interval` 和 `eval_interval` 不应过短，至少应接近一个 episode 的尺度。
 - `gui_eval_episodes` 可以较多；正式训练当前保留 `gui_eval_episodes: 15`。

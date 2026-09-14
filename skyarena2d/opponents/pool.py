@@ -71,12 +71,16 @@ class RuleOpponentPool:
             return (1.0 - self.uniform_mix) * adaptive + self.uniform_mix * uniform
 
     def sample(self, *, seed: int | None = None) -> tuple[str, BaseRuleOpponent]:
-        with self._lock:
-            index = int(self.rng.choice(len(self.names), p=self.probabilities()))
-        name = self.names[index]
+        name = self.sample_name()
         kwargs = dict(self.kwargs_by_name.get(name, {}))
         kwargs["seed"] = seed
         return name, self.registry[name](**kwargs)
+
+    def sample_name(self) -> str:
+        """Sample only the rule name, for remotely hosted environments."""
+        with self._lock:
+            index = int(self.rng.choice(len(self.names), p=self.probabilities()))
+        return self.names[index]
 
     def record_result(self, name: str, winner: str) -> None:
         if name not in self.records:

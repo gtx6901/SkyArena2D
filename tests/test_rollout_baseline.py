@@ -56,6 +56,33 @@ def test_sampling_uses_pointer_and_selected_target_weapon_masks() -> None:
     assert result["next_h"].shape == (1, 2, 6)
 
 
+def test_fast_sampling_log_prob_matches_full_head_evaluation() -> None:
+    obs = {
+        "self_features": np.zeros((1, 2, 4), dtype=np.float32),
+        "entity_features": np.zeros((1, 2, 3, 5), dtype=np.float32),
+        "entity_mask": np.ones((1, 2, 3), dtype=bool),
+        "target_mask": np.ones((1, 2, 4), dtype=bool),
+        "candidate_can_long": np.ones((1, 2, 3), dtype=bool),
+        "candidate_can_short": np.ones((1, 2, 3), dtype=bool),
+        "alive_mask": np.ones((1, 2), dtype=np.float32),
+        "agent_id": np.array([[0, 1]], dtype=np.int64),
+        "global_state": np.full((1, 7), np.nan, dtype=np.float32),
+    }
+    hidden = (torch.zeros((1, 2, 6)), torch.zeros((1, 2, 6)))
+    fast = sample_policy_actions(
+        _DeterministicActor(), obs, hidden, torch.device("cpu"), True
+    )
+    diagnostic = sample_policy_actions(
+        _DeterministicActor(), obs, hidden, torch.device("cpu"), True,
+        return_diagnostics=True,
+    )
+
+    np.testing.assert_array_equal(fast["course"], diagnostic["course"])
+    np.testing.assert_array_equal(fast["target"], diagnostic["target"])
+    np.testing.assert_array_equal(fast["fire"], diagnostic["fire"])
+    np.testing.assert_allclose(fast["log_prob"], diagnostic["log_prob"], atol=1e-7)
+
+
 def test_all_three_policy_heads_contribute_entropy_and_log_prob() -> None:
     evaluated = evaluate_policy_heads(
         course_logits=torch.zeros((1, 9)),

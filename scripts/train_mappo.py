@@ -16,6 +16,11 @@ def main():
     parser.add_argument("--config", default="configs/mappo_skyarena_baseline_v2.yaml")
     parser.add_argument("--total_env_steps", type=int, default=None)
     parser.add_argument("--device", default=None)
+    parser.add_argument("--env_backend", choices=("serial", "subprocess"), default=None)
+    parser.add_argument("--env_workers", default=None)
+    parser.add_argument("--train_dir", default=None)
+    parser.add_argument("--experiment_name", default=None)
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument("--save_interval", type=int, default=None)
     parser.add_argument("--eval_interval", type=int, default=None)
     parser.add_argument("--gui_eval_interval", type=int, default=None)
@@ -29,6 +34,16 @@ def main():
         cfg["train"]["total_env_steps"] = args.total_env_steps
     if args.device:
         cfg["train"]["device"] = args.device
+    if args.env_backend:
+        cfg["train"]["env_backend"] = args.env_backend
+    if args.env_workers:
+        cfg["train"]["env_workers"] = args.env_workers
+    if args.train_dir:
+        cfg["train"]["train_dir"] = args.train_dir
+    if args.experiment_name:
+        cfg["train"]["experiment_name"] = args.experiment_name
+    if args.resume:
+        cfg["train"]["resume"] = True
     if args.save_interval:
         cfg["train"]["save_interval"] = args.save_interval
     if args.eval_interval:

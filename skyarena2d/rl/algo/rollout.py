@@ -13,6 +13,17 @@ import numpy as np
 import torch
 from torch.distributions import Categorical
 
+_ACTOR_OBS_KEYS = (
+    "self_features",
+    "entity_features",
+    "entity_mask",
+    "target_mask",
+    "candidate_can_long",
+    "candidate_can_short",
+    "alive_mask",
+    "agent_id",
+)
+
 
 def masked_categorical(logits: torch.Tensor, mask: torch.Tensor) -> Categorical:
     """Build a categorical distribution after validating its boolean mask."""
@@ -223,13 +234,6 @@ def evaluate_policy_heads(
     }
 
 
-def _masked_action(logits: torch.Tensor, mask: torch.Tensor, deterministic: bool) -> torch.Tensor:
-    distribution = masked_categorical(logits, mask)
-    if deterministic:
-        return torch.argmax(logits.masked_fill(~mask, torch.finfo(logits.dtype).min), dim=-1)
-    return distribution.sample()
-
-
 @torch.no_grad()
 def sample_policy_actions(
     actor,
@@ -241,7 +245,10 @@ def sample_policy_actions(
     return_diagnostics: bool = False,
 ):
     """Sample atomic course, pointer target, and target-conditioned weapon."""
-    obs_t = to_torch_batch(obs_batch, device)
+    obs_t = to_torch_batch(
+        {key: obs_batch[key] for key in _ACTOR_OBS_KEYS if key in obs_batch},
+        device,
+    )
     if "self_features" not in obs_t:
         raise KeyError("self_features is required to infer environment and agent axes")
     num_envs, num_agents = obs_t["self_features"].shape[:2]
@@ -262,8 +269,24 @@ def sample_policy_actions(
         target_logits=out["target_logits"], entity_mask=entity_mask,
         target_mask=flat_target_mask, alive_mask=alive,
     )
-    course_action = _masked_action(out["course_logits"], course_mask, deterministic)
-    target_action = _masked_action(out["target_logits"], pointer_mask, deterministic)
+    course_dist = masked_categorical(out["course_logits"], course_mask)
+    target_dist = masked_categorical(out["target_logits"], pointer_mask)
+    if deterministic:
+        course_action = torch.argmax(
+            out["course_logits"].masked_fill(
+                ~course_mask, torch.finfo(out["course_logits"].dtype).min
+            ),
+            dim=-1,
+        )
+        target_action = torch.argmax(
+            out["target_logits"].masked_fill(
+                ~pointer_mask, torch.finfo(out["target_logits"].dtype).min
+            ),
+            dim=-1,
+        )
+    else:
+        course_action = course_dist.sample()
+        target_action = target_dist.sample()
 
     candidate_can_long = obs_t["candidate_can_long"].reshape(batch_size, -1).bool()
     candidate_can_short = obs_t["candidate_can_short"].reshape(batch_size, -1).bool()
@@ -272,27 +295,57 @@ def sample_policy_actions(
         candidate_can_long=candidate_can_long, candidate_can_short=candidate_can_short,
     )
     selected_fire_logits = select_target_conditioned_fire_logits(out["fire_logits"], target_action)
-    fire_action = _masked_action(selected_fire_logits, fire_mask, deterministic)
-    evaluated = evaluate_policy_heads(
-        course_logits=out["course_logits"], target_logits=out["target_logits"],
-        fire_logits=out["fire_logits"], course_action=course_action,
-        target_action=target_action, fire_action=fire_action,
-        entity_mask=entity_mask, alive_mask=alive,
-        candidate_can_long=candidate_can_long, candidate_can_short=candidate_can_short,
-        target_mask=flat_target_mask,
+    fire_dist = masked_categorical(selected_fire_logits, fire_mask)
+    if deterministic:
+        fire_action = torch.argmax(
+            selected_fire_logits.masked_fill(
+                ~fire_mask, torch.finfo(selected_fire_logits.dtype).min
+            ),
+            dim=-1,
+        )
+    else:
+        fire_action = fire_dist.sample()
+    live = alive.to(out["course_logits"].dtype)
+    log_prob = torch.stack(
+        (
+            course_dist.log_prob(course_action),
+            target_dist.log_prob(target_action),
+            fire_dist.log_prob(fire_action),
+        ),
+        dim=-1,
+    ).sum(dim=-1) * live
+
+    transfer = torch.stack(
+        (
+            course_action.to(torch.float32),
+            target_action.to(torch.float32),
+            fire_action.to(torch.float32),
+            log_prob,
+        ),
+        dim=-1,
     )
+    transfer_np = transfer.reshape(num_envs, num_agents, 4).cpu().numpy()
 
     result = {
-        "course": course_action.reshape(num_envs, num_agents).cpu().numpy(),
-        "target": target_action.reshape(num_envs, num_agents).cpu().numpy(),
-        "fire": fire_action.reshape(num_envs, num_agents).cpu().numpy(),
-        "log_prob": evaluated["log_prob"].reshape(num_envs, num_agents).cpu().numpy(),
-        "entropy": evaluated["entropy"].reshape(num_envs, num_agents).cpu().numpy(),
+        "course": transfer_np[..., 0].astype(np.int64),
+        "target": transfer_np[..., 1].astype(np.int64),
+        "fire": transfer_np[..., 2].astype(np.int64),
+        "log_prob": transfer_np[..., 3],
         "next_h": out["next_h"].reshape(num_envs, num_agents, -1),
         "next_c": out["next_c"].reshape(num_envs, num_agents, -1),
     }
     if return_diagnostics:
+        evaluated = evaluate_policy_heads(
+            course_logits=out["course_logits"], target_logits=out["target_logits"],
+            fire_logits=out["fire_logits"], course_action=course_action,
+            target_action=target_action, fire_action=fire_action,
+            entity_mask=entity_mask, alive_mask=alive,
+            candidate_can_long=candidate_can_long, candidate_can_short=candidate_can_short,
+            target_mask=flat_target_mask,
+        )
         result.update({
+            "log_prob": evaluated["log_prob"].reshape(num_envs, num_agents).cpu().numpy(),
+            "entropy": evaluated["entropy"].reshape(num_envs, num_agents).cpu().numpy(),
             "head_log_prob": evaluated["head_log_prob"].reshape(num_envs, num_agents, 3).cpu().numpy(),
             "head_entropy": evaluated["head_entropy"].reshape(num_envs, num_agents, 3).cpu().numpy(),
             "fire_logits_selected": selected_fire_logits.reshape(num_envs, num_agents, 3).cpu().numpy(),

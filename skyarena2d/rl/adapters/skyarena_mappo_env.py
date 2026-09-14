@@ -4,6 +4,8 @@ Wraps SkyArenaEngine with the Baseline V2 training contract.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
 from skyarena2d.adapters.action_types import SkyArenaSideAction
@@ -11,6 +13,16 @@ from skyarena2d.core.config import load_config
 from skyarena2d.core.engine import SkyArenaEngine
 from skyarena2d.opponents import RULES, RuleOpponentPool
 from skyarena2d.training.obs_builder import SkyArenaTrainingObsBuilder
+
+
+@dataclass(slots=True)
+class SkyArenaActionContext:
+    """Small state snapshot needed to decode the next policy action."""
+
+    num_fighters: int
+    alive: np.ndarray
+    current_heading: np.ndarray
+    step_count: int
 
 
 class SkyArenaMAPPOEnv:
@@ -46,11 +58,6 @@ class SkyArenaMAPPOEnv:
         blue_rule_name = env_cfg.get("blue_rule", "fix_rule_v2")
         if blue_rule_name not in RULES:
             raise ValueError(f"Unknown blue rule: {blue_rule_name}")
-        # Pass map dimensions for rules that need boundary awareness
-        opponent_kwargs: dict = {"seed": self._base_seed + seed_offset + 1000}
-        if blue_rule_name == "no_attack_rule":
-            opponent_kwargs["map_width"] = self.engine_config.map.width
-            opponent_kwargs["map_height"] = self.engine_config.map.height
         self.blue_rule_name = blue_rule_name
         pool_names = list(env_cfg.get("opponent_pool", []))
         self.opponent_pool = opponent_pool
@@ -69,7 +76,9 @@ class SkyArenaMAPPOEnv:
                 kwargs_by_name=kwargs_by_name,
             )
         self.current_opponent_name = blue_rule_name
-        self.blue_opponent = RULES[blue_rule_name](**opponent_kwargs)
+        self.blue_opponent = self._build_opponent(
+            blue_rule_name, seed=self._base_seed + seed_offset + 1000
+        )
 
         # Create obs builder
         self.obs_builder = SkyArenaTrainingObsBuilder(
@@ -86,7 +95,16 @@ class SkyArenaMAPPOEnv:
         self._last_info = None
         self.last_reset_seed: int | None = None
 
-    def reset(self) -> dict:
+    def _build_opponent(self, name: str, *, seed: int):
+        if name not in RULES:
+            raise ValueError(f"Unknown blue rule: {name}")
+        kwargs: dict = {"seed": seed}
+        if name == "no_attack_rule":
+            kwargs["map_width"] = self.engine_config.map.width
+            kwargs["map_height"] = self.engine_config.map.height
+        return RULES[name](**kwargs)
+
+    def reset(self, opponent_name: str | None = None) -> dict:
         """Reset environment and return initial policy obs for red."""
         if self.deterministic_reset:
             env_seed = self._base_seed + self.seed_offset + self._reset_counter
@@ -97,7 +115,10 @@ class SkyArenaMAPPOEnv:
 
         self.last_reset_seed = env_seed
         obs, info = self.engine.reset(seed=env_seed)
-        if self.opponent_pool is not None:
+        if opponent_name is not None:
+            self.current_opponent_name = opponent_name
+            self.blue_opponent = self._build_opponent(opponent_name, seed=opp_seed)
+        elif self.opponent_pool is not None:
             self.current_opponent_name, self.blue_opponent = self.opponent_pool.sample(seed=opp_seed)
         else:
             self.current_opponent_name = self.blue_rule_name
@@ -110,6 +131,16 @@ class SkyArenaMAPPOEnv:
 
         # Build policy obs for red
         return self._build_policy_obs()
+
+    def action_context(self) -> SkyArenaActionContext:
+        """Return only the state required by :class:`SkyArenaActionAdapter`."""
+        red = self.engine.state.red
+        return SkyArenaActionContext(
+            num_fighters=self.red_fighter_num,
+            alive=red.alive[: self.red_fighter_num].copy(),
+            current_heading=red.heading[: self.red_fighter_num].copy(),
+            step_count=int(self.engine.state.step_count),
+        )
 
     def step(self, sky_action: SkyArenaSideAction) -> tuple[dict, float, bool, dict]:
         """Step environment with red action.

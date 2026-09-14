@@ -24,6 +24,17 @@ def test_agent_conditioned_critic_shapes_and_identity_conditioning() -> None:
     assert not torch.allclose(all_values[:, 0], all_values[:, 1])
 
 
+def test_batched_rollout_values_match_stepwise_evaluation() -> None:
+    torch.manual_seed(7)
+    critic = SkyArenaCritic(global_state_dim=7, hidden_dim=32, num_agents=4)
+    states = torch.randn(5, 3, 7)
+
+    stepwise = torch.stack([critic(states[step]) for step in range(states.shape[0])])
+    batched = critic(states.reshape(-1, 7)).reshape(5, 3, 4)
+
+    torch.testing.assert_close(batched, stepwise, rtol=1e-6, atol=1e-6)
+
+
 def test_popart_updates_stats_while_preserving_denormalized_output() -> None:
     torch.manual_seed(23)
     head = PopArtValueHead(5, beta=0.5)

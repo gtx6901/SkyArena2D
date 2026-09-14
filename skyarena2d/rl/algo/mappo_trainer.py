@@ -19,6 +19,7 @@ import torch
 from skyarena2d.training.action_adapter import SkyArenaActionAdapter
 
 from ..adapters.skyarena_mappo_env import SkyArenaMAPPOEnv
+from ..adapters.vector_env import build_env_runner
 from ..models.actor import SkyArenaActor
 from ..models.critic import SkyArenaCritic
 from ..utils.checkpoint import (
@@ -117,22 +118,17 @@ class SkyArenaMAPPOTrainer:
         )
         self.eval_episodes = int(self.eval_cfg.get("policy_eval_episodes", 10))
 
+        self.env_runner = build_env_runner(cfg, self.num_envs)
+        self.opponent_pool = self.env_runner.opponent_pool
+        self.num_agents = self.env_runner.num_agents
+        obs_shapes = self.env_runner.obs_shapes
+        self.entity_slots = obs_shapes["entity_features"][1]
+
         requested_device = str(self.train_cfg.get("device", "cpu"))
         if requested_device.startswith("cuda") and not torch.cuda.is_available():
             print("[device] CUDA unavailable; falling back to CPU", flush=True)
             requested_device = "cpu"
         self.device = torch.device(requested_device)
-
-        first_env = SkyArenaMAPPOEnv(cfg, seed_offset=0)
-        shared_pool = first_env.opponent_pool
-        self.envs = [first_env] + [
-            SkyArenaMAPPOEnv(cfg, seed_offset=index, opponent_pool=shared_pool)
-            for index in range(1, self.num_envs)
-        ]
-        self.opponent_pool = shared_pool
-        self.num_agents = first_env.red_fighter_num
-        obs_shapes = first_env.obs_shapes()
-        self.entity_slots = obs_shapes["entity_features"][1]
 
         self.actor = SkyArenaActor(
             self_dim=obs_shapes["self_features"][-1],
@@ -158,7 +154,7 @@ class SkyArenaMAPPOTrainer:
             [*self.actor.parameters(), *self.critic.parameters()], lr=self.initial_lr
         )
 
-        engine_cfg = first_env.engine_config
+        engine_cfg = self.env_runner.engine_config
         self.action_adapter = SkyArenaActionAdapter(
             candidate_slots=self.entity_slots,
             course_bins=9,
@@ -187,7 +183,7 @@ class SkyArenaMAPPOTrainer:
         self.update_idx = 0
         self._load_requested_checkpoint()
 
-        self.current_obs = [env.reset() for env in self.envs]
+        self.current_obs = self.env_runner.reset_all()
         self._episode_returns = np.zeros(self.num_envs, dtype=np.float32)
         self._episode_lengths = np.zeros(self.num_envs, dtype=np.int32)
         hidden_dim = self.actor.lstm_hidden_dim
@@ -249,30 +245,24 @@ class SkyArenaMAPPOTrainer:
         )
 
     def _decode_action(self, env_index: int, obs: Mapping[str, np.ndarray], sampled: dict):
-        env = self.envs[env_index]
+        context = self.env_runner.action_contexts[env_index]
         return self.action_adapter.decode(
             course_action=sampled["course"][env_index],
             target_action=sampled["target"][env_index],
             fire_action=sampled["fire"][env_index],
-            own=env.engine.state.red,
+            own=context,
             candidate_ids=obs["candidate_ids"],
             candidate_can_long=obs["candidate_can_long"],
             candidate_can_short=obs["candidate_can_short"],
             has_active_contact=obs["has_active_contact"] > 0.5,
-            current_heading=env.engine.state.red.heading[: self.num_agents],
+            current_heading=context.current_heading,
             entity_features=obs["entity_features"],
             ew_state_key=env_index,
-            step_count=env.engine.state.step_count,
+            step_count=context.step_count,
         )
 
     def _step_all(self, actions: list) -> list[tuple[dict, float, bool, dict]]:
-        # Threads benchmark slower for this lightweight Python simulator due
-        # to GIL and scheduling contention. A process/vector backend should be
-        # introduced only together with a repeatable throughput benchmark.
-        return [
-            env.step(action)
-            for env, action in zip(self.envs, actions, strict=True)
-        ]
+        return self.env_runner.step_all(actions)
 
     @staticmethod
     def _numeric_means(rows: Iterable[Mapping[str, Any]]) -> dict[str, float]:
@@ -289,8 +279,10 @@ class SkyArenaMAPPOTrainer:
         observations = allocate_rollout_obs(example, self.rollout_steps, self.num_envs)
         shape = (self.rollout_steps, self.num_envs, self.num_agents)
         recurrent_shape = (*shape, self.actor.lstm_hidden_dim)
-        recurrent_h = np.empty(recurrent_shape, dtype=np.float32)
-        recurrent_c = np.empty(recurrent_shape, dtype=np.float32)
+        recurrent_h_device = torch.empty(
+            recurrent_shape, dtype=torch.float32, device=self.device
+        )
+        recurrent_c_device = torch.empty_like(recurrent_h_device)
         course = np.empty(shape, dtype=np.int64)
         target = np.empty(shape, dtype=np.int64)
         fire = np.empty(shape, dtype=np.int64)
@@ -300,19 +292,21 @@ class SkyArenaMAPPOTrainer:
         value = np.empty(shape, dtype=np.float32)
         episode_stats: list[dict] = []
         step_metrics: list[dict] = []
+        policy_seconds = 0.0
+        value_seconds = 0.0
+        decode_seconds = 0.0
+        env_step_seconds = 0.0
+        reset_seconds = 0.0
 
         for step in range(self.rollout_steps):
             fill_batched_obs(obs_batch, self.current_obs)
             for key in observations:
                 observations[key][step] = obs_batch[key]
-            recurrent_h[step] = self.actor_h.detach().cpu().numpy()
-            recurrent_c[step] = self.actor_c.detach().cpu().numpy()
+            recurrent_h_device[step].copy_(self.actor_h)
+            recurrent_c_device[step].copy_(self.actor_c)
 
+            phase_start = time.perf_counter()
             with torch.no_grad():
-                global_state = torch.as_tensor(
-                    obs_batch["global_state"], dtype=torch.float32, device=self.device
-                )
-                value[step] = self.critic(global_state).cpu().numpy()
                 sampled = sample_policy_actions(
                     self.actor,
                     obs_batch,
@@ -320,17 +314,23 @@ class SkyArenaMAPPOTrainer:
                     self.device,
                     deterministic=False,
                 )
+            policy_seconds += time.perf_counter() - phase_start
 
             course[step] = sampled["course"]
             target[step] = sampled["target"]
             fire[step] = sampled["fire"]
             log_prob[step] = sampled["log_prob"]
+            phase_start = time.perf_counter()
             actions = [
                 self._decode_action(index, self.current_obs[index], sampled)
                 for index in range(self.num_envs)
             ]
+            decode_seconds += time.perf_counter() - phase_start
+            phase_start = time.perf_counter()
             results = self._step_all(actions)
+            env_step_seconds += time.perf_counter() - phase_start
             next_obs: list[dict] = []
+            reset_indices: list[int] = []
             team_weight = self._team_weight()
             done_step = np.zeros(self.num_envs, dtype=bool)
             for env_index, (new_obs, team_reward, env_done, info) in enumerate(results):
@@ -361,8 +361,15 @@ class SkyArenaMAPPOTrainer:
                     self._episode_returns[env_index] = 0.0
                     self._episode_lengths[env_index] = 0
                     self.action_adapter.reset_ew_state(env_index)
-                    new_obs = self.envs[env_index].reset()
+                    reset_indices.append(env_index)
                 next_obs.append(new_obs)
+
+            if reset_indices:
+                phase_start = time.perf_counter()
+                reset_observations = self.env_runner.reset_many(reset_indices)
+                reset_seconds += time.perf_counter() - phase_start
+                for env_index, new_obs in reset_observations.items():
+                    next_obs[env_index] = new_obs
 
             done[step] = done_step
             self.current_obs = next_obs
@@ -374,10 +381,26 @@ class SkyArenaMAPPOTrainer:
             self.env_steps += self.num_envs
 
         fill_batched_obs(obs_batch, self.current_obs)
+        phase_start = time.perf_counter()
         with torch.no_grad():
-            next_value = self.critic(torch.as_tensor(
-                obs_batch["global_state"], dtype=torch.float32, device=self.device
+            rollout_states = observations["global_state"]
+            state_dim = rollout_states.shape[-1]
+            all_states = np.concatenate(
+                (
+                    rollout_states.reshape(-1, state_dim),
+                    obs_batch["global_state"],
+                ),
+                axis=0,
+            )
+            all_values = self.critic(torch.as_tensor(
+                all_states, dtype=torch.float32, device=self.device
             )).cpu().numpy()
+        rollout_value_count = self.rollout_steps * self.num_envs
+        value[:] = all_values[:rollout_value_count].reshape(value.shape)
+        next_value = all_values[rollout_value_count:]
+        value_seconds += time.perf_counter() - phase_start
+        recurrent_h = recurrent_h_device.cpu().numpy()
+        recurrent_c = recurrent_c_device.cpu().numpy()
         batch = RolloutBatch(
             observations=observations,
             recurrent_h=recurrent_h,
@@ -393,6 +416,13 @@ class SkyArenaMAPPOTrainer:
             episode_stats=episode_stats,
         )
         batch.validate()
+        self._last_collect_timing = {
+            "policy_seconds": policy_seconds,
+            "value_seconds": value_seconds,
+            "action_decode_seconds": decode_seconds,
+            "env_step_seconds": env_step_seconds,
+            "env_reset_seconds": reset_seconds,
+        }
         return batch, step_metrics
 
     @staticmethod
@@ -637,7 +667,9 @@ class SkyArenaMAPPOTrainer:
     def train(self) -> None:
         print(
             f"[train] entity-MAPPO start envs={self.num_envs} "
-            f"rollout={self.rollout_steps} target_steps={self.total_env_steps}",
+            f"rollout={self.rollout_steps} target_steps={self.total_env_steps} "
+            f"env_backend={self.env_runner.backend} "
+            f"env_workers={self.env_runner.num_workers}",
             flush=True,
         )
         try:
@@ -645,11 +677,20 @@ class SkyArenaMAPPOTrainer:
                 start = time.perf_counter()
                 batch, step_metrics = self._collect_rollout()
                 collect_seconds = time.perf_counter() - start
+                update_start = time.perf_counter()
                 update_metrics = self._ppo_update(batch)
+                update_seconds = time.perf_counter() - update_start
                 throughput = (
                     self.num_envs * self.rollout_steps / max(collect_seconds, 1e-9)
                 )
                 update_metrics["sample_steps_per_second"] = throughput
+                update_metrics["wall_steps_per_second"] = (
+                    self.num_envs * self.rollout_steps
+                    / max(collect_seconds + update_seconds, 1e-9)
+                )
+                update_metrics["collect_seconds"] = collect_seconds
+                update_metrics["ppo_update_seconds"] = update_seconds
+                update_metrics.update(self._last_collect_timing)
                 log_scalars(self.writer, "train", update_metrics, self.env_steps)
                 log_scalars(
                     self.writer, "rollout", self._rollout_diagnostics(batch), self.env_steps
@@ -678,7 +719,12 @@ class SkyArenaMAPPOTrainer:
                     f"pg={update_metrics['pg_loss']:.4f} "
                     f"vf={update_metrics['vf_loss']:.4f} "
                     f"entropy={update_metrics['entropy']:.4f} "
-                    f"sample_sps={throughput:.1f}",
+                    f"sample_sps={throughput:.1f} "
+                    f"wall_sps={update_metrics['wall_steps_per_second']:.1f} "
+                    f"policy_s={update_metrics['policy_seconds']:.2f} "
+                    f"env_s={update_metrics['env_step_seconds']:.2f} "
+                    f"value_s={update_metrics['value_seconds']:.2f} "
+                    f"ppo_s={update_seconds:.2f}",
                     flush=True,
                 )
                 if self.save_interval > 0 and self.env_steps >= self.next_save_step:
@@ -869,8 +915,7 @@ class SkyArenaMAPPOTrainer:
         return summary
 
     def close(self) -> None:
-        for env in self.envs:
-            env.engine.close()
+        self.env_runner.close()
         if self.writer is not None:
             self.writer.close()
             self.writer = None

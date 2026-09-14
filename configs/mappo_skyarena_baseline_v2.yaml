@@ -4,6 +4,9 @@ train:
   seed: 42
   device: cuda
   num_envs: 16
+  env_backend: subprocess
+  env_workers: 16
+  env_start_method: forkserver
   rollout_steps: 128
   total_env_steps: 5000000
   learning_rate: 0.0003

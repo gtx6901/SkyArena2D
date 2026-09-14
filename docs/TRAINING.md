@@ -228,6 +228,30 @@ MAPPO 正式训练：
 python scripts/train_mappo.py --config configs/mappo_skyarena_train.yaml --device cuda
 ```
 
+环境采样后端基准（不运行 PPO，也不修改 checkpoint）：
+
+```bash
+python scripts/benchmark_env_runner.py --backend serial --num-envs 16 --steps 128
+python scripts/benchmark_env_runner.py --backend subprocess --num-envs 16 --workers 10 --steps 128
+```
+
+`sample_sps` 只统计 rollout 收集；日志中的 `wall_sps` 同时包含 PPO 更新。
+`env_s` 与 `ppo_s` 分别用于判断瓶颈在环境推进还是 GPU 更新。
+
+### 性能路径的语义边界
+
+- subprocess worker 只持有环境与规则对手实例；actor、critic、recurrent state 和
+  PPO optimizer 始终留在主进程。
+- 对手池抽样、胜负记分和 checkpoint state 由主进程统一维护，完成局按环境索引
+  顺序处理，避免并发完成顺序改变课程分布。
+- rollout 采样直接复用产生 action 的 categorical 分布计算 log-prob，不改变 mask、
+  条件 fire head 或联合 log-prob 定义；`tests/test_rollout_baseline.py` 将快路径与完整
+  head evaluation 对照。
+- critic 的 rollout value 合并为一个大批次前向，recurrent state 在 GPU 连续缓存后
+  一次传回；GAE、episode reset、hidden 值及 PPO loss 均不变。
+- 这些优化不改变网络参数名、optimizer state 或 checkpoint 格式，Baseline V2
+  checkpoint 可双向加载。串行路径继续保留，便于确定性轨迹对照。
+
 MAPPO 课程训练：
 
 ```bash
