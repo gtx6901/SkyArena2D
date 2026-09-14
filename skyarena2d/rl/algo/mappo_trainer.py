@@ -129,6 +129,10 @@ class SkyArenaMAPPOTrainer:
             print("[device] CUDA unavailable; falling back to CPU", flush=True)
             requested_device = "cpu"
         self.device = torch.device(requested_device)
+        self.float32_matmul_precision = str(
+            self.train_cfg.get("float32_matmul_precision", "highest")
+        )
+        torch.set_float32_matmul_precision(self.float32_matmul_precision)
 
         self.actor = SkyArenaActor(
             self_dim=obs_shapes["self_features"][-1],
@@ -669,7 +673,8 @@ class SkyArenaMAPPOTrainer:
             f"[train] entity-MAPPO start envs={self.num_envs} "
             f"rollout={self.rollout_steps} target_steps={self.total_env_steps} "
             f"env_backend={self.env_runner.backend} "
-            f"env_workers={self.env_runner.num_workers}",
+            f"env_workers={self.env_runner.num_workers} "
+            f"matmul={self.float32_matmul_precision}",
             flush=True,
         )
         try:

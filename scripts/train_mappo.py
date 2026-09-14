@@ -16,6 +16,14 @@ def main():
     parser.add_argument("--config", default="configs/mappo_skyarena_baseline_v2.yaml")
     parser.add_argument("--total_env_steps", type=int, default=None)
     parser.add_argument("--device", default=None)
+    parser.add_argument("--num_envs", type=int, default=None)
+    parser.add_argument("--rollout_steps", type=int, default=None)
+    parser.add_argument("--num_minibatches", type=int, default=None)
+    parser.add_argument(
+        "--float32_matmul_precision",
+        choices=("highest", "high", "medium"),
+        default=None,
+    )
     parser.add_argument("--env_backend", choices=("serial", "subprocess"), default=None)
     parser.add_argument("--env_workers", default=None)
     parser.add_argument("--train_dir", default=None)
@@ -34,6 +42,14 @@ def main():
         cfg["train"]["total_env_steps"] = args.total_env_steps
     if args.device:
         cfg["train"]["device"] = args.device
+    if args.num_envs:
+        cfg["train"]["num_envs"] = args.num_envs
+    if args.rollout_steps:
+        cfg["train"]["rollout_steps"] = args.rollout_steps
+    if args.num_minibatches:
+        cfg["train"]["num_minibatches"] = args.num_minibatches
+    if args.float32_matmul_precision:
+        cfg["train"]["float32_matmul_precision"] = args.float32_matmul_precision
     if args.env_backend:
         cfg["train"]["env_backend"] = args.env_backend
     if args.env_workers:

@@ -3,9 +3,15 @@ train:
   train_dir: train_dir/skyarena_mappo_v2
   seed: 42
   device: cuda
-  num_envs: 16
+  # RTX 30/40-class GPUs use TensorFloat-32 tensor cores for float32 matmuls.
+  # Checkpoints remain load-compatible; set "highest" for the legacy FP32 path.
+  float32_matmul_precision: high
+  # 128 environments amortize the synchronous rollout/update phases on a
+  # 20-thread i9-13900H. Keep num_minibatches scaled with num_envs so the
+  # recurrent PPO minibatch size and optimizer-update density stay unchanged.
+  num_envs: 128
   env_backend: subprocess
-  env_workers: 16
+  env_workers: 20
   env_start_method: forkserver
   rollout_steps: 128
   total_env_steps: 5000000
@@ -20,7 +26,7 @@ train:
   value_coef: 0.5
   ppo_epochs: 4
   recurrent_chunk_length: 32
-  num_minibatches: 8
+  num_minibatches: 64
   max_grad_norm: 0.5
   target_kl: 0.03
   popart: true

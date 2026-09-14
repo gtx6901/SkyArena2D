@@ -52,9 +52,18 @@
   更新仍由主进程在 GPU 上批处理。
 - `env_workers` 控制常驻 worker 数；`auto` 默认保留两个逻辑 CPU、且不超过
   `num_envs`。正式跑前可用 `scripts/benchmark_env_runner.py` 对具体 CPU 比较不同
-  worker 数。当前 16 环境配置在 i9-13900H 上实测以 16 workers 最快。
+  worker 数。Baseline V2 在 i9-13900H / RTX 4060 Laptop 上的训练整轮基准为：
+  16 env / 16 workers / 8 minibatches 约 303 steps/s，128 env / 20 workers /
+  64 minibatches 约 483 steps/s。后者把 `num_minibatches` 与 `num_envs` 等比例扩大，
+  因而保持 recurrent PPO 的 minibatch 大小和单位样本 optimizer 更新密度；只扩大
+  `num_envs` 而不扩大 `num_minibatches` 虽会显示更高吞吐，但会改变学习动力学。
+- subprocess worker 启动时会把 OpenBLAS、OpenMP、MKL 与 NumExpr 线程限制为 1，
+  避免多个环境进程各自建立线程池；该限制不会污染主训练进程环境。
 - Linux CUDA 训练推荐 `env_start_method: forkserver`，避免从已初始化 CUDA 的
   主进程直接 `fork`。
+- Ampere 及更新的 NVIDIA GPU 可显式设置 `float32_matmul_precision: high`，让
+  float32 矩阵乘使用 TensorFloat-32 Tensor Core；checkpoint 格式不变，若需要
+  旧的最高精度数值路径则设置为 `highest`。
 - 无渲染、deterministic reset 的固定评估按 `policy_eval_workers` 并行 episode；
   GUI/render eval 和非确定 reset 继续使用串行路径。
 - `rollout_steps` 更稳定。

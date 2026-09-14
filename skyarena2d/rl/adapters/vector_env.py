@@ -14,6 +14,12 @@ from .skyarena_mappo_env import (
 )
 
 EnvStep = tuple[dict, float, bool, dict]
+_WORKER_THREAD_ENV = {
+    "OPENBLAS_NUM_THREADS": "1",
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+}
 
 
 def _worker_main(
@@ -195,7 +201,11 @@ class SubprocessEnvRunner:
         context = mp.get_context(start_method)
         self._connections = []
         self._processes = []
+        previous_thread_env = {
+            key: os.environ.get(key) for key in _WORKER_THREAD_ENV
+        }
         try:
+            os.environ.update(_WORKER_THREAD_ENV)
             for indices in self._assignments:
                 parent_connection, child_connection = context.Pipe()
                 process = context.Process(
@@ -219,6 +229,12 @@ class SubprocessEnvRunner:
         except BaseException:
             self.close()
             raise
+        finally:
+            for key, previous in previous_thread_env.items():
+                if previous is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = previous
 
     @staticmethod
     def recommended_workers(num_envs: int) -> int:
